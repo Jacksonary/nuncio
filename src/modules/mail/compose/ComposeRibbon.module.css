@@ -1,0 +1,145 @@
+/* Compose ribbon (Format / Insert / Options). */
+
+.ribbon {
+  flex: none;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-layer-alt);
+}
+
+.tabs {
+  padding: 0 var(--sp-3);
+}
+
+.body {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-1);
+  min-height: 40px;
+  padding: 2px var(--sp-3) var(--sp-1);
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-1);
+  width: 100%;
+}
+
+.group {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.divider {
+  width: 1px;
+  min-height: 22px;
+  align-self: stretch;
+  margin: 0 var(--sp-1);
+  background: var(--border);
+}
+
+.fontSelect {
+  width: 148px;
+}
+
+.sizeSelect {
+  width: 76px;
+}
+
+.headingSelect {
+  width: 118px;
+}
+
+.importanceSelect {
+  width: 120px;
+}
+
+.groupLabel {
+  margin-right: var(--sp-1);
+  font-size: var(--font-caption);
+  color: var(--text-secondary);
+}
+
+/* Color swatches */
+
+.swatches {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 4px;
+  padding: 4px;
+}
+
+.swatch {
+  width: 30px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-s);
+  cursor: pointer;
+}
+
+.swatch:hover {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.swatchClear {
+  width: 100%;
+  margin-top: 4px;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-s);
+  background: var(--surface);
+  color: var(--text-secondary);
+  font-size: var(--font-caption);
+  cursor: pointer;
+}
+
+.swatchClear:hover {
+  background: var(--surface-hover);
+}
+
+/* Table size picker */
+
+.tablePicker {
+  padding: 6px;
+}
+
+.tablePickerHint {
+  margin-bottom: 6px;
+  text-align: center;
+  font-size: var(--font-caption);
+  color: var(--text-secondary);
+}
+
+.tableGrid {
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  gap: 3px;
+}
+
+.tableCell,
+.tableCellActive {
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--surface);
+  cursor: pointer;
+}
+
+.tableCellActive {
+  border-color: var(--accent);
+  background: var(--accent-subtle);
+}
+
+.tablePickerFootnote {
+  margin-top: 6px;
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-tertiary);
+}

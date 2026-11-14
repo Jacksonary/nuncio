@@ -1,0 +1,1092 @@
+/* Shared styles for the settings flyout (Win11 Mail style) and its pages. */
+
+.root {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+  color: var(--text);
+}
+
+/* ─────────────────────────── Home ─────────────────────────── */
+
+.homeIntro {
+  padding: var(--sp-5) var(--sp-5) var(--sp-2);
+}
+
+.homeTitle {
+  font-size: var(--font-subtitle);
+  line-height: var(--line-subtitle);
+  font-weight: var(--weight-semibold);
+}
+
+.homeSubtitle {
+  margin-top: var(--sp-1);
+  color: var(--text-secondary);
+  font-size: var(--font-caption);
+  line-height: var(--line-caption);
+}
+
+.homeList {
+  display: flex;
+  flex-direction: column;
+  padding: var(--sp-2) var(--sp-3) var(--sp-5);
+  gap: 2px;
+}
+
+.homeRow {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  width: 100%;
+  padding: var(--sp-3);
+  border: none;
+  border-radius: var(--radius-m);
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--duration-fast) var(--ease);
+}
+
+.homeRow:hover {
+  background: var(--surface-hover);
+}
+
+.homeRow:active {
+  background: var(--surface-pressed);
+}
+
+.homeRow:focus-visible {
+  outline: var(--focus-outline);
+  outline-offset: -2px;
+}
+
+.homeIcon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  flex: none;
+  font-size: 20px;
+  color: var(--accent);
+  background: var(--accent-subtle);
+  border-radius: var(--radius-m);
+}
+
+.homeText {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.homeRowTitle {
+  font-size: var(--font-body);
+  line-height: var(--line-body);
+  font-weight: var(--weight-medium);
+}
+
+.homeRowDesc {
+  color: var(--text-secondary);
+  font-size: var(--font-caption);
+  line-height: var(--line-caption);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.homeChevron {
+  flex: none;
+  color: var(--text-tertiary);
+  display: inline-flex;
+}
+
+.homeFooter {
+  margin-top: auto;
+  padding: var(--sp-3) var(--sp-5) var(--sp-5);
+  display: flex;
+  justify-content: flex-end;
+  border-top: 1px solid var(--border-subtle);
+}
+
+/* ─────────────────────────── Pages ─────────────────────────── */
+
+.page {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+}
+
+.pageHeader {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-5) var(--sp-3);
+  background: var(--overlay);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.backButton {
+  margin-left: calc(var(--sp-2) * -1);
+  flex: none;
+}
+
+.pageHeading {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.pageTitle {
+  font-size: var(--font-body);
+  line-height: var(--line-body);
+  font-weight: var(--weight-semibold);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pageSubtitle {
+  color: var(--text-secondary);
+  font-size: var(--font-caption);
+  line-height: var(--line-caption);
+}
+
+.pageBody {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+  padding: var(--sp-4) var(--sp-5) var(--sp-8);
+}
+
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.sectionHeader {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-2);
+}
+
+.sectionTitle {
+  font-size: var(--font-caption);
+  line-height: var(--line-caption);
+  font-weight: var(--weight-semibold);
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.sectionHint {
+  color: var(--text-tertiary);
+  font-size: var(--font-caption);
+}
+
+.card {
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-l);
+  overflow: hidden;
+}
+
+.cardBody {
+  display: flex;
+  flex-direction: column;
+}
+
+.cardPad {
+  padding: var(--sp-3);
+}
+
+.row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-3);
+  padding: var(--sp-3);
+  border-top: 1px solid var(--border-subtle);
+}
+
+.row:first-child {
+  border-top: none;
+}
+
+.rowText {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.rowLabel {
+  font-size: var(--font-body);
+  line-height: var(--line-body);
+  font-weight: var(--weight-regular);
+}
+
+.rowDesc {
+  color: var(--text-secondary);
+  font-size: var(--font-caption);
+  line-height: var(--line-caption);
+}
+
+.rowControl {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding-top: 2px;
+}
+
+.rowControlWide {
+  flex: 1;
+  min-width: 0;
+  max-width: 220px;
+}
+
+.stackRow {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  border-top: 1px solid var(--border-subtle);
+}
+
+.stackRow:first-child {
+  border-top: none;
+}
+
+.fieldGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--sp-3);
+}
+
+.fieldGrid > .span2 {
+  grid-column: 1 / -1;
+}
+
+.inlineFields {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+
+.inlineFields > * {
+  flex: 1;
+  min-width: 120px;
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+
+.actionsBetween {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+
+.dangerZone {
+  border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
+}
+
+.dangerTitle {
+  color: var(--danger);
+}
+
+.divider {
+  height: 1px;
+  background: var(--border-subtle);
+  border: none;
+  margin: 0;
+}
+
+/* ─────────────────────────── Banners ─────────────────────────── */
+
+.banner {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  border-radius: var(--radius-m);
+  border: 1px solid var(--border);
+  background: var(--surface-alt);
+  font-size: var(--font-caption);
+  line-height: var(--line-caption);
+}
+
+.bannerIcon {
+  flex: none;
+  margin-top: 1px;
+  display: inline-flex;
+}
+
+.bannerBody {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.bannerTitle {
+  font-weight: var(--weight-semibold);
+  font-size: var(--font-body);
+}
+
+.infoBanner {
+  border-color: var(--accent-border);
+  background: var(--accent-subtle);
+  color: var(--text);
+}
+
+.infoBanner .bannerIcon {
+  color: var(--accent);
+}
+
+.warnBanner {
+  border-color: color-mix(in srgb, var(--warning) 45%, var(--border));
+  background: var(--warning-subtle);
+}
+
+.warnBanner .bannerIcon {
+  color: var(--warning);
+}
+
+.errorBanner {
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+  background: var(--danger-subtle);
+}
+
+.errorBanner .bannerIcon {
+  color: var(--danger);
+}
+
+.successBanner {
+  border-color: color-mix(in srgb, var(--success) 45%, var(--border));
+  background: var(--success-subtle);
+}
+
+.successBanner .bannerIcon {
+  color: var(--success);
+}
+
+.hint {
+  color: var(--text-secondary);
+  font-size: var(--font-caption);
+  line-height: var(--line-caption);
+}
+
+.errorText {
+  color: var(--danger);
+  font-size: var(--font-caption);
+  line-height: var(--line-caption);
+}
+
+.successText {
+  color: var(--success);
+  font-size: var(--font-caption);
+  line-height: var(--line-caption);
+}
+
+.mono {
+  font-family: var(--font-mono);
+  font-size: var(--font-caption);
+  word-break: break-all;
+  user-select: text;
+}
+
+.linkButton {
+  display: inline;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.linkButton:hover {
+  color: var(--accent-hover);
+}
+
+/* ──────────────────────── Account list ──────────────────────── */
+
+.accountList {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.accountRow {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-l);
+  background: var(--surface);
+  transition: background var(--duration-fast) var(--ease);
+}
+
+.accountRow:hover {
+  background: var(--surface-hover);
+}
+
+.accountRowDragOver {
+  border-color: var(--accent);
+  background: var(--accent-subtle);
+}
+
+/* The built-in local account: shown, editable, but not reorderable or
+   deletable (it owns the local calendar / contacts / task list). */
+.accountRowBuiltin {
+  border-style: dashed;
+  background: var(--surface-alt);
+}
+
+.accountMain {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: 0;
+  border: none;
+  background: none;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  border-radius: var(--radius-m);
+}
+
+.accountMain:focus-visible {
+  outline: var(--focus-outline);
+  outline-offset: 2px;
+}
+
+.accountMeta {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.accountName {
+  font-weight: var(--weight-medium);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.accountEmail {
+  color: var(--text-secondary);
+  font-size: var(--font-caption);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.accountSide {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+}
+
+.dragHandle {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 32px;
+  border: none;
+  background: none;
+  color: var(--text-tertiary);
+  cursor: grab;
+  border-radius: var(--radius-s);
+}
+
+.dragHandle:hover {
+  color: var(--text-secondary);
+  background: var(--surface-hover);
+}
+
+.dragHandle:active {
+  cursor: grabbing;
+}
+
+/* Keeps the avatar aligned with rows that have a drag handle. */
+.dragSpacer {
+  flex: none;
+  width: 24px;
+  height: 32px;
+}
+
+.colorSwatch {
+  width: 18px;
+  height: 18px;
+  border-radius: var(--radius-round);
+  border: 1px solid var(--border);
+  flex: none;
+}
+
+/* ──────────────────────── Folder list ───────────────────────── */
+
+.folderList {
+  display: flex;
+  flex-direction: column;
+}
+
+.folderRow {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border-top: 1px solid var(--border-subtle);
+  min-height: 40px;
+}
+
+.folderRow:first-child {
+  border-top: none;
+}
+
+.folderName {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.folderIcon {
+  color: var(--text-tertiary);
+  display: inline-flex;
+  flex: none;
+}
+
+/* ───────────────────────── Rule editor ──────────────────────── */
+
+.ruleList {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.ruleRow {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-l);
+  background: var(--surface);
+}
+
+.ruleMain {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ruleName {
+  font-weight: var(--weight-medium);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ruleSummary {
+  color: var(--text-secondary);
+  font-size: var(--font-caption);
+  line-height: var(--line-caption);
+  overflow-wrap: anywhere;
+}
+
+.ruleSide {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+}
+
+.conditionRow,
+.actionRow {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+
+.actionRow > .grow {
+  flex: 1 1 160px;
+  min-width: 0;
+}
+
+.conditionRow > .grow {
+  flex: 2 1 128px;
+  min-width: 100px;
+}
+
+.conditionRow > .op {
+  flex: 0 0 92px;
+}
+
+.conditionRow > .valueInput {
+  flex: 1 1 120px;
+  min-width: 96px;
+}
+
+.conditionRow > .remove,
+.actionRow > .remove {
+  flex: none;
+  margin-left: auto;
+  padding-top: 4px;
+}
+
+.rowStack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.ruleEditor {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: var(--sp-3);
+}
+
+.ruleEditorHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+}
+
+.ruleEditorTitle {
+  font-weight: var(--weight-semibold);
+}
+
+.subGroup {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-m);
+  background: var(--bg-layer-alt);
+}
+
+.subGroupHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  font-size: var(--font-caption);
+  font-weight: var(--weight-semibold);
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+.chipRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+
+/* ────────────────────── Rich text editor ────────────────────── */
+
+.editor {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-m);
+  background: var(--control-bg);
+  overflow: hidden;
+}
+
+.editor:focus-within {
+  border-color: var(--accent);
+  box-shadow: var(--focus-ring);
+}
+
+.editorToolbar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: var(--sp-1);
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--surface-alt);
+}
+
+.editorSurface {
+  min-height: 110px;
+  max-height: 260px;
+  overflow-y: auto;
+  padding: var(--sp-3);
+  font-size: var(--font-body);
+  line-height: 1.55;
+  color: var(--text);
+  outline: none;
+  user-select: text;
+  cursor: text;
+}
+
+.editorSurface:empty::before {
+  content: attr(data-placeholder);
+  color: var(--text-tertiary);
+  pointer-events: none;
+}
+
+.editorSurface a {
+  color: var(--accent);
+}
+
+.editorSurface p {
+  margin: 0 0 6px;
+}
+
+.editorSurface p:last-child {
+  margin-bottom: 0;
+}
+
+.linkForm {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--sp-2);
+  padding: var(--sp-2);
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--surface-alt);
+}
+
+/* ─────────────────────── Storage / about ────────────────────── */
+
+.storageGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--sp-2);
+}
+
+.storageCell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-m);
+  background: var(--surface);
+}
+
+.storageLabel {
+  color: var(--text-secondary);
+  font-size: var(--font-caption);
+}
+
+.storageValue {
+  font-size: var(--font-body);
+  font-weight: var(--weight-semibold);
+}
+
+.aboutGrid {
+  display: grid;
+  grid-template-columns: 110px 1fr;
+  gap: var(--sp-2) var(--sp-3);
+  align-items: baseline;
+}
+
+.aboutLabel {
+  color: var(--text-secondary);
+  font-size: var(--font-caption);
+}
+
+.aboutValue {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.aboutLinks {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  align-items: stretch;
+}
+
+.aboutLinkButton {
+  justify-content: flex-start;
+  color: var(--accent);
+}
+
+.listActions {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  flex-wrap: wrap;
+}
+
+.emptyHint {
+  padding: var(--sp-4);
+  text-align: center;
+  color: var(--text-secondary);
+  font-size: var(--font-caption);
+}
+
+.signatureCard {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-l);
+  background: var(--surface);
+}
+
+.signatureHeader {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.signatureName {
+  flex: 1;
+  min-width: 0;
+  font-weight: var(--weight-medium);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.signaturePreview {
+  color: var(--text-secondary);
+  font-size: var(--font-caption);
+  line-height: var(--line-caption);
+  max-height: 44px;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.badgeRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1);
+}
+
+.optionTileGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--sp-2);
+}
+
+.optionTile {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-m);
+  background: var(--surface);
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color var(--duration-fast) var(--ease),
+    background var(--duration-fast) var(--ease);
+}
+
+.optionTile:hover {
+  background: var(--surface-hover);
+}
+
+.optionTile:focus-visible {
+  outline: var(--focus-outline);
+  outline-offset: -2px;
+}
+
+.optionTileSelected {
+  border-color: var(--accent);
+  background: var(--accent-subtle);
+}
+
+.optionTileIcon {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-s);
+  background: var(--accent-subtle);
+  color: var(--accent);
+  font-size: 18px;
+}
+
+.optionTileText {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.optionTileTitle {
+  font-size: var(--font-caption);
+  line-height: var(--line-caption);
+  font-weight: var(--weight-medium);
+}
+
+.optionTileDesc {
+  font-size: 11px;
+  line-height: 14px;
+  color: var(--text-secondary);
+}
+
+/* ───────────────────────── Add account ─────────────────────── */
+
+.wizardSteps {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-1);
+}
+
+.wizardStep {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  color: var(--text-tertiary);
+  font-size: var(--font-caption);
+}
+
+.wizardStepActive {
+  color: var(--text);
+  font-weight: var(--weight-medium);
+}
+
+.wizardStepDot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: var(--radius-round);
+  border: 1px solid currentColor;
+  font-size: 11px;
+}
+
+.wizardStepActive .wizardStepDot {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-text);
+}
+
+.wizardBody {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  min-height: 320px;
+}
+
+.spinnerRow {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  border-radius: var(--radius-m);
+  background: var(--surface-alt);
+  color: var(--text-secondary);
+  font-size: var(--font-caption);
+}
+
+.testResults {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding: var(--sp-3);
+  border-radius: var(--radius-m);
+  background: var(--surface-alt);
+  border: 1px solid var(--border-subtle);
+}
+
+.testRow {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--font-caption);
+}
+
+.testOk {
+  color: var(--success);
+}
+
+.testFail {
+  color: var(--danger);
+}
+
+.advancedToggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-m);
+  background: var(--surface-alt);
+  cursor: pointer;
+  color: inherit;
+  font-size: var(--font-caption);
+  font-weight: var(--weight-medium);
+}
+
+.advancedToggle:hover {
+  background: var(--surface-hover);
+}
+
+.advancedBody {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: var(--sp-1) 0 0;
+}
+
+.progressLabel {
+  color: var(--text-secondary);
+  font-size: var(--font-caption);
+}
+
+.checkList {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+@media (max-width: 520px) {
+  .fieldGrid,
+  .storageGrid,
+  .optionTileGrid {
+    grid-template-columns: 1fr;
+  }
+}

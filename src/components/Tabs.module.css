@@ -1,0 +1,123 @@
+.tabs {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  min-width: 0;
+}
+
+.underline {
+  border-bottom: 1px solid var(--border);
+  gap: var(--sp-4);
+  padding: 0 var(--sp-2);
+}
+
+.pill {
+  padding: var(--sp-1);
+  background: var(--surface-alt);
+  border-radius: var(--radius-m);
+  width: fit-content;
+}
+
+.tab {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: 34px;
+  padding: 0 var(--sp-2);
+  border: none;
+  border-radius: var(--radius-s);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: var(--font-body);
+  font-weight: var(--weight-medium);
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    color var(--duration-fast) var(--ease),
+    background-color var(--duration-fast) var(--ease);
+}
+
+.tab:hover {
+  color: var(--text);
+  background: var(--surface-hover);
+}
+
+.tab:focus-visible {
+  outline: 2px solid var(--focus-outline);
+  outline-offset: -2px;
+}
+
+.active {
+  color: var(--accent);
+}
+
+.underline .tab {
+  border-radius: 0;
+  min-height: 40px;
+  padding: 0 var(--sp-1);
+}
+
+.underline .tab::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px;
+  height: 2px;
+  border-radius: 2px 2px 0 0;
+  background: transparent;
+  transition: background-color var(--duration-fast) var(--ease);
+}
+
+.underline .active::after {
+  background: var(--accent);
+}
+
+.pill .tab {
+  min-height: 30px;
+}
+
+.pill .active {
+  background: var(--surface-solid);
+  color: var(--text);
+  box-shadow: var(--shadow-2);
+}
+
+.icon {
+  display: inline-flex;
+  align-items: center;
+  font-size: 16px;
+}
+
+.count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: var(--radius-round);
+  background: var(--surface-pressed);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.active .count {
+  background: var(--accent-subtle);
+  color: var(--accent);
+}
+
+.list {
+  display: flex;
+  align-items: center;
+  gap: inherit;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.list::-webkit-scrollbar {
+  display: none;
+}

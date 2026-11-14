@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 64 64">
+<title>Nuncio — Final 27-A</title>
+<rect width="64" height="64" rx="14.506666666666666" fill="#F6F0E8"/><path xmlns="http://www.w3.org/2000/svg" d="M13 24H51Q55 24 55 28V47Q55 51 51 51H13Q9 51 9 47V28Q9 24 13 24Z" fill="#384F53" />
+<path xmlns="http://www.w3.org/2000/svg" d="M13 29L32 43L51 29" fill="none" stroke="#E2E4D7" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" />
+<path xmlns="http://www.w3.org/2000/svg" d="M10 12C14 9 17 15 22.5 12C26.5 9 30 15 35 12" fill="none" stroke="#9B8268" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
+<path xmlns="http://www.w3.org/2000/svg" d="M10 17C14 14 17 20 22.5 17C26.5 14 30 20 35 17" fill="none" stroke="#9B8268" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
+<circle xmlns="http://www.w3.org/2000/svg" cx="44" cy="20" r="13.25" fill="#F6F0E8" />
+<circle xmlns="http://www.w3.org/2000/svg" cx="44" cy="20" r="11.2" fill="none" stroke="#9B8268" stroke-width="1.6" />
+<path xmlns="http://www.w3.org/2000/svg" d="M39.1 25.6V14.4L48.900000000000006 25.6V14.4" fill="none" stroke="#685347" stroke-width="2.7" stroke-linecap="round" stroke-linejoin="round" />
+</svg>

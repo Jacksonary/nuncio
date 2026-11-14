@@ -1,0 +1,38 @@
+    Checking nuncio-core v0.1.0 (<repo>/src-tauri/crates/core)
+   Compiling nuncio v0.1.0 (<repo>/src-tauri)
+    Checking nuncio-ical v0.1.0 (<repo>/src-tauri/crates/ical)
+    Checking nuncio-mime v0.1.0 (<repo>/src-tauri/crates/mime)
+    Checking nuncio-auth v0.1.0 (<repo>/src-tauri/crates/auth)
+error: this function has too many arguments (8/7)
+   --> crates/ical/src/ics/write.rs:147:1
+    |
+147 | / fn write_vevent(
+148 | |     out: &mut String,
+149 | |     event: &CalendarEvent,
+150 | |     exdates: &[String],
+...   |
+155 | |     force_status: Option<EventStatus>,
+156 | | ) {
+    | |_^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#too_many_arguments
+    = note: `-D clippy::too-many-arguments` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::too_many_arguments)]`
+
+error: this function has too many arguments (8/7)
+   --> crates/ical/src/recurrence.rs:463:1
+    |
+463 | / fn expand_internal(
+464 | |     event: &CalendarEvent,
+465 | |     exdates: &[String],
+466 | |     rdates: &[String],
+...   |
+471 | |     max: usize,
+472 | | ) -> Vec<Occurrence> {
+    | |____________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#too_many_arguments
+
+error: could not compile `nuncio-ical` (lib) due to 2 previous errors
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `nuncio-ical` (lib test) due to 2 previous errors

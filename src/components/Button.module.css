@@ -1,0 +1,159 @@
+.button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  min-height: var(--control-height);
+  padding: 0 var(--sp-3);
+  border: 1px solid transparent;
+  border-radius: var(--radius-s);
+  background: transparent;
+  color: var(--text);
+  font-size: var(--font-body);
+  font-weight: var(--weight-medium);
+  line-height: var(--line-body);
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+  transition:
+    background-color var(--duration-fast) var(--ease),
+    border-color var(--duration-fast) var(--ease),
+    color var(--duration-fast) var(--ease);
+}
+
+.button:focus-visible {
+  outline: 2px solid var(--focus-outline);
+  outline-offset: 2px;
+}
+
+.button:disabled,
+.button[aria-disabled="true"] {
+  opacity: 0.42;
+  cursor: default;
+  pointer-events: none;
+}
+
+.small {
+  min-height: var(--control-height-sm);
+  padding: 0 var(--sp-2);
+  gap: var(--sp-1);
+  font-size: var(--font-caption);
+  line-height: var(--line-caption);
+}
+
+.large {
+  min-height: var(--control-height-lg);
+  padding: 0 var(--sp-5);
+  font-size: var(--font-body);
+}
+
+.primary {
+  background: var(--accent);
+  color: var(--accent-text);
+}
+
+.primary:hover {
+  background: var(--accent-hover);
+}
+
+.primary:active {
+  background: var(--accent-pressed);
+}
+
+.subtle {
+  background: var(--control-bg);
+  border-color: var(--border);
+}
+
+.subtle:hover {
+  background: var(--control-bg-hover);
+  border-color: var(--border-strong);
+}
+
+.subtle:active {
+  background: var(--surface-pressed);
+}
+
+.transparent {
+  background: transparent;
+}
+
+.transparent:hover {
+  background: var(--surface-hover);
+}
+
+.transparent:active {
+  background: var(--surface-pressed);
+}
+
+.outline {
+  background: transparent;
+  border-color: var(--border-strong);
+}
+
+.outline:hover {
+  background: var(--surface-hover);
+}
+
+.danger {
+  color: var(--danger);
+}
+
+.dangerFilled {
+  background: #c42b1c;
+  color: #ffffff;
+}
+
+.dangerFilled:hover {
+  background: #a4262c;
+}
+
+.fullWidth {
+  width: 100%;
+}
+
+.icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  flex: none;
+}
+
+.small .icon {
+  font-size: 16px;
+}
+
+.large .icon {
+  font-size: 20px;
+}
+
+.label {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: buttonSpin 0.7s linear infinite;
+  flex: none;
+}
+
+@keyframes buttonSpin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation-duration: 1.6s;
+  }
+}

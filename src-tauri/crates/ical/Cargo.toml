@@ -1,0 +1,15 @@
+[package]
+name = "nuncio-ical"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+nuncio-core = { path = "../core" }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+rrule = { workspace = true }
+tracing = { workspace = true }
+base64 = { workspace = true }
+encoding_rs = { workspace = true }
+mail-builder = { workspace = true }

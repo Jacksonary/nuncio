@@ -1,0 +1,95 @@
+.editor {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.row {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--sp-3);
+  min-width: 0;
+}
+
+.modeSelect {
+  flex: 1;
+  min-width: 180px;
+}
+
+.interval {
+  width: 150px;
+  flex: none;
+}
+
+.weekdays {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.legend {
+  display: block;
+  font-size: 11px;
+  color: var(--text-secondary);
+  font-weight: var(--weight-medium);
+}
+
+.weekdayRow {
+  display: flex;
+  gap: 2px;
+  flex-wrap: wrap;
+}
+
+.weekday {
+  min-width: 38px;
+}
+
+.staticField {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding-bottom: 6px;
+}
+
+.staticValue {
+  font-size: var(--font-body);
+  color: var(--text);
+}
+
+.caption {
+  margin: 0;
+  font-size: var(--font-caption);
+  color: var(--text-tertiary);
+}
+
+.endSection {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  border-top: 1px dashed var(--border-subtle);
+  padding-top: var(--sp-2);
+}
+
+.countInput {
+  max-width: 180px;
+}
+
+.summary {
+  margin: 0;
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius-s);
+  background: var(--surface-alt);
+  color: var(--text-secondary);
+  font-size: var(--font-caption);
+}
+
+@media (max-width: 540px) {
+  .row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .interval {
+    width: 100%;
+  }
+}

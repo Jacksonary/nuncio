@@ -1,0 +1,83 @@
+.splitter {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.vertical {
+  flex-direction: column;
+}
+
+.primary {
+  flex: none;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.secondary {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.handle {
+  flex: none;
+  position: relative;
+  width: 7px;
+  cursor: col-resize;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  touch-action: none;
+  outline: none;
+}
+
+.handle::after {
+  content: "";
+  width: 1px;
+  height: 100%;
+  background: var(--border);
+  transition:
+    background-color var(--duration-fast) var(--ease),
+    width var(--duration-fast) var(--ease);
+}
+
+.handle:hover::after,
+.handle:focus-visible::after,
+.dragging::after {
+  width: 2px;
+  background: var(--accent);
+}
+
+.handle:focus-visible {
+  outline: 2px solid var(--focus-outline);
+  outline-offset: -2px;
+  border-radius: var(--radius-s);
+}
+
+.vertical .handle {
+  width: 100%;
+  height: 7px;
+  cursor: row-resize;
+}
+
+.vertical .handle::after {
+  width: 100%;
+  height: 1px;
+}
+
+.vertical .handle:hover::after,
+.vertical .handle:focus-visible::after,
+.vertical .dragging::after {
+  width: 100%;
+  height: 2px;
+}
+
+.dragging {
+  user-select: none;
+}

@@ -1,0 +1,160 @@
+.root {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  padding: var(--sp-2) var(--sp-3) var(--sp-2);
+  gap: var(--sp-2);
+}
+
+.toolbar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: 36px;
+  padding: 0 var(--sp-1);
+}
+
+.navGroup {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+}
+
+.title {
+  font-size: 18px;
+  line-height: 24px;
+  font-weight: var(--weight-semibold);
+  margin: 0 var(--sp-2) 0 var(--sp-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.spacer {
+  flex: 1;
+  min-width: var(--sp-2);
+}
+
+.searchWrap {
+  width: 220px;
+  flex: none;
+}
+
+.viewTabs {
+  flex: none;
+}
+
+.content {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border-subtle);
+  position: relative;
+}
+
+.loading {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.searchPopover {
+  padding: var(--sp-1);
+}
+
+.searchHeader {
+  font-size: var(--font-caption);
+  color: var(--text-tertiary);
+  padding: var(--sp-1) var(--sp-2);
+  font-weight: var(--weight-semibold);
+}
+
+.searchEmpty {
+  padding: var(--sp-4);
+  color: var(--text-tertiary);
+  font-size: var(--font-caption);
+  text-align: center;
+}
+
+.searchResults {
+  display: flex;
+  flex-direction: column;
+  max-height: 360px;
+  overflow-y: auto;
+}
+
+.searchItem {
+  display: flex;
+  align-items: stretch;
+  gap: var(--sp-2);
+  padding: var(--sp-2);
+  border: none;
+  background: transparent;
+  border-radius: var(--radius-s);
+  text-align: left;
+  cursor: pointer;
+  min-width: 0;
+}
+
+.searchItem:hover {
+  background: var(--surface-hover);
+}
+
+.searchItem:focus-visible {
+  outline: 2px solid var(--focus-outline);
+  outline-offset: -2px;
+}
+
+.searchColor {
+  flex: none;
+  width: 3px;
+  border-radius: 2px;
+}
+
+.searchBody {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 2px;
+}
+
+.searchTitle {
+  font-size: 13px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.searchMeta {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: var(--font-caption);
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (max-width: 1080px) {
+  .searchWrap {
+    width: 160px;
+  }
+}
+
+@media (max-width: 900px) {
+  .toolbar {
+    flex-wrap: wrap;
+  }
+  .title {
+    order: 5;
+    flex-basis: 100%;
+  }
+}

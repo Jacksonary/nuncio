@@ -1,0 +1,79 @@
+glib v0.18.5
+├── atk v0.18.2
+│   └── gtk v0.18.2
+│       ├── libappindicator v0.9.0
+│       │   └── tray-icon v0.25.1
+│       │       └── tauri v2.12.5
+│       │           ├── nuncio v0.1.0 (<repo>/src-tauri)
+│       │           ├── tauri-plugin-autostart v2.7.0
+│       │           │   └── nuncio v0.1.0 (<repo>/src-tauri)
+│       │           ├── tauri-plugin-deep-link v2.6.3
+│       │           │   ├── nuncio v0.1.0 (<repo>/src-tauri)
+│       │           │   └── tauri-plugin-single-instance v2.5.5
+│       │           │       └── nuncio v0.1.0 (<repo>/src-tauri)
+│       │           ├── tauri-plugin-dialog v2.8.4
+│       │           │   └── nuncio v0.1.0 (<repo>/src-tauri)
+│       │           ├── tauri-plugin-fs v2.7.1
+│       │           │   └── tauri-plugin-dialog v2.8.4 (*)
+│       │           ├── tauri-plugin-notification v2.8.1
+│       │           │   └── nuncio v0.1.0 (<repo>/src-tauri)
+│       │           ├── tauri-plugin-opener v2.7.3
+│       │           │   └── nuncio v0.1.0 (<repo>/src-tauri)
+│       │           ├── tauri-plugin-process v2.4.0
+│       │           │   └── nuncio v0.1.0 (<repo>/src-tauri)
+│       │           ├── tauri-plugin-single-instance v2.5.5 (*)
+│       │           ├── tauri-plugin-updater v2.14.1
+│       │           │   └── nuncio v0.1.0 (<repo>/src-tauri)
+│       │           └── tauri-plugin-window-state v2.5.0
+│       │               └── nuncio v0.1.0 (<repo>/src-tauri)
+│       ├── muda v0.20.0
+│       │   ├── tauri v2.12.5 (*)
+│       │   └── tray-icon v0.25.1 (*)
+│       ├── tao v0.37.2
+│       │   └── tauri-runtime-wry v2.12.3
+│       │       └── tauri v2.12.5 (*)
+│       ├── tauri v2.12.5 (*)
+│       ├── tauri-runtime v2.12.2
+│       │   ├── tauri v2.12.5 (*)
+│       │   └── tauri-runtime-wry v2.12.3 (*)
+│       ├── tauri-runtime-wry v2.12.3 (*)
+│       ├── webkit2gtk v2.0.2
+│       │   ├── tauri v2.12.5 (*)
+│       │   ├── tauri-runtime v2.12.2 (*)
+│       │   ├── tauri-runtime-wry v2.12.3 (*)
+│       │   └── wry v0.57.2
+│       │       └── tauri-runtime-wry v2.12.3 (*)
+│       └── wry v0.57.2 (*)
+├── cairo-rs v0.18.5
+│   ├── gdk v0.18.2
+│   │   ├── gdkx11 v0.18.2
+│   │   │   └── wry v0.57.2 (*)
+│   │   ├── gtk v0.18.2 (*)
+│   │   └── webkit2gtk v2.0.2 (*)
+│   ├── gtk v0.18.2 (*)
+│   └── webkit2gtk v2.0.2 (*)
+├── gdk v0.18.2 (*)
+├── gdk-pixbuf v0.18.5
+│   ├── gdk v0.18.2 (*)
+│   └── gtk v0.18.2 (*)
+├── gdkx11 v0.18.2 (*)
+├── gio v0.18.4
+│   ├── gdk v0.18.2 (*)
+│   ├── gdk-pixbuf v0.18.5 (*)
+│   ├── gdkx11 v0.18.2 (*)
+│   ├── gtk v0.18.2 (*)
+│   ├── pango v0.18.3
+│   │   ├── gdk v0.18.2 (*)
+│   │   └── gtk v0.18.2 (*)
+│   ├── soup3 v0.5.0
+│   │   ├── webkit2gtk v2.0.2 (*)
+│   │   └── wry v0.57.2 (*)
+│   └── webkit2gtk v2.0.2 (*)
+├── gtk v0.18.2 (*)
+├── javascriptcore-rs v1.1.2
+│   ├── webkit2gtk v2.0.2 (*)
+│   └── wry v0.57.2 (*)
+├── libappindicator v0.9.0 (*)
+├── pango v0.18.3 (*)
+├── soup3 v0.5.0 (*)
+└── webkit2gtk v2.0.2 (*)

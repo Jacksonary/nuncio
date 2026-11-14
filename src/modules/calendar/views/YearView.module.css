@@ -1,0 +1,132 @@
+.root {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--sp-4);
+  padding: var(--sp-3) var(--sp-4) var(--sp-5);
+  overflow-y: auto;
+  height: 100%;
+  align-content: start;
+}
+
+.month {
+  background: var(--surface-alt);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-m);
+  padding: var(--sp-2) var(--sp-2) var(--sp-1);
+  min-width: 0;
+}
+
+.monthTitle {
+  display: block;
+  width: 100%;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: var(--weight-semibold);
+  text-align: left;
+  padding: var(--sp-1);
+  border-radius: var(--radius-s);
+  cursor: pointer;
+}
+
+.monthTitle:hover {
+  background: var(--surface-hover);
+  color: var(--accent);
+}
+
+.monthTitle:focus-visible {
+  outline: 2px solid var(--focus-outline);
+  outline-offset: 0;
+}
+
+.weekdayHeader {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  padding: var(--sp-1) 0 2px;
+}
+
+.weekdayHeader span {
+  text-align: center;
+  font-size: 9px;
+  color: var(--text-tertiary);
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 1px;
+}
+
+.day {
+  position: relative;
+  height: 24px;
+  border: none;
+  background: transparent;
+  border-radius: var(--radius-s);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0;
+  color: var(--text);
+}
+
+.day:hover {
+  background: var(--surface-hover);
+}
+
+.day:focus-visible {
+  outline: 2px solid var(--focus-outline);
+  outline-offset: -1px;
+}
+
+.day.outside {
+  opacity: 0.28;
+}
+
+.day.hasEvents .dayNumber {
+  font-weight: var(--weight-semibold);
+}
+
+.dayNumber {
+  font-size: 10px;
+  line-height: 11px;
+}
+
+.day.today .dayNumber {
+  background: var(--accent);
+  color: var(--accent-text);
+  border-radius: var(--radius-round);
+  width: 17px;
+  height: 17px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.dots {
+  position: absolute;
+  bottom: 1px;
+  display: inline-flex;
+  gap: 1px;
+}
+
+.dot {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+}
+
+@media (max-width: 1200px) {
+  .root {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 860px) {
+  .root {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

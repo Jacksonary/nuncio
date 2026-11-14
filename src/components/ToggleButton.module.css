@@ -1,0 +1,14 @@
+.pressed {
+  background: var(--accent-subtle);
+  border-color: var(--accent-border);
+  color: var(--accent);
+}
+
+.pressed:hover {
+  background: var(--accent-subtle-hover);
+}
+
+.pressedPrimary {
+  background: var(--accent-pressed);
+  color: var(--accent-text);
+}

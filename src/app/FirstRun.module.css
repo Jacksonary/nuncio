@@ -1,0 +1,126 @@
+.layer {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-first-run);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--sp-6);
+  background: var(--bg-layer);
+  backdrop-filter: blur(40px) saturate(150%);
+  -webkit-backdrop-filter: blur(40px) saturate(150%);
+  animation: firstRunIn var(--duration-slow) var(--ease);
+}
+
+.dragStrip {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: var(--titlebar-height);
+}
+
+.card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-3);
+  width: min(560px, 100%);
+  max-height: calc(100vh - 64px);
+  overflow-y: auto;
+  padding: var(--sp-8) var(--sp-8) var(--sp-6);
+  background: var(--overlay);
+  border: 1px solid var(--border);
+  border-radius: calc(var(--radius-l) + 4px);
+  box-shadow: var(--shadow-flyout);
+  text-align: center;
+  animation: firstRunCard var(--duration-slow) var(--ease);
+}
+
+.title {
+  font-size: var(--font-title);
+  line-height: var(--line-title);
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+  margin-top: var(--sp-2);
+}
+
+.subtitle {
+  font-size: var(--font-body);
+  line-height: var(--line-body);
+  color: var(--text-secondary);
+  max-width: 420px;
+}
+
+.features {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin: var(--sp-3) 0 0;
+  padding: 0;
+  list-style: none;
+  align-self: stretch;
+  text-align: left;
+}
+
+.feature {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  font-size: var(--font-caption);
+  line-height: var(--line-caption);
+  color: var(--text-secondary);
+}
+
+.featureIcon {
+  display: inline-flex;
+  align-items: center;
+  color: var(--accent);
+  font-size: 16px;
+  flex: none;
+  margin-top: 1px;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  margin-top: var(--sp-4);
+}
+
+.privacy {
+  margin-top: var(--sp-2);
+  font-size: var(--font-caption);
+  line-height: var(--line-caption);
+  color: var(--text-tertiary);
+  max-width: 420px;
+}
+
+@keyframes firstRunIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes firstRunCard {
+  from {
+    opacity: 0;
+    transform: translateY(12px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .layer,
+  .card {
+    animation: none;
+  }
+}

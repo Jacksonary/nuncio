@@ -1,0 +1,45 @@
+.commandBar {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.visible {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  min-width: 0;
+  flex: 0 1 auto;
+  overflow: hidden;
+}
+
+.measureRow {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  height: 0;
+  overflow: hidden;
+  visibility: hidden;
+  pointer-events: none;
+  z-index: -1;
+}
+
+.measureButton {
+  flex: none;
+}
+
+.overflow {
+  flex: none;
+  margin-left: auto;
+}
+
+.ribbon {
+  gap: var(--sp-2);
+}

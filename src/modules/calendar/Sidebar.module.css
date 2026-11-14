@@ -1,0 +1,242 @@
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.miniSection {
+  flex: none;
+  padding: var(--sp-1) var(--sp-2) var(--sp-3);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.miniHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  padding: 0 var(--sp-1) var(--sp-1);
+}
+
+.miniTitle {
+  font-size: 13px;
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.miniNav {
+  display: inline-flex;
+  gap: 0;
+  flex: none;
+}
+
+.miniGrid {
+  display: grid;
+  align-items: center;
+  justify-items: center;
+  row-gap: 1px;
+}
+
+.miniWeekHeading,
+.miniWeekday {
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  color: var(--text-tertiary);
+  font-weight: var(--weight-medium);
+}
+
+.miniWeekNumber {
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 9px;
+  color: var(--text-tertiary);
+}
+
+.miniDay {
+  position: relative;
+  width: 26px;
+  height: 26px;
+  margin: 0 auto;
+  border: 1px solid transparent;
+  border-radius: var(--radius-round);
+  background: transparent;
+  color: var(--text);
+  font-size: 11.5px;
+  line-height: 14px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0;
+}
+
+.miniDay:hover {
+  background: var(--surface-hover);
+}
+
+.miniDay:focus-visible {
+  outline: 2px solid var(--focus-outline);
+  outline-offset: 0;
+}
+
+.miniOutside {
+  color: var(--text-disabled);
+}
+
+.miniToday {
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: var(--weight-semibold);
+}
+
+.miniSelected {
+  background: var(--accent-subtle);
+  color: var(--text);
+  font-weight: var(--weight-semibold);
+}
+
+.miniDayNumber {
+  line-height: 1;
+}
+
+.miniDots {
+  position: absolute;
+  bottom: 1px;
+  display: inline-flex;
+  gap: 1px;
+}
+
+.miniDot {
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+}
+
+.listSection {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: var(--sp-2) 0 0;
+}
+
+.sectionTitle {
+  flex: none;
+  margin: 0;
+  padding: 0 var(--sp-3) var(--sp-1);
+  font-size: 11px;
+  line-height: 14px;
+  font-weight: var(--weight-semibold);
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.calendarScroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 var(--sp-2);
+}
+
+.group {
+  margin-bottom: var(--sp-2);
+}
+
+.groupTitle {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  padding: var(--sp-1) var(--sp-1) 2px;
+  min-width: 0;
+}
+
+.groupDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.groupName {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.calendarRow {
+  border-radius: var(--radius-s);
+  padding: 2px 4px;
+}
+
+.calendarRow:hover {
+  background: var(--surface-hover);
+}
+
+.calendarRow[data-hidden='true'] {
+  opacity: 0.55;
+}
+
+.calendarCheckbox {
+  display: flex;
+  width: 100%;
+  align-items: center;
+}
+
+.calendarLabel {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+  font-size: 12.5px;
+  color: var(--text);
+}
+
+.calendarSwatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  flex: none;
+}
+
+.calendarName {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.calendarBadge {
+  flex: none;
+  color: var(--text-tertiary);
+  font-size: 12px;
+}
+
+.placeholder {
+  margin: 0;
+  padding: var(--sp-2) var(--sp-2);
+  color: var(--text-tertiary);
+  font-size: var(--font-caption);
+}
+
+.addRow {
+  flex: none;
+  padding: var(--sp-1) var(--sp-2) var(--sp-2);
+  border-top: 1px solid var(--border-subtle);
+}
+
+.addButton {
+  justify-content: flex-start;
+}

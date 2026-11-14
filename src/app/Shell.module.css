@@ -1,0 +1,343 @@
+.shell {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  min-height: 0;
+  overflow: hidden;
+  background: transparent;
+  color: var(--text);
+}
+
+.titleBar {
+  flex: none;
+  height: var(--titlebar-height);
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 0 var(--sp-3) 0 var(--sp-2);
+  user-select: none;
+}
+
+/* macOS: leave room for the overlaid traffic lights. */
+.titleBarMac {
+  padding-left: var(--titlebar-mac-padding);
+}
+
+/* Windows/Linux: caption buttons flush with the window edge. */
+.titleBarControls {
+  padding-right: 0;
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex: none;
+}
+
+.brandName {
+  font-size: 13px;
+  font-weight: var(--weight-semibold);
+  color: var(--text-secondary);
+  letter-spacing: 0.01em;
+}
+
+.dragSpacer {
+  flex: 1;
+  align-self: stretch;
+  min-width: var(--sp-4);
+}
+
+.titleActions {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  flex: none;
+}
+
+.workArea {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  gap: var(--sp-2);
+  padding: 0 var(--sp-2) var(--sp-2);
+}
+
+.nav {
+  flex: none;
+  width: var(--nav-width);
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--pane-nav);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-l);
+  backdrop-filter: blur(30px) saturate(150%);
+  -webkit-backdrop-filter: blur(30px) saturate(150%);
+  box-shadow: var(--shadow-2);
+  overflow: hidden;
+  transition: width var(--duration-slow) var(--ease);
+}
+
+.rail {
+  width: var(--nav-rail-width);
+}
+
+.navHeader {
+  flex: none;
+  padding: var(--sp-3);
+}
+
+.rail .navHeader {
+  padding: var(--sp-2) 0;
+  display: flex;
+  justify-content: center;
+}
+
+.navBody {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.rail .navBody {
+  display: none;
+}
+
+.navFooter {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding: var(--sp-2);
+  border-top: 1px solid var(--border-subtle);
+}
+
+.syncRow {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: 100%;
+  min-height: 26px;
+  padding: 0 var(--sp-1);
+  border: none;
+  border-radius: var(--radius-s);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 14px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.syncRow:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.syncRow:focus-visible {
+  outline: 2px solid var(--focus-outline);
+  outline-offset: -2px;
+}
+
+.syncIcon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  font-size: 14px;
+  flex: none;
+  color: var(--accent);
+}
+
+.syncIconError {
+  color: var(--danger);
+}
+
+.syncIconWarning {
+  color: var(--warning);
+}
+
+.syncIconSuccess {
+  color: var(--success);
+}
+
+.syncText {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rail .syncRow {
+  justify-content: center;
+  padding: 0;
+}
+
+.rail .syncText {
+  display: none;
+}
+
+.switcher {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  min-width: 0;
+}
+
+.moduleButton {
+  flex: 1;
+  min-width: 0;
+  height: 52px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  padding: 4px 2px;
+  border: none;
+  border-radius: var(--radius-m);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  position: relative;
+  transition:
+    background-color var(--duration-fast) var(--ease),
+    color var(--duration-fast) var(--ease);
+}
+
+.moduleButton:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.moduleButton:focus-visible {
+  outline: 2px solid var(--focus-outline);
+  outline-offset: -2px;
+}
+
+.moduleButtonActive,
+.moduleButtonActive:hover {
+  color: var(--accent);
+}
+
+.moduleButtonActive::after {
+  content: "";
+  position: absolute;
+  bottom: 3px;
+  width: 16px;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--accent);
+}
+
+.moduleIcon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 20px;
+  line-height: 1;
+}
+
+.moduleLabel {
+  font-size: 10px;
+  line-height: 12px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rail .switcher {
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-1);
+}
+
+.rail .moduleButton {
+  flex: none;
+  width: 100%;
+  height: 40px;
+}
+
+.rail .moduleLabel,
+.rail .moduleButtonActive::after {
+  display: none;
+}
+
+.railItemWrap {
+  width: 100%;
+}
+
+.settingsButton {
+  flex: none;
+  align-self: center;
+}
+
+.rail .settingsButton {
+  margin-top: var(--sp-1);
+}
+
+.main {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--pane-content);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-l);
+  backdrop-filter: blur(30px) saturate(150%);
+  -webkit-backdrop-filter: blur(30px) saturate(150%);
+  box-shadow: var(--shadow-2);
+  overflow: hidden;
+  position: relative;
+}
+
+.offlineBanner {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-4);
+  background: var(--warning-subtle);
+  border-bottom: 1px solid var(--border);
+  font-size: var(--font-caption);
+  color: var(--text);
+}
+
+.offlineText {
+  flex: 1;
+  min-width: 0;
+}
+
+.mainBody {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  animation: moduleIn var(--duration-normal) var(--ease);
+}
+
+@keyframes moduleIn {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nav,
+  .mainBody {
+    animation: none;
+    transition: none;
+  }
+}

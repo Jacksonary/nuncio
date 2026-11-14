@@ -1,0 +1,39 @@
+.split {
+  display: inline-flex;
+  align-items: stretch;
+  border-radius: var(--radius-s);
+  overflow: hidden;
+}
+
+.primary {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.menuTrigger {
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  border-left: 1px solid color-mix(in srgb, currentColor 22%, transparent);
+  width: var(--control-height);
+}
+
+.split.small .menuTrigger {
+  width: var(--control-height-sm);
+}
+
+.split.large .menuTrigger {
+  width: var(--control-height-lg);
+}
+
+.chevron {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+}
+
+.primary:focus-visible,
+.menuTrigger:focus-visible {
+  position: relative;
+  z-index: 1;
+}

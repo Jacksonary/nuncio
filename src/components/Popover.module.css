@@ -1,0 +1,44 @@
+.popover {
+  position: fixed;
+  z-index: var(--z-popover);
+  margin: 0;
+  padding: 0;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-m);
+  box-shadow: var(--shadow-flyout);
+  /*
+   * No backdrop-filter here: it would create a containing block, which breaks
+   * inline (non-portal) nested submenus that use position: fixed.
+   * The translucent surface token still gives the Mica-like layering.
+   */
+  animation: popoverIn var(--duration-normal) var(--ease);
+  max-width: calc(100vw - 16px);
+  max-height: calc(100vh - 16px);
+  overflow: visible;
+  box-sizing: border-box;
+}
+
+.measuring {
+  visibility: hidden;
+  opacity: 0;
+  pointer-events: none;
+}
+
+@keyframes popoverIn {
+  from {
+    opacity: 0;
+    transform: translateY(-2px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .popover {
+    animation: none;
+  }
+}

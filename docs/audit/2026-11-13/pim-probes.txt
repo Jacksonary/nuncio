@@ -1,0 +1,47 @@
+   Compiling tokio-util v0.7.20
+   Compiling futures-task v0.3.34
+   Compiling idna v1.1.0
+   Compiling uuid v1.29.2
+   Compiling futures-channel v0.3.34
+   Compiling tokio-rustls v0.26.6
+   Compiling quick-xml v0.42.0
+   Compiling futures-util v0.3.34
+   Compiling r2d2_sqlite v0.36.0
+   Compiling url v2.5.8
+   Compiling h2 v0.4.20
+   Compiling nuncio-core v0.1.0 (<repo>/src-tauri/crates/core)
+   Compiling ammonia v4.2.4
+   Compiling tower v0.5.3
+   Compiling tower-http v0.6.11
+   Compiling hyper v1.12.0
+   Compiling hyper-util v0.1.21
+   Compiling hyper-rustls v0.27.10
+   Compiling reqwest v0.13.5
+   Compiling nuncio-mime v0.1.0 (<repo>/src-tauri/crates/mime)
+   Compiling nuncio-ical v0.1.0 (<repo>/src-tauri/crates/ical)
+   Compiling nuncio-pim v0.1.0 (<repo>/src-tauri/crates/pim)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 31.06s
+     Running tests/audit_regressions.rs (target/debug/deps/audit_regressions-7824c1301cee5187)
+
+running 2 tests
+
+thread 'every_subscription_master_must_preserve_rdates' (176118) panicked at crates/pim/tests/audit_regressions.rs:20:5:
+the second master lost its RDATE occurrences
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test every_subscription_master_must_preserve_rdates ... FAILED
+
+thread 'recurring_task_count_two_must_stop_after_second_completion' (176119) panicked at crates/pim/tests/audit_regressions.rs:37:5:
+assertion `left == right` failed: COUNT=2 created a third active occurrence
+  left: 1
+ right: 0
+test recurring_task_count_two_must_stop_after_second_completion ... FAILED
+
+failures:
+
+failures:
+    every_subscription_master_must_preserve_rdates
+    recurring_task_count_two_must_stop_after_second_completion
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p nuncio-pim --test audit_regressions`

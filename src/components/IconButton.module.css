@@ -1,0 +1,84 @@
+.iconButton {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--control-height);
+  height: var(--control-height);
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius-s);
+  background: transparent;
+  color: var(--text);
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  flex: none;
+  transition:
+    background-color var(--duration-fast) var(--ease),
+    color var(--duration-fast) var(--ease),
+    border-color var(--duration-fast) var(--ease);
+}
+
+.small {
+  width: var(--control-height-sm);
+  height: var(--control-height-sm);
+  font-size: 16px;
+}
+
+.large {
+  width: var(--control-height-lg);
+  height: var(--control-height-lg);
+  font-size: 24px;
+}
+
+.iconButton:hover:not(:disabled) {
+  background: var(--surface-hover);
+}
+
+.iconButton:active:not(:disabled) {
+  background: var(--surface-pressed);
+}
+
+.iconButton:disabled {
+  opacity: 0.4;
+  cursor: default;
+  pointer-events: none;
+}
+
+.appearance-subtle {
+  background: var(--control-bg);
+  border-color: var(--border-subtle);
+}
+
+.appearance-subtle:hover:not(:disabled) {
+  background: var(--control-bg-hover);
+}
+
+.appearance-primary {
+  background: var(--accent);
+  color: var(--accent-text);
+}
+
+.appearance-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.selected {
+  background: var(--accent-subtle);
+  color: var(--accent);
+}
+
+.selected:hover:not(:disabled) {
+  background: var(--accent-subtle-hover);
+}
+
+.iconButton:focus-visible {
+  outline: 2px solid var(--focus-outline);
+  outline-offset: 2px;
+}
+
+.icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}

@@ -1,0 +1,65 @@
+/*
+ * Windows 11 style caption buttons: 46x32, transparent until hover, close
+ * turns red. The strip itself is not a drag region so clicks never start a
+ * window drag.
+ */
+.controls {
+  display: flex;
+  align-items: center;
+  align-self: stretch;
+  flex: none;
+  margin-left: var(--sp-2);
+  -webkit-app-region: no-drag;
+}
+
+.button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--caption-button-width);
+  height: var(--caption-button-height);
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: default;
+  outline: none;
+  transition:
+    background-color var(--duration-fast) var(--ease),
+    color var(--duration-fast) var(--ease);
+}
+
+.button > svg {
+  width: 10px;
+  height: 10px;
+}
+
+.button:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.button:active {
+  background: var(--surface-pressed);
+}
+
+.button:focus-visible {
+  outline: 2px solid var(--focus-outline);
+  outline-offset: -3px;
+}
+
+.close:hover {
+  background: #c42b1c;
+  color: #ffffff;
+}
+
+.close:active {
+  background: #b22a1b;
+  color: #ffffff;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .button {
+    transition: none;
+  }
+}

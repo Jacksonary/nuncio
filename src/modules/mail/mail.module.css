@@ -1,0 +1,1780 @@
+/* Mail module — Windows 11 Mail inspired layout built on the shared tokens. */
+
+.mailMain {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  overflow: hidden;
+}
+
+.listColumn,
+.readerColumn {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* ─────────────────────────────── Sidebar ─────────────────────────────── */
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding: var(--sp-2) var(--sp-2) var(--sp-3);
+  min-height: 100%;
+}
+
+.sidebarLoading,
+.sidebarEmpty {
+  padding: var(--sp-3);
+}
+
+.sidebarSection {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.accountRow,
+.unifiedRow {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  min-height: 30px;
+  padding: 1px 4px 1px 2px;
+  border-radius: var(--radius-s);
+  color: var(--text-secondary);
+}
+
+.accountRow:hover,
+.unifiedRow:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.folderRow {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  height: 28px;
+  padding-right: 6px;
+  border-radius: var(--radius-s);
+  cursor: default;
+  color: var(--text);
+  user-select: none;
+}
+
+.folderRow:hover {
+  background: var(--surface-hover);
+}
+
+.folderRow:focus-visible {
+  outline: 2px solid var(--focus-outline);
+  outline-offset: -2px;
+}
+
+.folderRowSelected,
+.folderRowSelected:hover {
+  background: var(--accent-subtle);
+  color: var(--text);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.folderRowDrop {
+  background: var(--accent-subtle-hover);
+  outline: 1px dashed var(--accent-border);
+  outline-offset: -1px;
+}
+
+.folderRowMuted {
+  color: var(--text-tertiary);
+}
+
+.folderChevron {
+  flex: none;
+  width: 16px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  border-radius: var(--radius-s);
+}
+
+.folderChevron:hover {
+  color: var(--text);
+}
+
+.folderChevronSpacer {
+  display: inline-block;
+  width: 16px;
+  height: 1px;
+}
+
+.folderIcon {
+  flex: none;
+  width: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-secondary);
+}
+
+.folderName {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  line-height: 18px;
+}
+
+.folderMutedIcon {
+  display: inline-flex;
+  color: var(--text-tertiary);
+  flex: none;
+}
+
+.folderLoading {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  padding: var(--sp-1) var(--sp-3);
+  font-size: var(--font-caption);
+  color: var(--text-tertiary);
+}
+
+.moreRow {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  height: 26px;
+  margin-top: 2px;
+  padding: 0 6px 0 4px;
+  border: none;
+  border-radius: var(--radius-s);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.moreRow:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.accountName,
+.unifiedName {
+  flex: 1;
+  min-width: 0;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: var(--weight-semibold);
+  font-size: 12px;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+.accountName:hover,
+.unifiedName:hover {
+  color: var(--accent);
+}
+
+.accountWarning {
+  display: inline-flex;
+  color: var(--warning);
+  flex: none;
+}
+
+.accountError {
+  display: inline-flex;
+  color: var(--danger);
+  flex: none;
+}
+
+.accountMuted {
+  display: inline-flex;
+  color: var(--text-tertiary);
+  flex: none;
+}
+
+.reauthBar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: 2px 4px var(--sp-1);
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: var(--radius-s);
+  background: var(--warning-subtle);
+  color: var(--text);
+  font-size: 11px;
+  line-height: 15px;
+}
+
+.reauthBar span {
+  flex: 1;
+  min-width: 0;
+}
+
+.sidebarFooter {
+  margin-top: auto;
+  padding-top: var(--sp-2);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.sidebarHint {
+  font-size: 10px;
+  line-height: 14px;
+  color: var(--text-tertiary);
+  padding: 0 var(--sp-1);
+}
+
+/* ─────────────────────────── Message list ─────────────────────────── */
+
+.listPane {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--pane-list);
+}
+
+.listHeader {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border-bottom: 1px solid var(--border-subtle);
+  background: color-mix(in srgb, var(--pane-list) 82%, transparent);
+  backdrop-filter: blur(12px);
+}
+
+.listTitleRow {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.listTitles {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+}
+
+.listTitle {
+  margin: 0;
+  font-size: 17px;
+  line-height: 22px;
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.listSubtitle {
+  font-size: var(--font-caption);
+  color: var(--text-tertiary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.listHeaderActions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+}
+
+.searchRow {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.searchRow > *:first-child {
+  flex: 1;
+  min-width: 0;
+}
+
+.scopeRow {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.scopeLabel {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  white-space: nowrap;
+}
+
+.scopeChips {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 1px;
+  border-radius: var(--radius-round);
+  background: var(--surface-alt);
+}
+
+.batchBar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  min-height: var(--control-height);
+  padding: 2px var(--sp-1);
+  border-radius: var(--radius-m);
+  background: var(--accent-subtle);
+}
+
+.batchCount {
+  padding: 0 var(--sp-2);
+  font-size: var(--font-caption);
+  font-weight: var(--weight-semibold);
+  white-space: nowrap;
+}
+
+.batchSpacer {
+  flex: 1;
+}
+
+.advancedPanel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-m);
+  background: var(--surface);
+}
+
+.advancedGrid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--sp-2);
+}
+
+.advancedChecks {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2) var(--sp-4);
+}
+
+.advancedActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--sp-2);
+}
+
+.listBody {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+}
+
+.listLoading {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.listFooter {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-1);
+  padding: var(--sp-1);
+  border-top: 1px solid var(--border-subtle);
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+.dateHeader {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3) var(--sp-1);
+  font-size: 11px;
+  font-weight: var(--weight-semibold);
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+  background: color-mix(in srgb, var(--pane-list) 90%, transparent);
+}
+
+.dateHeaderCount {
+  padding: 0 6px;
+  border-radius: var(--radius-round);
+  background: var(--surface-selected);
+  font-weight: var(--weight-regular);
+  letter-spacing: 0;
+}
+
+.messageRowWrap {
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+/* Horizontal swipe gesture (touch/pen, held mouse drag, trackpad wheel). */
+.swipeRow {
+  position: relative;
+  overflow: hidden;
+  touch-action: pan-y;
+  overscroll-behavior-x: contain;
+}
+
+.swipeContent {
+  position: relative;
+  will-change: transform;
+}
+
+.swipeContentSnap {
+  transition: transform 160ms var(--ease);
+}
+
+.swipeActionLayer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  display: flex;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.swipeActionLayer.swipeActionStart {
+  left: 0;
+}
+
+.swipeActionLayer.swipeActionEnd {
+  right: 0;
+}
+
+.swipeAction {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 0 var(--sp-3);
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: var(--weight-semibold);
+}
+
+.swipeActionStart .swipeAction {
+  justify-content: flex-start;
+}
+
+.swipeActionEnd .swipeAction {
+  justify-content: flex-end;
+}
+
+.swipeActionIcon {
+  display: inline-flex;
+  flex: none;
+}
+
+.swipeActionLabel {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.swipeToneAccent {
+  background: var(--accent);
+  color: var(--accent-text);
+}
+
+.swipeToneDanger {
+  background: var(--danger);
+  color: #ffffff;
+}
+
+.swipeToneNeutral {
+  background: var(--text-tertiary);
+  color: var(--surface-solid);
+}
+
+/* Outbox rows show the queue state instead of a body preview. */
+.rowOutboxStatus {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--text-secondary);
+}
+
+.rowOutboxStatusFailed {
+  color: var(--danger);
+}
+
+.rowOutboxIcon {
+  display: inline-flex;
+  flex: none;
+}
+
+.rowOutboxLabel {
+  flex: none;
+  font-weight: var(--weight-medium);
+}
+
+.rowOutboxError {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.85;
+}
+
+.messageRowOutbox .rowSubject {
+  font-style: italic;
+}
+
+.messageRow.messageRowOutboxFailed {
+  background: color-mix(in srgb, var(--danger-subtle) 45%, transparent);
+}
+
+.messageRow.messageRowOutboxFailed:hover {
+  background: var(--danger-subtle);
+}
+
+.messageRow {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  min-height: var(--row-min, 70px);
+  padding: var(--sp-2) var(--sp-3);
+  cursor: default;
+  user-select: none;
+  outline: none;
+}
+
+.messageRow:hover {
+  background: var(--surface-hover);
+}
+
+.messageRowCurrent {
+  box-shadow: inset 2px 0 0 var(--accent-border);
+}
+
+.messageRowSelected,
+.messageRowSelected:hover {
+  background: var(--accent-subtle);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.messageRow:focus-visible {
+  outline: 2px solid var(--focus-outline);
+  outline-offset: -2px;
+}
+
+.messageRow:focus-visible .rowHoverActions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.accountStripe {
+  position: absolute;
+  left: 0;
+  top: 4px;
+  bottom: 4px;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
+}
+
+.rowCheckbox {
+  flex: none;
+  display: flex;
+  align-items: center;
+  padding-top: 2px;
+}
+
+.rowAvatar {
+  flex: none;
+  margin-top: 1px;
+}
+
+.rowBody {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.rowTop {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  min-height: 18px;
+}
+
+.rowSender {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  line-height: 18px;
+  color: var(--text-secondary);
+}
+
+.messageRowUnread .rowSender {
+  color: var(--text);
+  font-weight: var(--weight-semibold);
+}
+
+.rowIcon,
+.rowIconImportant,
+.rowIconFlag {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  color: var(--text-tertiary);
+}
+
+.rowIconImportant {
+  color: var(--danger);
+}
+
+.rowIconFlag {
+  color: var(--accent);
+}
+
+.rowSpacer {
+  flex: 1;
+  min-width: 4px;
+}
+
+.rowDate {
+  flex: none;
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--text-tertiary);
+  padding-left: 4px;
+}
+
+.messageRowUnread .rowDate {
+  color: var(--accent);
+  font-weight: var(--weight-medium);
+}
+
+.threadBadge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  height: 18px;
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-round);
+  background: var(--surface-alt);
+  color: var(--text-secondary);
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.threadBadge:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.threadBadgeOpen {
+  background: var(--accent-subtle);
+  border-color: var(--accent-border);
+  color: var(--accent);
+}
+
+.threadBadgeUnread {
+  color: var(--accent);
+  font-weight: var(--weight-semibold);
+}
+
+.rowSubject {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  line-height: 18px;
+  color: var(--text);
+  min-height: 18px;
+}
+
+.messageRowUnread .rowSubject {
+  font-weight: var(--weight-semibold);
+}
+
+.rowPreview {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--text-tertiary);
+  overflow-wrap: anywhere;
+}
+
+.rowHoverActions {
+  position: absolute;
+  top: 3px;
+  right: 6px;
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  padding: 1px;
+  border-radius: var(--radius-m);
+  background: var(--surface);
+  border: 1px solid var(--border-subtle);
+  box-shadow: var(--shadow-2);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--duration-fast) var(--ease);
+}
+
+.messageRow:hover .rowHoverActions,
+.messageRow:focus-within .rowHoverActions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.messageRowHasActions:hover .rowDate {
+  visibility: hidden;
+}
+
+.threadMembers {
+  display: flex;
+  flex-direction: column;
+  padding: 0 0 var(--sp-1) 44px;
+  background: color-mix(in srgb, var(--pane-list) 55%, transparent);
+}
+
+.threadLoading {
+  padding: var(--sp-1) 0 var(--sp-1) 44px;
+}
+
+.threadMember {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  min-height: 26px;
+  padding: 1px var(--sp-3) 1px var(--sp-1);
+  border-radius: var(--radius-s);
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.threadMember:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.threadMemberUnread {
+  color: var(--text);
+  font-weight: var(--weight-semibold);
+}
+
+.threadAvatar {
+  flex: none;
+}
+
+.threadSender {
+  flex: none;
+  max-width: 35%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.threadSubject {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-tertiary);
+}
+
+.threadDate {
+  flex: none;
+  font-size: 10px;
+  color: var(--text-tertiary);
+}
+
+.inlineIcon {
+  display: inline-flex;
+  color: var(--text-tertiary);
+  flex: none;
+}
+
+/* ─────────────────────────── Reading pane ─────────────────────────── */
+
+.readerPane {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--pane-content);
+  overflow: hidden;
+}
+
+.readerLoading {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.messageCard {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.messageHeader {
+  flex: none;
+  padding: var(--sp-3) var(--sp-4) var(--sp-2);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.subjectRow {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.messageSubject {
+  margin: 0;
+  flex: 1;
+  min-width: 0;
+  font-size: 18px;
+  line-height: 24px;
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.headerFlag {
+  color: var(--accent);
+  flex: none;
+}
+
+.messageMeta {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+}
+
+.headerAvatar {
+  flex: none;
+  margin-top: 1px;
+}
+
+.messageMetaText {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.senderLine {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-1);
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.senderAddress {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.senderContact {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+}
+
+.senderName {
+  max-width: 100%;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  font-weight: var(--weight-semibold);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  border-radius: var(--radius-s);
+}
+
+.senderName:hover {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.senderName:focus-visible {
+  outline: 2px solid var(--focus-outline);
+  outline-offset: 1px;
+}
+
+.recipientLine {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+  flex-wrap: wrap;
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+.recipientToggle {
+  max-width: 44ch;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  border-radius: var(--radius-s);
+}
+
+.recipientToggle:hover {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.recipientChip {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 32ch;
+}
+
+.messageDate {
+  color: var(--text-tertiary);
+  white-space: nowrap;
+}
+
+.recipientsDetail {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: var(--sp-1);
+  padding: var(--sp-2);
+  border-radius: var(--radius-m);
+  background: var(--surface-alt);
+  font-size: 11px;
+}
+
+.recipientDetailRow {
+  display: flex;
+  gap: var(--sp-2);
+}
+
+.recipientDetailLabel {
+  flex: none;
+  width: 56px;
+  color: var(--text-tertiary);
+}
+
+.recipientDetailValue {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px var(--sp-2);
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+
+.accountChip {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  padding: 2px var(--sp-2);
+  border-radius: var(--radius-round);
+  background: var(--surface-alt);
+  border: 1px solid var(--border-subtle);
+  font-size: 10px;
+  color: var(--text-secondary);
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.accountDot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+
+.externalNotice {
+  margin-top: var(--sp-2);
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: var(--radius-s);
+  background: var(--warning-subtle);
+  color: var(--text);
+  font-size: 11px;
+}
+
+.messageToolbar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: var(--sp-1) var(--sp-3);
+  border-bottom: 1px solid var(--border-subtle);
+  min-height: 38px;
+}
+
+.toolbarSeparator {
+  width: 1px;
+  align-self: stretch;
+  margin: 6px var(--sp-1);
+  background: var(--border);
+}
+
+.toolbarSpacer {
+  flex: 1;
+}
+
+.bodyWrap {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  background: var(--surface-solid);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.messageFrame {
+  flex: 1;
+  width: 100%;
+  height: 100%;
+  border: none;
+  background: #ffffff;
+  display: block;
+}
+
+.plainBody {
+  flex: 1;
+  margin: 0;
+  padding: var(--sp-4);
+  font-family: var(--font-ui);
+  font-size: var(--font-body);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow: auto;
+  color: var(--text);
+  background: var(--surface-solid);
+}
+
+/* Reading view (readability): the extracted article in a typographic column. */
+.readingView {
+  flex: 1;
+  min-width: 0;
+  overflow: auto;
+  padding: var(--sp-6) var(--sp-5);
+  background: var(--surface-solid);
+}
+
+.readingArticle {
+  max-width: 44rem;
+  margin: 0 auto;
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: var(--font-body);
+  line-height: 1.75;
+  overflow-wrap: anywhere;
+}
+
+.readingHeading {
+  margin: 1.6em 0 0.5em;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.readingHeading:first-child {
+  margin-top: 0;
+}
+
+.readingHeading1 {
+  font-size: 1.6em;
+}
+
+.readingHeading2 {
+  font-size: 1.35em;
+}
+
+.readingHeading3 {
+  font-size: 1.18em;
+}
+
+.readingHeading4,
+.readingHeading5,
+.readingHeading6 {
+  font-size: 1.05em;
+}
+
+.readingParagraph {
+  margin: 0 0 1em;
+  white-space: pre-wrap;
+}
+
+.readingListItem {
+  display: flex;
+  gap: 0.55em;
+  margin: 0 0 0.4em;
+  padding-left: 0.2em;
+}
+
+.readingListMarker {
+  flex: none;
+  min-width: 1.4em;
+  text-align: right;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.readingListText {
+  flex: 1;
+  min-width: 0;
+  white-space: pre-wrap;
+}
+
+.readingQuote {
+  margin: 0 0 1em;
+  padding: 0.15em 0 0.15em 1em;
+  border-left: 3px solid var(--border);
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+}
+
+.readingPre {
+  margin: 0 0 1em;
+  padding: var(--sp-3);
+  overflow-x: auto;
+  border-radius: 6px;
+  background: var(--surface-alt);
+  font-family: var(--font-mono);
+  font-size: 0.875em;
+  line-height: 1.5;
+  white-space: pre;
+}
+
+.emptyBody {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-tertiary);
+  font-size: var(--font-caption);
+}
+
+.remoteBar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  padding: var(--sp-1) var(--sp-3);
+  background: var(--warning-subtle);
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: 11px;
+  color: var(--text);
+}
+
+.remoteIcon {
+  display: inline-flex;
+  color: var(--warning);
+  flex: none;
+}
+
+.remoteText {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.remoteSpacer {
+  flex: 1;
+}
+
+.outboxNotice {
+  flex: none;
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--accent-subtle);
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: 12px;
+  color: var(--text);
+}
+
+.outboxNoticeFailed {
+  background: var(--danger-subtle);
+}
+
+.outboxNoticeFailed .remoteIcon {
+  color: var(--danger);
+}
+
+.outboxNoticeText {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.outboxNoticeLabel {
+  font-weight: var(--weight-semibold);
+}
+
+.outboxNoticeError {
+  overflow-wrap: anywhere;
+  color: var(--danger);
+}
+
+.outboxNoticeHint {
+  color: var(--text-tertiary);
+  font-size: 11px;
+}
+
+.inviteCard {
+  margin: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--accent-border);
+  background: var(--accent-subtle);
+  flex: none;
+}
+
+.inviteHeader {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+}
+
+.inviteIcon {
+  flex: none;
+  display: inline-flex;
+  color: var(--accent);
+}
+
+.inviteTitles {
+  flex: 1;
+  min-width: 0;
+}
+
+.inviteTitle {
+  font-size: 14px;
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+}
+
+.inviteMeta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px var(--sp-3);
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.inviteMetaItem {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.inviteRow {
+  display: flex;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.inviteLabel {
+  flex: none;
+  min-width: 64px;
+  color: var(--text-tertiary);
+}
+
+.inviteAttendees {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px var(--sp-2);
+}
+
+.inviteAttendee {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.inviteMore {
+  color: var(--text-tertiary);
+}
+
+.inviteActions {
+  display: flex;
+  gap: var(--sp-2);
+  margin-top: var(--sp-3);
+}
+
+.attachmentStrip {
+  flex: none;
+  padding: var(--sp-2) var(--sp-3);
+  border-top: 1px solid var(--border-subtle);
+  background: var(--surface-alt);
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.attachmentHeader {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-1);
+}
+
+.attachmentTitle {
+  flex: 1;
+  font-size: 11px;
+  font-weight: var(--weight-semibold);
+  color: var(--text-secondary);
+}
+
+.attachmentList {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1);
+}
+
+.attachmentChip {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  max-width: 320px;
+  padding: 2px 2px 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-m);
+  background: var(--surface);
+}
+
+.attachmentChip:hover {
+  border-color: var(--border-strong);
+}
+
+.attachmentMain {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  min-width: 0;
+  padding: 2px;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.attachmentIcon {
+  display: inline-flex;
+  color: var(--accent);
+  flex: none;
+}
+
+.attachmentName {
+  max-width: 190px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attachmentSize {
+  flex: none;
+  color: var(--text-tertiary);
+  font-size: 10px;
+}
+
+.conversationHeader {
+  flex: none;
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-4);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.conversationTitle {
+  font-size: 13px;
+  font-weight: var(--weight-semibold);
+}
+
+.conversationCount {
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+.conversationScroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: var(--sp-3);
+}
+
+.threadCard {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-m);
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.threadCardMessage {
+  flex: none;
+}
+
+.threadCardLabel {
+  flex: none;
+  padding: var(--sp-1) var(--sp-3);
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: 10px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+.threadMessageCard {
+  flex: none;
+}
+
+.threadMessageCard .bodyWrap {
+  flex: 0 0 auto;
+  height: 420px;
+}
+
+.threadMessageCard .messageHeader {
+  padding-top: var(--sp-2);
+}
+
+.threadCardLoading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  padding: var(--sp-4);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-m);
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.collapsedMessage {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: 100%;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-m);
+  background: var(--surface-alt);
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.collapsedMessage:hover {
+  background: var(--surface-hover);
+  border-color: var(--border);
+}
+
+.collapsedSender {
+  flex: none;
+  max-width: 34%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-weight: var(--weight-medium);
+}
+
+.collapsedSubject {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.collapsedDate {
+  flex: none;
+  font-size: 10px;
+  color: var(--text-tertiary);
+}
+
+.rawHeaders {
+  margin: 0;
+  max-height: 60vh;
+  overflow: auto;
+  padding: var(--sp-3);
+  border-radius: var(--radius-m);
+  background: var(--surface-alt);
+  border: 1px solid var(--border-subtle);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text-secondary);
+}
+
+/* ───────────────────────────── Contact card ───────────────────────────── */
+
+.contactPopover {
+  padding: var(--sp-3);
+}
+
+.contactHeader {
+  display: flex;
+  gap: var(--sp-2);
+  align-items: flex-start;
+}
+
+.contactIdentity {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 1px;
+}
+
+.contactName {
+  font-size: 13px;
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.contactEmail {
+  font-size: 11px;
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+
+.contactMeta {
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+.contactBody {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+  padding-top: var(--sp-2);
+  border-top: 1px solid var(--border-subtle);
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.contactLine {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  overflow-wrap: anywhere;
+}
+
+.contactLink {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.contactLink:hover {
+  text-decoration: underline;
+}
+
+.contactActions {
+  display: flex;
+  gap: var(--sp-1);
+  flex-wrap: wrap;
+}
+
+.contactHint {
+  color: var(--text-tertiary);
+  font-size: 11px;
+}
+
+.contactLoading {
+  display: flex;
+  justify-content: center;
+  padding: var(--sp-2);
+}
+
+/* ─────────────────────────── Inline composer ─────────────────────────── */
+
+.inlineCompose {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--pane-content);
+}
+
+.inlineComposeHeader {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  padding: var(--sp-1) var(--sp-2) var(--sp-1) var(--sp-3);
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--pane-nav);
+}
+
+.inlineComposeTitle {
+  font-size: 12px;
+  font-weight: var(--weight-semibold);
+  color: var(--text-secondary);
+}
+
+.inlineComposeSpacer {
+  flex: 1;
+}
+
+.inlineComposeBody {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* ─────────────────────────── Secondary windows ─────────────────────────── */
+
+.windowRoot {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Small screens: keep the panes usable. */
+@media (max-width: 900px) {
+  .advancedGrid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rowHoverActions,
+  .swipeContentSnap {
+    transition: none;
+  }
+}
+
+@media print {
+  .messageToolbar,
+  .remoteBar,
+  .accountChip,
+  .rowHoverActions {
+    display: none !important;
+  }
+
+  .readerPane,
+  .messageCard,
+  .bodyWrap,
+  .messageFrame {
+    height: auto;
+    max-height: none;
+    overflow: visible;
+  }
+
+  .readingView {
+    height: auto;
+    max-height: none;
+    overflow: visible;
+    padding: 0;
+    background: transparent;
+  }
+
+  .readingArticle {
+    max-width: none;
+    font-size: 12pt;
+    line-height: 1.6;
+  }
+
+  .bodyWrap {
+    flex: 1 1 auto;
+    min-height: 600px;
+  }
+}

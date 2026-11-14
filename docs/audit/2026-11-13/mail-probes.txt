@@ -1,0 +1,152 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling libc v0.2.191
+   Compiling log v0.4.35
+   Compiling serde_core v1.0.229
+   Compiling once_cell v1.21.4
+   Compiling bitflags v2.13.2
+   Compiling serde v1.0.229
+   Compiling num-traits v0.2.19
+   Compiling tracing-core v0.1.36
+   Compiling crossbeam-utils v0.8.23
+   Compiling crc32fast v1.5.5
+   Compiling serde_json v1.0.154
+   Compiling parking_lot_core v0.9.12
+   Compiling errno v0.3.15
+   Compiling mio v1.2.4
+   Compiling parking_lot v0.12.5
+   Compiling signal-hook-registry v1.4.8
+   Compiling socket2 v0.6.5
+   Compiling getrandom v0.2.17
+   Compiling ring v0.17.14
+   Compiling quote v1.0.47
+   Compiling syn v3.0.10
+   Compiling syn v2.0.119
+   Compiling string_cache_codegen v0.11.2
+   Compiling parking_lot_core v0.10.0
+   Compiling string_cache v0.11.0
+   Compiling parking_lot v0.13.0
+   Compiling rustls-webpki v0.103.16
+   Compiling getrandom v0.4.3
+   Compiling rustix v1.1.6
+   Compiling simd-adler32 v0.3.10
+   Compiling miniz_oxide v0.9.1
+   Compiling web_atoms v0.3.0
+   Compiling rustls v0.23.46
+   Compiling rand v0.10.3
+   Compiling synstructure v0.14.0
+   Compiling regex-automata v0.4.18
+   Compiling scheduled-thread-pool v0.2.8
+   Compiling rusqlite v0.41.1
+   Compiling uuid v1.29.2
+   Compiling flate2 v1.1.11
+   Compiling regex v1.13.1
+   Compiling r2d2 v0.8.10
+   Compiling concurrent-queue v2.5.0
+   Compiling security-framework-sys v2.17.0
+   Compiling core-foundation v0.10.1
+   Compiling compression-codecs v0.4.47
+   Compiling gethostname v1.1.0
+   Compiling security-framework v3.7.0
+   Compiling r2d2_sqlite v0.36.0
+   Compiling ipnet v2.12.2
+   Compiling async-channel v1.9.0
+   Compiling mail-builder v2.0.1
+   Compiling markup5ever v0.40.0
+   Compiling rustls-platform-verifier v0.7.1
+   Compiling html5ever v0.40.1
+   Compiling async-channel v2.5.0
+   Compiling stop-token v0.7.0
+   Compiling hostname v0.4.2
+   Compiling tracing-attributes v0.1.31
+   Compiling hashify v0.2.9
+   Compiling pin-project-internal v1.1.13
+   Compiling thiserror-impl v1.0.69
+   Compiling zerofrom-derive v0.1.8
+   Compiling yoke-derive v0.8.4
+   Compiling zerovec-derive v0.11.7
+   Compiling tokio-macros v2.7.2
+   Compiling displaydoc v0.2.7
+   Compiling futures-macro v0.3.34
+   Compiling serde_derive v1.0.229
+   Compiling tokio v1.54.1
+   Compiling tracing v0.1.44
+   Compiling thiserror-impl v2.0.21
+   Compiling async-trait v0.1.92
+   Compiling pin-project v1.1.13
+   Compiling thiserror v1.0.69
+   Compiling mail-parser v0.11.9
+   Compiling futures-util v0.3.34
+   Compiling tokio-util v0.7.20
+   Compiling h2 v0.4.20
+   Compiling zerofrom v0.1.8
+   Compiling tokio-rustls v0.26.6
+   Compiling yoke v0.8.4
+   Compiling zerovec v0.11.9
+   Compiling zerotrie v0.2.5
+   Compiling tinystr v0.8.5
+   Compiling potential_utf v0.1.6
+   Compiling icu_locale_core v2.4.0
+   Compiling icu_collections v2.4.0
+   Compiling thiserror v2.0.21
+   Compiling icu_provider v2.4.0
+   Compiling hyper v1.12.0
+   Compiling tower v0.5.3
+   Compiling icu_normalizer v2.4.0
+   Compiling icu_properties v2.4.0
+   Compiling idna_adapter v1.2.2
+   Compiling idna v1.1.0
+   Compiling hyper-util v0.1.21
+   Compiling async-compression v0.4.52
+   Compiling chrono v0.4.45
+   Compiling url v2.5.8
+   Compiling serde_urlencoded v0.7.1
+   Compiling html2text v0.17.4
+   Compiling futures-executor v0.3.34
+   Compiling chrono-tz v0.10.4
+   Compiling nuncio-core v0.1.0 (<repo>/src-tauri/crates/core)
+   Compiling hyper-rustls v0.27.10
+   Compiling ammonia v4.2.4
+   Compiling tower-http v0.6.11
+   Compiling async-imap v0.12.0
+   Compiling reqwest v0.13.5
+   Compiling futures v0.3.34
+   Compiling lettre v0.11.23
+   Compiling rrule v0.14.0
+   Compiling nuncio-ical v0.1.0 (<repo>/src-tauri/crates/ical)
+   Compiling nuncio-mime v0.1.0 (<repo>/src-tauri/crates/mime)
+   Compiling nuncio-mail v0.1.0 (<repo>/src-tauri/crates/mail)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 04s
+     Running tests/audit_regressions.rs (target/debug/deps/audit_regressions-b1c3e21317c8b714)
+
+running 4 tests
+
+thread 'another_account_pass_must_not_recover_active_send' (170365) panicked at crates/mail/tests/audit_regressions.rs:57:5:
+assertion `left == right` failed: an unrelated account reset the live send to pending
+  left: Pending
+ right: Sending
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'discard_must_reject_sending_item' (170366) panicked at crates/mail/tests/audit_regressions.rs:70:5:
+a sending item was discarded successfully
+test discard_must_reject_sending_item ... FAILED
+test another_account_pass_must_not_recover_active_send ... FAILED
+
+thread 'unsaved_send_must_queue_sent_copy' (170368) panicked at crates/mail/tests/audit_regressions.rs:40:5:
+sent copy was not queued for an unsaved draft
+test unsaved_send_must_queue_sent_copy ... FAILED
+
+thread 'pop3_must_be_readable_after_current_clear_cache_steps' (170367) panicked at crates/mail/tests/audit_regressions.rs:96:5:
+POP3 body remains unreadable after sync: Some(NotFound("message 8b5091d4-79e1-584f-b3fa-bc9b786af643 has no cached body"))
+test pop3_must_be_readable_after_current_clear_cache_steps ... FAILED
+
+failures:
+
+failures:
+    another_account_pass_must_not_recover_active_send
+    discard_must_reject_sending_item
+    pop3_must_be_readable_after_current_clear_cache_steps
+    unsaved_send_must_queue_sent_copy
+
+test result: FAILED. 0 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+error: test failed, to rerun pass `-p nuncio-mail --test audit_regressions`

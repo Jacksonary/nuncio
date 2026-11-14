@@ -1,0 +1,49 @@
+Diff in <repo>/src-tauri/crates/mail/tests/mail_service.rs:651:
+         .into_iter()
+         .find(|op| op.kind == ops::KIND_APPEND_TO_SENT)
+         .expect("sent append queued");
+-    let payload: ops::AppendToSentOp =
+-        repo::pending_ops::payload(&append).expect("append payload");
++    let payload: ops::AppendToSentOp = repo::pending_ops::payload(&append).expect("append payload");
+     let copy = tokio::fs::read(&payload.rfc822_path)
+         .await
+         .expect("read sent copy");
+Diff in <repo>/src-tauri/crates/mail/tests/mail_service.rs:1476:
+ 
+     let path = ctx.paths.staging_dir().join("outbox-retry.eml");
+     ctx.paths.ensure_parent(&path).expect("staging dir");
+-    std::fs::write(&path, b"Subject: retry\r\nTo: bob@example.com\r\n\r\nbody\r\n")
+-        .expect("write staged message");
++    std::fs::write(
++        &path,
++        b"Subject: retry\r\nTo: bob@example.com\r\n\r\nbody\r\n",
++    )
++    .expect("write staged message");
+     let item = nuncio_core::models::OutboxItem::new(
+         "acc",
+         None,
+Diff in <repo>/src-tauri/crates/mail/tests/mail_service.rs:1555:
+     assert_eq!(error.code(), "invalidInput");
+ 
+     let junk = folder_id(&ctx, "acc", "Junk").await;
+-    service.folder_empty(&junk).await.expect("junk can be emptied");
++    service
++        .folder_empty(&junk)
++        .await
++        .expect("junk can be emptied");
+ }
+ 
+ #[tokio::test]
+Diff in <repo>/src-tauri/src/windows.rs:21:
+ /// a cold start must follow the start-minimized setting, not the last close).
+ pub fn window_state_flags() -> tauri_plugin_window_state::StateFlags {
+     use tauri_plugin_window_state::StateFlags;
+-    let flags = StateFlags::SIZE
+-        | StateFlags::POSITION
+-        | StateFlags::MAXIMIZED
+-        | StateFlags::FULLSCREEN;
++    let flags =
++        StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED | StateFlags::FULLSCREEN;
+     // macOS keeps native decorations (overlay title bar). Windows/Linux use a
+     // custom title bar drawn by the frontend, so restoring a persisted
+     // "decorations" value would reintroduce the native bar.

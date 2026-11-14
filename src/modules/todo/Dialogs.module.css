@@ -1,0 +1,54 @@
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+
+.sectionLabel {
+  font-size: var(--font-caption);
+  font-weight: var(--weight-semibold);
+  color: var(--text-secondary);
+}
+
+.colorSection {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.weekdaySection,
+.monthlySection,
+.endSection {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.weekdays {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1);
+}
+
+.weekdays > button {
+  min-width: 44px;
+  justify-content: center;
+}
+
+.twoColumns {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: var(--sp-3);
+  align-items: end;
+}
+
+.unit {
+  color: var(--text-secondary);
+  font-size: var(--font-caption);
+  white-space: nowrap;
+}
+
+.error {
+  font-size: var(--font-caption);
+  color: var(--danger);
+}

@@ -1,0 +1,280 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build, for example v0.0.3. Leave empty to reuse the version already in package.json."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: nsis
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+            bundles: dmg,app
+          # GitHub retired the macos-13 image in December 2025; macos-15-intel
+          # is the official x86_64 macOS runner and builds the Intel DMG
+          # natively (no cross-compilation needed).
+          - platform: macos-15-intel
+            target: x86_64-apple-darwin
+            bundles: dmg,app
+          - platform: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bundles: deb,appimage
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        env:
+          DISPATCH_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            # Tag builds: `v0.0.3` -> version 0.0.3, tag v0.0.3.
+            VERSION="${GITHUB_REF_NAME#v}"
+            TAG="${GITHUB_REF_NAME}"
+            STAMP=true
+          elif [[ -n "${DISPATCH_VERSION}" ]]; then
+            # Manual rebuild of a specific version: accept `0.0.3` or `v0.0.3`.
+            VERSION="${DISPATCH_VERSION#v}"
+            TAG="v${VERSION}"
+            STAMP=true
+          else
+            # Manual build without a version: reuse the manifests untouched.
+            VERSION="$(jq -r '.version' package.json)"
+            TAG="v${VERSION}"
+            STAMP=false
+          fi
+          if [[ ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Refusing to build with non-semver version '${VERSION}'"
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "stamp=${STAMP}" >> "${GITHUB_OUTPUT}"
+          echo "Building version ${VERSION} (tag ${TAG}, stamp=${STAMP})"
+
+      - name: Stamp version into the build manifests
+        if: steps.version.outputs.stamp == 'true'
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          echo "Setting version to: ${VERSION}"
+
+          jq --arg v "${VERSION}" '.version = $v' package.json > tmp.json && mv tmp.json package.json
+          jq --arg v "${VERSION}" '.version = $v' src-tauri/tauri.conf.json > tmp.json && mv tmp.json src-tauri/tauri.conf.json
+
+          # Only the [package] version line starts with `version = "`.
+          sed -i.bak "s/^version = \".*\"/version = \"${VERSION}\"/" src-tauri/Cargo.toml
+          rm -f src-tauri/Cargo.toml.bak
+
+      - name: Configure updater artifacts
+        id: updater
+        shell: bash
+        env:
+          SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${SIGNING_KEY}" ]]; then
+            printf '{"bundle":{"createUpdaterArtifacts":true}}\n' > src-tauri/ci.config.json
+            echo "enabled=true" >> "${GITHUB_OUTPUT}"
+            echo "Updater signing key found: signed installers and latest.json will be published."
+          else
+            # Keep releases green before the signing key is configured; the
+            # in-app update check stays disabled because no latest.json exists.
+            printf '{"bundle":{"createUpdaterArtifacts":false}}\n' > src-tauri/ci.config.json
+            echo "enabled=false" >> "${GITHUB_OUTPUT}"
+            echo "::warning::TAURI_SIGNING_PRIVATE_KEY is not set; building without updater artifacts and latest.json."
+          fi
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Install system dependencies (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libsoup-3.0-dev \
+            libssl-dev \
+            librsvg2-dev \
+            libayatana-appindicator3-dev \
+            libdbus-1-dev \
+            pkg-config
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NUNCIO_GOOGLE_CLIENT_ID: ${{ secrets.NUNCIO_GOOGLE_CLIENT_ID }}
+          NUNCIO_GOOGLE_CLIENT_SECRET: ${{ secrets.NUNCIO_GOOGLE_CLIENT_SECRET }}
+          NUNCIO_MS_CLIENT_ID: ${{ secrets.NUNCIO_MS_CLIENT_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        with:
+          tagName: ${{ steps.version.outputs.tag }}
+          releaseName: "Nuncio ${{ steps.version.outputs.tag }}"
+          releaseBody: |
+            下载对应平台的安装包即可。macOS 未公证的构建请右键打开，或执行 `xattr -cr /Applications/Nuncio.app`。
+
+            Download the installer for your platform. Unsigned macOS builds may require right-click → Open, or `xattr -cr /Applications/Nuncio.app`.
+          releaseDraft: false
+          prerelease: false
+          args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --config src-tauri/ci.config.json
+
+  sync-to-gitee:
+    name: Sync release to Gitee
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      GITEE_OWNER: weiguoliu
+      GITEE_REPO: nuncio
+      GITHUB_DL: https://github.com/${{ github.repository }}/releases/download
+    steps:
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        env:
+          DISPATCH_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          elif [[ -n "${DISPATCH_VERSION}" ]]; then
+            TAG="v${DISPATCH_VERSION#v}"
+          else
+            TAG="v$(curl -fsSL "https://raw.githubusercontent.com/${{ github.repository }}/${GITHUB_SHA}/package.json" | jq -r '.version')"
+          fi
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "Syncing ${TAG} to Gitee"
+
+      - name: Check Gitee token
+        id: token
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        run: |
+          if [ -z "${GITEE_TOKEN}" ]; then
+            echo "::warning::GITEE_TOKEN is not set; skipping the Gitee release sync."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download GitHub release assets
+        if: steps.token.outputs.present == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p assets
+          # tauri-action finishes uploading per matrix job; retry until the release is visible.
+          for i in 1 2 3 4 5 6; do
+            if gh release view "${TAG}" --repo "${{ github.repository }}" >/dev/null 2>&1; then break; fi
+            echo "Release ${TAG} not visible yet, retry ${i}/6"; sleep 10
+          done
+          gh release download "${TAG}" --repo "${{ github.repository }}" --dir assets --clobber
+          ls -lh assets/
+
+      - name: Point latest.json at Gitee downloads
+        if: steps.token.outputs.present == 'true'
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -f assets/latest.json ]; then
+            GITEE_DL="https://gitee.com/${GITEE_OWNER}/${GITEE_REPO}/releases/download"
+            # Same files and signatures, only the download host changes.
+            sed -i "s#${GITHUB_DL}/#${GITEE_DL}/#g" assets/latest.json
+            echo "latest.json rewritten for Gitee:"; cat assets/latest.json
+          else
+            echo "No latest.json in this release (updater signing key not configured)."
+          fi
+
+      - name: Create or reuse Gitee release and upload assets
+        if: steps.token.outputs.present == 'true'
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          API="https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}"
+
+          RELEASE_ID=$(curl -s "${API}/releases/tags/${TAG}?access_token=${GITEE_TOKEN}" | jq -r '.id // empty')
+          if [ -z "${RELEASE_ID}" ]; then
+            BODY=$(jq -n --arg t "${GITEE_TOKEN}" --arg tag "${TAG}" --arg sha "${GITHUB_SHA}" \
+              '{access_token: $t, tag_name: $tag, target_commitish: $sha, name: ("Nuncio " + $tag),
+                body: "下载对应平台的安装包即可。macOS 未公证的构建请执行 `xattr -cr /Applications/Nuncio.app`。\n\nDownload the installer for your platform.",
+                prerelease: false}')
+            RESPONSE=$(curl -s -X POST "${API}/releases" -H "Content-Type: application/json" -d "${BODY}")
+            RELEASE_ID=$(echo "${RESPONSE}" | jq -r '.id // empty')
+            if [ -z "${RELEASE_ID}" ]; then
+              echo "::error::Failed to create Gitee release: ${RESPONSE}"
+              exit 1
+            fi
+            echo "Created Gitee release ${RELEASE_ID}"
+          else
+            echo "Reusing existing Gitee release ${RELEASE_ID}"
+          fi
+
+          EXISTING=$(curl -s "${API}/releases/${RELEASE_ID}/attach_files?access_token=${GITEE_TOKEN}&per_page=100" | jq -r '.[]?.name')
+          MAX_SIZE=$((30 * 1024 * 1024))
+          FAILED=0
+          for file in assets/*; do
+            [ -f "${file}" ] || continue
+            name=$(basename "${file}")
+            if echo "${EXISTING}" | grep -Fxq "${name}"; then
+              echo "Skip ${name}: already on Gitee"; continue
+            fi
+            size=$(stat -c%s "${file}")
+            if [ "${size}" -gt "${MAX_SIZE}" ]; then
+              echo "::warning::Skip ${name}: $((size / 1024 / 1024)) MB exceeds the 30 MB Gitee attachment limit"
+              continue
+            fi
+            echo "Uploading ${name} ($((size / 1024)) KB)"
+            if ! curl -sS --fail --retry 2 --retry-delay 5 -X POST \
+                "${API}/releases/${RELEASE_ID}/attach_files" \
+                -F "access_token=${GITEE_TOKEN}" -F "file=@${file}" >/dev/null; then
+              echo "::warning::Upload failed for ${name}"; FAILED=1
+            fi
+          done
+          [ "${FAILED}" -eq 0 ] || echo "::warning::Some assets failed to upload to Gitee"
+          echo "Gitee sync completed: https://gitee.com/${GITEE_OWNER}/${GITEE_REPO}/releases/tag/${TAG}"

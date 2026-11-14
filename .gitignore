@@ -1,0 +1,12 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/crates/*/target/
+src-tauri/gen/schemas/
+.env.local
+.env.*.local
+*.log
+.DS_Store
+
+# 本地保存的 OAuth 凭据原文，不提交
+docs/clientInfo

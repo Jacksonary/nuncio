@@ -1,0 +1,489 @@
+.emptyPane,
+.loadingPane {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  min-height: 0;
+  padding: var(--sp-6);
+}
+
+.detail {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--sp-5) var(--sp-5) var(--sp-6);
+  gap: 0;
+}
+
+.titleRow {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  margin-top: var(--sp-1);
+}
+
+.completeButton {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  margin-top: 4px;
+  padding: 0;
+  border: 1.5px solid var(--border-strong);
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-on-accent);
+  cursor: pointer;
+  opacity: 0.6;
+  transition:
+    background-color var(--duration-fast) var(--ease),
+    border-color var(--duration-fast) var(--ease),
+    opacity var(--duration-fast) var(--ease);
+}
+
+.completeButton svg {
+  opacity: 0;
+}
+
+.completeButton:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: var(--accent-subtle);
+  color: var(--accent);
+  opacity: 1;
+}
+
+.completeButtonOn {
+  background: var(--accent);
+  border-color: var(--accent);
+  opacity: 1;
+}
+
+.completeButtonOn svg {
+  opacity: 1;
+}
+
+.completeButtonOn:hover:not(:disabled) {
+  background: var(--accent-hover);
+  color: var(--text-on-accent);
+}
+
+.completeButton:disabled {
+  cursor: default;
+}
+
+.titleInput {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  padding: 0 0 2px;
+  border: none;
+  border-bottom: 1px solid transparent;
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 20px;
+  line-height: 26px;
+  font-weight: var(--weight-semibold);
+  resize: none;
+  overflow: hidden;
+  transition: border-color var(--duration-fast) var(--ease);
+}
+
+.titleInput:focus {
+  border-bottom-color: var(--accent-border);
+}
+
+.titleInput::placeholder {
+  color: var(--text-tertiary);
+  font-weight: var(--weight-regular);
+}
+
+.titleCompleted {
+  text-decoration: line-through;
+  color: var(--text-tertiary);
+}
+
+.starButton {
+  flex: none;
+  margin-top: 2px;
+  color: var(--text-tertiary);
+}
+
+.starButton[aria-pressed="true"] {
+  color: var(--warning);
+  background: var(--warning-subtle);
+}
+
+.starButton[aria-pressed="true"]:hover {
+  color: var(--warning);
+  background: var(--warning-subtle);
+}
+
+.metaRow {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  padding: 0 0 var(--sp-2) 30px;
+  margin-bottom: var(--sp-1);
+}
+
+.listChip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 220px;
+  padding: 2px 6px 2px 4px;
+  border: none;
+  border-radius: var(--radius-s);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.listChip:hover:not(:disabled) {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.listChip:focus-visible {
+  outline: 2px solid var(--focus-outline);
+  outline-offset: 1px;
+}
+
+.listChip:disabled {
+  cursor: default;
+}
+
+.listDot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+}
+
+.listName {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.localHint {
+  flex: none;
+  padding: 0 5px;
+  border-radius: 3px;
+  background: var(--surface-alt);
+  color: var(--text-tertiary);
+  font-size: 10px;
+  line-height: 15px;
+  cursor: help;
+}
+
+.content {
+  display: flex;
+  flex-direction: column;
+}
+
+.section {
+  padding: var(--sp-2) 0 var(--sp-3);
+  border-top: 1px solid var(--border-subtle);
+}
+
+.sectionHeader {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 2px 0 var(--sp-1);
+}
+
+.sectionTitle {
+  font-size: 11px;
+  line-height: 14px;
+  font-weight: var(--weight-semibold);
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.sectionMeta {
+  font-size: 10.5px;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.stepList {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.stepRow {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: 30px;
+  padding: 1px 2px 1px 4px;
+  border-radius: var(--radius-s);
+}
+
+.stepRow:hover {
+  background: var(--surface-hover);
+}
+
+.stepRow[data-drop="before"]::before,
+.stepRow[data-drop="after"]::after {
+  content: "";
+  position: absolute;
+  left: 26px;
+  right: 4px;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--accent);
+  pointer-events: none;
+}
+
+.stepRow[data-drop="before"]::before {
+  top: -1px;
+}
+
+.stepRow[data-drop="after"]::after {
+  bottom: -1px;
+}
+
+.stepCircle {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 1.5px solid var(--border-strong);
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-on-accent);
+  cursor: pointer;
+}
+
+.stepCircle svg {
+  opacity: 0;
+}
+
+.stepCircle:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.stepCircleOn {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+
+.stepCircleOn svg {
+  opacity: 1;
+}
+
+.stepCircleOn:hover:not(:disabled) {
+  background: var(--accent-hover);
+  color: var(--text-on-accent);
+}
+
+.stepInput {
+  flex: 1;
+  min-width: 0;
+  height: 25px;
+  padding: 0 2px;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 12.5px;
+}
+
+.stepInput:focus {
+  border-bottom: 1px solid var(--accent-border);
+}
+
+.stepInputDone {
+  text-decoration: line-through;
+  color: var(--text-tertiary);
+}
+
+.stepHandle {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 22px;
+  border-radius: 3px;
+  color: var(--text-tertiary);
+  cursor: grab;
+  opacity: 0;
+}
+
+.stepRow:hover .stepHandle,
+.stepHandle:focus-visible {
+  opacity: 1;
+}
+
+.stepHandle:active {
+  cursor: grabbing;
+}
+
+.stepHandle:focus-visible {
+  outline: 2px solid var(--focus-outline);
+  outline-offset: -2px;
+}
+
+.stepDelete {
+  flex: none;
+  opacity: 0;
+}
+
+.stepRow:hover .stepDelete,
+.stepRow:focus-within .stepDelete {
+  opacity: 1;
+}
+
+.stepAddRow {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: 30px;
+  padding: 0 4px;
+  color: var(--accent);
+}
+
+.stepAddInput {
+  flex: 1;
+  min-width: 0;
+  height: 26px;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 12.5px;
+}
+
+.stepAddInput::placeholder {
+  color: var(--text-tertiary);
+}
+
+.actionRow {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: 100%;
+  min-height: 34px;
+  padding: 2px 6px;
+  border: none;
+  border-radius: var(--radius-m);
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.actionRow:hover:not(:disabled) {
+  background: var(--surface-hover);
+}
+
+.actionRow:focus-visible {
+  outline: 2px solid var(--focus-outline);
+  outline-offset: -2px;
+}
+
+.actionRow:disabled {
+  cursor: default;
+  opacity: 0.65;
+}
+
+.actionIcon {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  color: var(--text-secondary);
+}
+
+.actionIconAccent {
+  color: var(--accent);
+}
+
+.actionLabel {
+  flex: none;
+  color: var(--text-secondary);
+}
+
+.actionValue {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
+  color: var(--text);
+}
+
+.overdue {
+  color: var(--danger);
+}
+
+.actionChevron {
+  flex: none;
+  color: var(--text-tertiary);
+}
+
+.reminderEditor {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: var(--sp-2);
+  align-items: end;
+  padding: var(--sp-2) var(--sp-2) var(--sp-3) 28px;
+}
+
+.reminderEditor > button {
+  grid-column: 1 / -1;
+  justify-self: start;
+}
+
+.infoBlock {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--sp-3) 0 0;
+  border-top: 1px solid var(--border-subtle);
+  color: var(--text-tertiary);
+  font-size: 10.5px;
+}
+
+.footer {
+  display: flex;
+  justify-content: flex-start;
+  padding-top: var(--sp-4);
+}
+
+.menuDot {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 3px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .completeButton,
+  .titleInput {
+    transition: none;
+  }
+}

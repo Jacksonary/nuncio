@@ -1,0 +1,450 @@
+//! Outbox processor: sends queued RFC822 messages and performs post-send
+//! housekeeping (Answered/$Forwarded flags, Drafts cleanup, Sent APPEND,
+//! recipient history).
+
+use chrono::Utc;
+use nuncio_core::models::{Address, Draft, FolderRole, OutboxItem, OutboxState, ReplyMode};
+use nuncio_core::{events, repo, AppError, CoreContext, Result};
+use tracing::{debug, info, warn};
+
+const MAX_ATTEMPTS: u32 = 8;
+
+/// How long a send may stay in `sending` before it is assumed abandoned.
+///
+/// `send_raw` cancels a message after `SEND_DEADLINE` (5 min), so any row still
+/// in `sending` past 8 minutes belongs to a task that is gone: crashed, killed,
+/// or cut off mid-send. The two constants are tied together deliberately —
+/// shortening this below the send deadline would let a live transfer be
+/// reclaimed and delivered twice.
+const SENDING_LEASE: chrono::Duration = chrono::Duration::minutes(8);
+
+/// Send every due outbox item for one account.
+pub async fn process_due(
+    ctx: &CoreContext,
+    account: &nuncio_core::models::Account,
+) -> Result<usize> {
+    recover_stuck(ctx, &account.id).await?;
+    let now = Utc::now();
+    let account_id = account.id.clone();
+    let items = ctx
+        .db
+        .read(move |db| repo::outbox::list(db, Some(&account_id)))
+        .await?;
+    let mut sent = 0;
+    for item in items.into_iter().filter(|item| {
+        item.state == OutboxState::Pending && item.next_retry_at.map(|at| at <= now).unwrap_or(true)
+    }) {
+        match process_one(ctx, account, &item.id).await {
+            Ok(()) => sent += 1,
+            Err(error) => warn!(%error, outbox = %item.id, "outbox item failed"),
+        }
+    }
+    Ok(sent)
+}
+
+/// Send one outbox item. Retry bookkeeping is persisted on the row, so this
+/// returns `Ok` even when delivery failed (the item stays pending/failed).
+pub async fn process_one(
+    ctx: &CoreContext,
+    account: &nuncio_core::models::Account,
+    outbox_id: &str,
+) -> Result<()> {
+    let item = ctx
+        .db
+        .read({
+            let outbox_id = outbox_id.to_string();
+            move |db| repo::outbox::get(db, &outbox_id)
+        })
+        .await?
+        .ok_or_else(|| AppError::not_found(format!("outbox item {outbox_id} not found")))?;
+    if item.state == OutboxState::Sent {
+        return Ok(());
+    }
+
+    // Conditional transition avoids two outbox passes sending the same item.
+    let item_id = item.id.clone();
+    let claimed = ctx
+        .db
+        .write(move |db| {
+            let changed = db.execute(
+                "UPDATE outbox SET state = 'sending', sending_started_at = ?2
+                 WHERE id = ?1 AND state IN ('pending', 'failed')",
+                rusqlite::params![item_id, nuncio_core::repo::dt_string(Utc::now())],
+            )?;
+            Ok(changed)
+        })
+        .await?;
+    if claimed == 0 {
+        debug!(outbox = %item.id, "outbox item claimed by another worker");
+        return Ok(());
+    }
+
+    // The budget starts at the claim, not after the file read: reading a large
+    // staged message, refreshing the credential and talking SMTP must all fit
+    // inside one window that stays below `SENDING_LEASE`.
+    let deadline = tokio::time::Instant::now() + crate::smtp::send::SEND_DEADLINE;
+
+    let bytes = match tokio::time::timeout_at(
+        deadline,
+        tokio::fs::read(&item.rfc822_path),
+    )
+    .await
+    {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(error)) => {
+            let message = format!("staged message is missing: {error}");
+            fail_permanently(ctx, &item, &message).await?;
+            return Ok(());
+        }
+        Err(_) => {
+            let message = "reading the staged message exceeded the send deadline".to_string();
+            fail_permanently(ctx, &item, &message).await?;
+            return Ok(());
+        }
+    };
+
+    let send_result = crate::smtp::send::send_account_message_within(
+        ctx,
+        account,
+        &bytes,
+        Some(&item.recipients),
+        deadline,
+    )
+    .await;
+    match send_result {
+        Ok(()) => {
+            let item_id = item.id.clone();
+            ctx.db
+                .write(move |db| repo::outbox::mark_sent(db, &item_id))
+                .await?;
+            post_send(ctx, account, &item).await?;
+            if let Err(error) =
+                crate::service::outbox::refresh_outbox_folder(ctx, &account.id).await
+            {
+                debug!(%error, "could not refresh the Outbox folder");
+            }
+            info!(outbox = %item.id, "outbox item sent");
+        }
+        Err(error) => {
+            // `send_account_message_within` already reported an auth failure
+            // inside its own deadline; reporting again here was an unbounded
+            // tail that could outlive the lease. Keep the state transition but
+            // never block on the report.
+            if error.code() == "auth" {
+                debug!(outbox = %item.id, "auth failure reported by the send path");
+            }
+            let message = error.message();
+            let state = ctx
+                .db
+                .write({
+                    let item_id = item.id.clone();
+                    let message = message.clone();
+                    move |db| {
+                        repo::outbox::mark_failed(db, &item_id, &message, Utc::now(), MAX_ATTEMPTS)
+                    }
+                })
+                .await?;
+            if state == OutboxState::Failed {
+                events::emit_op_failed(
+                    ctx.events.as_ref(),
+                    account.id.clone(),
+                    &format!("Send \"{}\"", item.subject),
+                    &message,
+                );
+                warn!(outbox = %item.id, error = %message, "outbox item failed permanently");
+            } else {
+                debug!(outbox = %item.id, error = %message, "outbox item scheduled for retry");
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn post_send(
+    ctx: &CoreContext,
+    account: &nuncio_core::models::Account,
+    item: &OutboxItem,
+) -> Result<()> {
+    // The Sent copy is independent of draft bookkeeping: a draft that was never
+    // auto-saved (no id yet) still has to be filed away, otherwise providers
+    // that do not save sent mail themselves would lose the record entirely.
+    record_recipients(ctx, &item.recipients).await?;
+    if let Err(error) = append_to_sent(ctx, account, item).await {
+        warn!(outbox = %item.id, %error, "could not append the message to Sent");
+    }
+
+    let Some(draft_id) = item.draft_id.clone() else {
+        return Ok(());
+    };
+    let draft = ctx
+        .db
+        .read({
+            let draft_id = draft_id.clone();
+            move |db| repo::drafts::get(db, &draft_id)
+        })
+        .await?;
+
+    let mut affected_folders = Vec::new();
+    if let Some(draft) = &draft {
+        apply_source_flags(ctx, account, draft).await?;
+        remove_remote_draft(ctx, account, draft).await?;
+        affected_folders.extend(
+            ctx.db
+                .read({
+                    let account_id = account.id.clone();
+                    move |db| repo::folders::by_role(db, &account_id, FolderRole::Drafts)
+                })
+                .await?
+                .map(|folder| folder.id),
+        );
+        let staging = ctx.paths.draft_staging_dir(&draft_id);
+        if let Err(error) = tokio::fs::remove_dir_all(&staging).await {
+            debug!(%error, path = %staging.display(), "draft staging cleanup skipped");
+        }
+        let draft_id = draft_id.clone();
+        ctx.db
+            .write(move |db| repo::drafts::delete(db, &draft_id))
+            .await?;
+    }
+
+    // Notify the UI that drafts/outbox changed.
+    events::emit_mail_changed(
+        ctx.events.as_ref(),
+        account.id.clone(),
+        affected_folders,
+        Vec::new(),
+        events::MailChangeKind::Updated,
+    );
+    Ok(())
+}
+
+async fn apply_source_flags(
+    ctx: &CoreContext,
+    account: &nuncio_core::models::Account,
+    draft: &Draft,
+) -> Result<()> {
+    let Some(source_id) = draft.source_message_id.clone() else {
+        return Ok(());
+    };
+    let stored = ctx
+        .db
+        .read({
+            let source_id = source_id.clone();
+            move |db| repo::messages::get(db, &source_id)
+        })
+        .await?;
+    let Some(stored) = stored else {
+        return Ok(());
+    };
+    let answered = matches!(
+        draft.reply_mode,
+        Some(ReplyMode::Reply) | Some(ReplyMode::ReplyAll)
+    );
+    let forwarded = matches!(
+        draft.reply_mode,
+        Some(ReplyMode::Forward) | Some(ReplyMode::ForwardAsAttachment)
+    );
+    if !answered && !forwarded {
+        return Ok(());
+    }
+    let id = stored.summary.id.clone();
+    ctx.db
+        .write(move |db| {
+            repo::messages::set_flags(
+                db,
+                &[id],
+                None,
+                None,
+                answered.then_some(true),
+                forwarded.then_some(true),
+            )
+        })
+        .await?;
+    if let Some(uid) = stored.uid {
+        crate::ops::enqueue_set_flags(
+            ctx,
+            &account.id,
+            &stored.summary.folder_id,
+            &[uid],
+            None,
+            None,
+            answered.then_some(true),
+            forwarded.then_some(true),
+            "Mark original as replied/forwarded",
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn remove_remote_draft(
+    ctx: &CoreContext,
+    account: &nuncio_core::models::Account,
+    draft: &Draft,
+) -> Result<()> {
+    let Some(remote_id) = draft.remote_draft_message_id.clone() else {
+        return Ok(());
+    };
+    let stored = ctx
+        .db
+        .read({
+            let remote_id = remote_id.clone();
+            move |db| repo::messages::get(db, &remote_id)
+        })
+        .await?;
+    if let Some(stored) = stored {
+        if let Some(uid) = stored.uid {
+            crate::ops::enqueue_delete_remote_draft(
+                ctx,
+                &account.id,
+                &stored.summary.folder_id,
+                uid,
+            )
+            .await?;
+        }
+        let ids = vec![stored.summary.id.clone()];
+        ctx.db
+            .write(move |db| repo::messages::delete_local(db, &ids, true))
+            .await?;
+    }
+    Ok(())
+}
+
+async fn append_to_sent(
+    ctx: &CoreContext,
+    account: &nuncio_core::models::Account,
+    item: &OutboxItem,
+) -> Result<()> {
+    if account.capabilities.auto_saves_sent {
+        return Ok(());
+    }
+    let account_id = account.id.clone();
+    let sent = ctx
+        .db
+        .read(move |db| repo::folders::by_role(db, &account_id, FolderRole::Sent))
+        .await?;
+    let Some(sent) = sent else {
+        debug!(account = %account.id, "no Sent folder; skipping APPEND");
+        return Ok(());
+    };
+    // The transmitted bytes intentionally carry no Bcc header. The stored Sent
+    // copy keeps it, like regular mail clients, so the sender can see who the
+    // message went to.
+    let with_bcc = match sent_copy_with_bcc(ctx, item).await {
+        Ok(Some(path)) => Some(path),
+        Ok(None) => None,
+        Err(error) => {
+            debug!(%error, outbox = %item.id, "could not prepare the Sent copy with Bcc");
+            None
+        }
+    };
+    let path = with_bcc.as_deref().unwrap_or(item.rfc822_path.as_str());
+    crate::ops::enqueue_append_to_sent(ctx, &account.id, &sent.id, path).await
+}
+
+/// Write a copy of the staged message that restores the Bcc header. The Bcc
+/// recipients are the outbox recipients that are neither `To` nor `Cc` in the
+/// built message. Returns `None` when there is no Bcc recipient.
+async fn sent_copy_with_bcc(ctx: &CoreContext, item: &OutboxItem) -> Result<Option<String>> {
+    let bytes = tokio::fs::read(&item.rfc822_path)
+        .await
+        .map_err(|error| AppError::io(format!("cannot read the staged message: {error}")))?;
+    let parsed = match nuncio_mime::parse(&bytes) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            debug!(%error, outbox = %item.id, "cannot parse the sent message for Bcc");
+            return Ok(None);
+        }
+    };
+    let mut visible: std::collections::HashSet<String> = parsed
+        .headers
+        .to
+        .iter()
+        .chain(parsed.headers.cc.iter())
+        .map(|address| nuncio_core::text::normalize_email(&address.email))
+        .filter(|email| !email.is_empty())
+        .collect();
+    visible.extend(
+        parsed
+            .headers
+            .bcc
+            .iter()
+            .map(|address| nuncio_core::text::normalize_email(&address.email)),
+    );
+    let bcc: Vec<Address> = item
+        .recipients
+        .iter()
+        .filter(|address| {
+            let email = nuncio_core::text::normalize_email(&address.email);
+            !email.is_empty() && !visible.contains(&email)
+        })
+        .cloned()
+        .collect();
+    let bcc = nuncio_mime::dedupe_addresses(bcc);
+    if bcc.is_empty() {
+        return Ok(None);
+    }
+    let with_bcc = nuncio_mime::add_bcc_header(&bytes, &bcc)?;
+    let path = ctx
+        .paths
+        .staging_dir()
+        .join(format!("sent-{}.eml", nuncio_core::models::new_id()));
+    ctx.paths.ensure_parent(&path)?;
+    tokio::fs::write(&path, &with_bcc)
+        .await
+        .map_err(|error| AppError::io(format!("cannot stage the Sent copy: {error}")))?;
+    Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+async fn record_recipients(ctx: &CoreContext, recipients: &[Address]) -> Result<()> {
+    if recipients.is_empty() {
+        return Ok(());
+    }
+    let recipients = recipients.to_vec();
+    ctx.db
+        .write(move |db| repo::recipient_history::record(db, &recipients))
+        .await
+}
+
+async fn fail_permanently(ctx: &CoreContext, item: &OutboxItem, message: &str) -> Result<()> {
+    let item_id = item.id.clone();
+    let message_owned = message.to_string();
+    ctx.db
+        .write(move |db| repo::outbox::mark_failed(db, &item_id, &message_owned, Utc::now(), 1))
+        .await?;
+    events::emit_op_failed(
+        ctx.events.as_ref(),
+        item.account_id.clone(),
+        &format!("Send \"{}\"", item.subject),
+        message,
+    );
+    Ok(())
+}
+
+/// Reset `sending` rows abandoned by a crash or forced shutdown.
+///
+/// The cutoff is measured from when the send *started*, not when the item was
+/// queued: an item can sit pending for hours behind an offline queue and still
+/// be actively transmitting when another account's pass runs. Without this the
+/// old check would knock a live send back to `pending`, letting a second worker
+/// claim it and deliver the message twice.
+async fn recover_stuck(ctx: &CoreContext, account_id: &str) -> Result<()> {
+    // Every configured account polls on its own timer. Recovery is therefore
+    // scoped to the row's own account: an expired row of account A must not be
+    // revived by account B's pass, which is how a second worker could end up
+    // sending a message whose first attempt was still running.
+    let cutoff = Utc::now() - SENDING_LEASE;
+    let account_id = account_id.to_string();
+    ctx.db
+        .write(move |db| {
+            db.execute(
+                "UPDATE outbox SET state = 'pending', sending_started_at = NULL
+                 WHERE state = 'sending'
+                   AND account_id = ?2
+                   AND COALESCE(sending_started_at, created_at) < ?1",
+                rusqlite::params![nuncio_core::repo::dt_string(cutoff), account_id],
+            )?;
+            Ok(())
+        })
+        .await
+}
