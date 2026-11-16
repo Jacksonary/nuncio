@@ -152,27 +152,6 @@
   color: var(--text-tertiary);
 }
 
-.moreRow {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-1);
-  height: 26px;
-  margin-top: 2px;
-  padding: 0 6px 0 4px;
-  border: none;
-  border-radius: var(--radius-s);
-  background: transparent;
-  color: var(--text-secondary);
-  font-size: 12px;
-  text-align: left;
-  cursor: pointer;
-}
-
-.moreRow:hover {
-  background: var(--surface-hover);
-  color: var(--text);
-}
-
 .accountName,
 .unifiedName {
   flex: 1;
@@ -352,14 +331,12 @@
 }
 
 .batchCount {
+  /* Pinned to the right edge of the action row. */
+  margin-left: auto;
   padding: 0 var(--sp-2);
   font-size: var(--font-caption);
   font-weight: var(--weight-semibold);
   white-space: nowrap;
-}
-
-.batchSpacer {
-  flex: 1;
 }
 
 .advancedPanel {

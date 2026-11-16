@@ -25,7 +25,9 @@ use crate::http::HttpClient;
 /// Default (unnamed) contact folder.  Graph addresses it as `/me/contacts`.
 pub const DEFAULT_FOLDER: &str = "contacts";
 
-const CONTACT_SELECT: &str = "id,displayName,givenName,surname,middleName,nickname,companyName,jobTitle,department,emailAddresses,businessPhones,homePhones,mobilePhone,businessHomePage,homeAddress,businessAddress,otherAddress,birthday,personalNotes,categories,changeKey";
+// `CONTACT_SELECT` was removed with the `$select` on the delta request: change
+// tracking over 'Contacts' rejects it, and the delta feed returns the full
+// contact shape anyway.
 
 /// Photos downloaded per sync pass (keeps large address books light).
 const PHOTO_BUDGET: usize = 100;
@@ -124,7 +126,12 @@ impl GraphContactsClient {
         let mut next = Some(match delta_link {
             Some(link) => link.to_string(),
             None => self.url(&format!(
-                "{}/delta?$select={CONTACT_SELECT}&$top=100",
+                // Change tracking over 'Contacts' rejects `$select` and `$top`
+                // outright ("The following parameters are not supported with
+                // change tracking over the 'Contacts' resource"). The delta feed
+                // always returns the full shape, and page size is requested with
+                // `Prefer: odata.maxpagesize` on the request itself.
+                "{}/delta",
                 Self::folder_path(folder)
             )),
         });
@@ -139,7 +146,11 @@ impl GraphContactsClient {
             let response = self
                 .http
                 .send_authed(account_id, TokenResource::MicrosoftGraph, |token| {
-                    self.http.raw().get(&url).bearer_auth(token)
+                    self.http
+                        .raw()
+                        .get(&url)
+                        .bearer_auth(token)
+                        .header("Prefer", "odata.maxpagesize=100")
                 })
                 .await?;
             if !response.status().is_success() {

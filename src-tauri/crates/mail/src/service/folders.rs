@@ -339,6 +339,15 @@ impl MailService {
                     Ok(())
                 })
                 .await?;
+        } else if crate::graph::uses_graph(&account) {
+            // Graph has no EXPUNGE. Deleting every message one by one is the
+            // only equivalent, and it is expensive enough that the user should
+            // see a clear answer instead of a silent half-empty folder. Falling
+            // through to IMAP here would fail with a completely unrelated
+            // authentication error.
+            return Err(AppError::unsupported(
+                "emptying a folder is not supported for Microsoft accounts yet",
+            ));
         } else {
             match self
                 .inner
@@ -348,6 +357,12 @@ impl MailService {
             {
                 Ok(()) => {}
                 Err(error) if matches!(error.code(), "notFound" | "internal") => {
+                    // Graph accounts never had an IMAP session to fall back to;
+                    // connecting would surface an authentication error that has
+                    // nothing to do with what the user asked for.
+                    if crate::graph::uses_graph(&account) {
+                        return Err(error);
+                    }
                     let mut connection =
                         crate::imap::connect_account(&self.inner.ctx, &account).await?;
                     connection.select(&folder.remote_path).await?;
@@ -388,6 +403,12 @@ impl MailService {
             Ok(()) => Ok(()),
             Err(error) if matches!(error.code(), "notFound" | "internal") => {
                 let account = self.account(&folder.account_id).await?;
+                // Same rule: the direct-sync fallback is an IMAP path. A Graph
+                // account has no IMAP connection, so surface the engine error
+                // instead of failing on a confusing authentication message.
+                if crate::graph::uses_graph(&account) {
+                    return Err(error);
+                }
                 if let Some(_imap) = account.imap.as_ref() {
                     let mut connection =
                         crate::imap::connect_account(&self.inner.ctx, &account).await?;

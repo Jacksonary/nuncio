@@ -152,7 +152,9 @@ impl GraphTasksClient {
         let mut next = Some(match delta_link {
             Some(link) => link.to_string(),
             None => self.url(&format!(
-                "/me/todo/lists/{}/tasks/delta?$top=100&$expand=checklistItems",
+                // `$top` is not allowed with change tracking; the page size
+                // goes in a `Prefer: odata.maxpagesize` header instead.
+                "/me/todo/lists/{}/tasks/delta?$expand=checklistItems",
                 encode(list_id)
             )),
         });
@@ -168,7 +170,11 @@ impl GraphTasksClient {
             let response = self
                 .http
                 .send_authed(account_id, TokenResource::MicrosoftGraph, |token| {
-                    self.http.raw().get(&url).bearer_auth(token)
+                    self.http
+                        .raw()
+                        .get(&url)
+                        .bearer_auth(token)
+                        .header("Prefer", "odata.maxpagesize=100")
                 })
                 .await?;
             if !response.status().is_success() && include_expand {
@@ -179,7 +185,7 @@ impl GraphTasksClient {
                 drop(body);
                 include_expand = false;
                 next = Some(self.url(&format!(
-                    "/me/todo/lists/{}/tasks/delta?$top=100",
+                    "/me/todo/lists/{}/tasks/delta",
                     encode(list_id)
                 )));
                 let _ = status;

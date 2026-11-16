@@ -242,13 +242,23 @@ impl Notifier for AppNotifier {
         #[cfg(target_os = "windows")]
         {
             let mut drawn = false;
-            match tauri::image::Image::from_bytes(&crate::badge::overlay_png(count)) {
-                Ok(image) => {
-                    if window.set_overlay_icon(Some(image)).is_ok() {
+            match crate::badge::overlay_png(count) {
+                // `None` means "no badge": passing a fully transparent image
+                // instead leaves the overlay slot occupied, and the compositor
+                // renders banding artifacts over the taskbar icon.
+                None => {
+                    if window.set_overlay_icon(None).is_ok() {
                         drawn = true;
                     }
                 }
-                Err(error) => debug!(%error, "cannot decode the overlay icon"),
+                Some(bytes) => match tauri::image::Image::from_bytes(&bytes) {
+                    Ok(image) => {
+                        if window.set_overlay_icon(Some(image)).is_ok() {
+                            drawn = true;
+                        }
+                    }
+                    Err(error) => debug!(%error, "cannot decode the overlay icon"),
+                },
             }
             if !drawn {
                 let title = if count > 0 {

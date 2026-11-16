@@ -1,12 +1,12 @@
 /**
- * Mail folder pane: unified inbox, one expandable section per account with
- * special-use folders and a "More" section for the full tree. Folder rows are
- * drag & drop targets and expose the full folder context menu.
+ * Mail folder pane: unified inbox, one expandable section per account. Each
+ * account shows its inbox, drafts and favourites directly; everything else is
+ * folded behind a single "More" row. Folder rows are drag & drop targets and
+ * expose the full folder context menu.
  */
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Add16Regular,
-  Archive16Regular,
   Archive24Regular,
   ChevronDown16Regular,
   ChevronRight16Regular,
@@ -18,10 +18,8 @@ import {
   FolderAdd16Regular,
   FolderMail24Regular,
   MailInbox16Regular,
-  Mail16Regular,
   Mail24Regular,
   MailMultiple24Regular,
-  MailOff24Regular,
   MailUnread16Regular,
   MoreHorizontal16Regular,
   ArrowSync16Regular,
@@ -41,7 +39,6 @@ import {
   Dialog,
   DotBadge,
   EmptyState,
-  IconButton,
   Input,
   Menu,
   MenuButton,
@@ -52,22 +49,21 @@ import {
   toast,
   type MenuEntry,
 } from "@/components";
-import { folders as foldersApi, isIpcError, messages as messagesApi, sync as syncApi } from "@/ipc/api";
+import { folders as foldersApi, isIpcError, sync as syncApi } from "@/ipc/api";
 import type { Account, Folder, FolderRole } from "@/ipc/types";
 import { t, useT } from "@/lib/i18n";
 import { queryKeys } from "@/lib/queryKeys";
 import { useShellStore } from "@/lib/store";
 import { useMessageActions, messageActionToast } from "./actions";
-import { MESSAGE_DRAG_MIME, hasMessageDragData, readMessageDragData } from "./dnd";
+import { hasMessageDragData, readMessageDragData } from "./dnd";
 import {
-  UNIFIED_PREFIX,
-  buildFolderTree,
+  aggregateUnread,
   flattenFolderTree,
   isSameOrDescendant,
   parseUnifiedFolderId,
-  primaryNodes,
-  secondaryNodes,
+  splitAccountFolders,
   unifiedFolderId,
+  type AccountFolderSections,
   type FolderNode,
 } from "./logic";
 import {
@@ -341,6 +337,60 @@ export function MailSidebar() {
       return changed ? next : previous;
     });
   }, [folders, mailAccounts]);
+
+  /**
+   * Each account's rows split into the top rows and the ones folded behind
+   * "More". Shared by the render pass and by the auto-expand effect below.
+   */
+  const accountSections = useMemo(() => {
+    const result = new Map<string, AccountFolderSections & { tree: FolderNode[] }>();
+    for (const account of mailAccounts) {
+      const tree = folders.trees.get(account.id) ?? [];
+      // The outbox only appears once something is queued for sending.
+      const visibleTree = tree.filter(
+        (node) =>
+          !(
+            node.folder.role === "outbox" &&
+            node.folder.totalCount === 0 &&
+            node.children.length === 0
+          ),
+      );
+      result.set(account.id, { tree, ...splitAccountFolders(visibleTree) });
+    }
+    return result;
+  }, [folders, mailAccounts]);
+
+  /**
+   * Reveal "More" when the selected folder lives inside it, so deep links and
+   * freshly created folders never end up selected-but-invisible. The effect
+   * only fires for a selection it has not revealed yet: deriving the open
+   * state from the selection instead would instantly force "More" back open
+   * and make the row impossible to collapse while such a folder is selected.
+   */
+  const revealedFor = useRef<string | null>(null);
+  useEffect(() => {
+    const selectedId = selection.folderId;
+    if (!selectedId || revealedFor.current === selectedId) return;
+    const owner = mailAccounts.find((account) =>
+      flattenFolderTree(accountSections.get(account.id)?.secondary ?? []).some(
+        (entry) => entry.folder.id === selectedId,
+      ),
+    );
+    if (!owner) {
+      // The selection is on a top-level row. Forget it, so the same folder
+      // moving into "More" later (e.g. its favourite flag was cleared) reveals
+      // the section again instead of leaving the selected row hidden.
+      revealedFor.current = null;
+      return;
+    }
+    revealedFor.current = selectedId;
+    setMoreAccounts((previous) => {
+      if (previous.has(owner.id)) return previous;
+      const next = new Set(previous);
+      next.add(owner.id);
+      return next;
+    });
+  }, [accountSections, mailAccounts, selection.folderId]);
 
   const unreadByAccount = useMemo(() => {
     const result = new Map<string, number>();
@@ -806,14 +856,11 @@ export function MailSidebar() {
       ) : null}
 
       {mailAccounts.map((account) => {
-        const tree = folders.trees.get(account.id) ?? [];
-        // The outbox only appears once something is queued for sending.
-        const visibleTree = tree.filter(
-          (node) =>
-            !(node.folder.role === "outbox" && node.folder.totalCount === 0 && node.children.length === 0),
-        );
-        const primary = primaryNodes(visibleTree);
-        const secondary = secondaryNodes(visibleTree, primary);
+        const sections = accountSections.get(account.id);
+        const tree = sections?.tree ?? [];
+        const primary = sections?.primary ?? [];
+        const secondary = sections?.secondary ?? [];
+        const secondaryUnread = aggregateUnread(secondary);
         const accountOpen = expandedAccounts.has(account.id);
         const moreOpen = moreAccounts.has(account.id);
         const accountUnread = unreadByAccount.get(account.id) ?? 0;
@@ -906,17 +953,38 @@ export function MailSidebar() {
                   />
                 ))}
                 {secondary.length > 0 ? (
-                  <button
-                    type="button"
-                    className={styles.moreRow}
-                    onClick={() => toggleMore(account.id)}
+                  <div
+                    className={styles.folderRow}
+                    style={{ paddingLeft: 6 }}
+                    role="treeitem"
                     aria-expanded={moreOpen}
+                    aria-label={
+                      secondaryUnread > 0
+                        ? `${tt("mail.sidebar.moreFolders")}, ${tt("mail.sidebar.unreadCount", { count: secondaryUnread })}`
+                        : tt("mail.sidebar.moreFolders")
+                    }
+                    title={tt("mail.sidebar.moreFolders")}
+                    tabIndex={0}
+                    onClick={() => toggleMore(account.id)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        toggleMore(account.id);
+                      }
+                    }}
                   >
-                    <span className={styles.folderChevron}>
-                      {moreOpen ? <ChevronDown16Regular /> : <ChevronRight16Regular />}
+                    <span className={styles.folderChevronSpacer} />
+                    <span className={styles.folderIcon} aria-hidden="true">
+                      <MoreHorizontal16Regular />
                     </span>
-                    {moreOpen ? tt("mail.sidebar.showLess") : tt("mail.sidebar.moreFolders")}
-                  </button>
+                    <span className={styles.folderName}>
+                      {tt("mail.sidebar.moreFolders")}
+                    </span>
+                    <CountBadge
+                      count={secondaryUnread}
+                      label={tt("mail.sidebar.unreadCount", { count: secondaryUnread })}
+                    />
+                  </div>
                 ) : null}
                 {moreOpen
                   ? secondary.map((node) => (

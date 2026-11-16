@@ -20,6 +20,7 @@ import { Button, ConfirmHost, ToastProvider } from "@/components";
 import { ComposeWindow, MessageWindow } from "@/modules/mail/windows";
 import { useT, t as translate } from "@/lib/i18n";
 import { installSecondaryEventBridge } from "@/lib/eventBridge";
+import { useThemeSync, useSettingsQuery } from "@/lib/useSettings";
 import { Shell } from "@/app/Shell";
 import { WindowFrame } from "@/app/WindowFrame";
 import styles from "./App.module.css";
@@ -139,6 +140,12 @@ function RoutedView() {
 }
 
 export default function App() {
+  // Theme sync is mounted here rather than in the Shell so it also runs in the
+  // message / compose windows, which render without the shell. Every window is
+  // its own webview with its own native theme, so each one has to follow the
+  // settings and the OS independently.
+  useThemeSync(useSettingsQuery().data?.theme);
+
   return (
     <ErrorBoundary>
       <ToastProvider>

@@ -57,10 +57,18 @@ pub const MICROSOFT_MAIL_SCOPES: &[&str] = &[
     "https://outlook.office.com/SMTP.Send",
 ];
 
-/// Scopes for the Microsoft *Graph* resource (calendar, contacts, tasks).
+/// Scopes for the Microsoft *Graph* resource (mail, calendar, contacts, tasks).
+///
+/// The mail scopes are here as well as on the IMAP resource: some accounts are
+/// refused an IMAP session by Exchange (`User is authenticated but not
+/// connected`) even though every prerequisite checks out, and Graph is the only
+/// other way to reach the mailbox. They are requested so a token that carries
+/// them exists at all — OAuth only ever issues scopes that were asked for.
 pub const MICROSOFT_GRAPH_SCOPES: &[&str] = &[
     "openid",
     "offline_access",
+    "https://graph.microsoft.com/Mail.ReadWrite",
+    "https://graph.microsoft.com/Mail.Send",
     "https://graph.microsoft.com/Calendars.ReadWrite",
     "https://graph.microsoft.com/Contacts.ReadWrite",
     "https://graph.microsoft.com/Tasks.ReadWrite",
@@ -79,6 +87,8 @@ pub const MICROSOFT_AUTHORIZE_SCOPES: &[&str] = &[
     "offline_access",
     "https://outlook.office.com/IMAP.AccessAsUser.All",
     "https://outlook.office.com/SMTP.Send",
+    "https://graph.microsoft.com/Mail.ReadWrite",
+    "https://graph.microsoft.com/Mail.Send",
     "https://graph.microsoft.com/Calendars.ReadWrite",
     "https://graph.microsoft.com/Contacts.ReadWrite",
     "https://graph.microsoft.com/Tasks.ReadWrite",
@@ -296,8 +306,15 @@ pub fn build_auth_url(
                     .append_pair("include_granted_scopes", "true");
             }
             OAuthProvider::Microsoft => {
+                // `consent`, not `select_account`: the account picker alone lets
+                // Entra answer from a previous grant, and a grant recorded before
+                // a scope was added to the registration does not carry it. The
+                // token then authenticates fine against Graph but is rejected by
+                // IMAP — which looks like "sign-in succeeded, then immediately
+                // expired". Asking for consent every time makes the issued token
+                // match the scopes this build actually requests.
                 query
-                    .append_pair("prompt", "select_account")
+                    .append_pair("prompt", "consent")
                     .append_pair("response_mode", "query");
             }
         }
@@ -434,7 +451,7 @@ mod tests {
         );
         assert_eq!(
             params.get("prompt").map(String::as_str),
-            Some("select_account")
+            Some("consent")
         );
         assert_eq!(
             params.get("response_mode").map(String::as_str),

@@ -213,7 +213,12 @@ impl GraphClient {
             let mut next: Option<String> = Some(match &delta_url {
                 Some(url) => url.clone(),
                 None => self.url(&format!(
-                    "/me/calendars/{}/events/delta?%24select={}&%24top=100",
+                    // No `$top`: change-tracking endpoints reject it —
+                    // "The '$top' parameter is not supported with change tracking
+                    // over the 'SyncEvents' resource as page size cannot be
+                    // guaranteed." Page size is requested with `Prefer:
+                    // odata.maxpagesize` instead (see the request below).
+                    "/me/calendars/{}/events/delta?%24select={}",
                     encode(calendar_remote_id),
                     encode(EVENT_SELECT)
                 )),
@@ -238,7 +243,14 @@ impl GraphClient {
                                 .raw()
                                 .get(&url)
                                 .bearer_auth(token)
-                                .header("Prefer", "outlook.timezone=\"UTC\"")
+                                // One header, comma separated: the timezone and
+                                // the page size are both `Prefer` directives.
+                                // Delta endpoints refuse `$top` — this is the
+                                // supported way to influence page size.
+                                .header(
+                                    "Prefer",
+                                    "outlook.timezone=\"UTC\", odata.maxpagesize=100",
+                                )
                         },
                     )
                     .await?;

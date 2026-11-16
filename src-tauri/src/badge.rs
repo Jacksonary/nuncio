@@ -5,16 +5,27 @@
 //! encoding crate we emit an uncompressed RGBA PNG (stored deflate blocks):
 //! it is a few hundred bytes and keeps the dependency graph small.
 
-const SIZE: u32 = 32;
+/// Badge canvas.
+///
+/// 32px was too small: Windows scales the overlay icon, and at 32 the two-glyph
+/// text ("9+", "12") already needs 33px of horizontal room, so it was clipped
+/// on the right and the remaining glyphs landed on the edge of the circle.
+/// 64 gives the text room at 100% and enough source pixels that the scaling to
+/// the taskbar size stays sharp on high-DPI displays.
+const SIZE: u32 = 64;
 
 /// Render a red circular badge with the unread count (`9+` above nine).
 ///
-/// A count of zero yields a transparent image, which removes the overlay.
-pub fn overlay_png(count: u32) -> Vec<u8> {
-    let mut pixels = vec![0u8; (SIZE * SIZE * 4) as usize];
+/// Returns `None` when there is nothing to show. An all-transparent image is
+/// NOT equivalent to "no badge": Windows still draws an overlay slot for it,
+/// and on some compositor paths the transparent surface leaves artifacts
+/// (black banding) over the taskbar icon. The caller must pass `None` to
+/// `set_overlay_icon` so the overlay is actually removed.
+pub fn overlay_png(count: u32) -> Option<Vec<u8>> {
     if count == 0 {
-        return encode_png(&pixels);
+        return None;
     }
+    let mut pixels = vec![0u8; (SIZE * SIZE * 4) as usize];
 
     let center = (SIZE as f32 - 1.0) / 2.0;
     let radius = center - 1.0;
@@ -42,7 +53,7 @@ pub fn overlay_png(count: u32) -> Vec<u8> {
         count.to_string()
     };
     draw_text(&mut pixels, &text);
-    encode_png(&pixels)
+    Some(encode_png(&pixels))
 }
 
 /// 5x7 glyphs for digits and `+`; `#` is an opaque white pixel.
@@ -86,7 +97,12 @@ fn glyph(ch: char) -> Option<[&'static str; 7]> {
 }
 
 fn draw_text(pixels: &mut [u8], text: &str) {
-    const SCALE: u32 = 3;
+    // Scale by glyph count: the circle is round, so a two-glyph run has to stay
+    // inside it diagonally. At SIZE=64 a scale of 5 fits one glyph but a
+    // two-glyph run ("9+") reaches 32.6px from centre against a 31px radius and
+    // spills over the rim.
+    const SCALE_SINGLE: u32 = 5;
+    const SCALE_PAIR: u32 = 4;
     const GLYPH_W: u32 = 5;
     const GLYPH_H: u32 = 7;
     const GAP: u32 = 1;
@@ -95,8 +111,9 @@ fn draw_text(pixels: &mut [u8], text: &str) {
     if glyphs.is_empty() {
         return;
     }
-    let total_w = glyphs.len() as u32 * GLYPH_W * SCALE + (glyphs.len() as u32 - 1) * GAP * SCALE;
-    let total_h = GLYPH_H * SCALE;
+    let scale = if glyphs.len() > 1 { SCALE_PAIR } else { SCALE_SINGLE };
+    let total_w = glyphs.len() as u32 * GLYPH_W * scale + (glyphs.len() as u32 - 1) * GAP * scale;
+    let total_h = GLYPH_H * scale;
     let start_x = (SIZE.saturating_sub(total_w)) / 2;
     let start_y = (SIZE.saturating_sub(total_h)) / 2;
 
@@ -107,10 +124,10 @@ fn draw_text(pixels: &mut [u8], text: &str) {
                 if ch != '#' {
                     continue;
                 }
-                for dy in 0..SCALE {
-                    for dx in 0..SCALE {
-                        let x = start_x + x_offset + col as u32 * SCALE + dx;
-                        let y = start_y + row as u32 * SCALE + dy;
+                for dy in 0..scale {
+                    for dx in 0..scale {
+                        let x = start_x + x_offset + col as u32 * scale + dx;
+                        let y = start_y + row as u32 * scale + dy;
                         if x >= SIZE || y >= SIZE {
                             continue;
                         }
@@ -123,7 +140,7 @@ fn draw_text(pixels: &mut [u8], text: &str) {
                 }
             }
         }
-        x_offset += (GLYPH_W + GAP) * SCALE;
+        x_offset += (GLYPH_W + GAP) * scale;
     }
 }
 
@@ -201,7 +218,7 @@ mod tests {
 
     #[test]
     fn png_has_valid_signature_and_bounded_size() {
-        let bytes = overlay_png(3);
+        let bytes = overlay_png(3).expect("a count renders a badge");
         assert_eq!(
             &bytes[..8],
             &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
@@ -211,19 +228,79 @@ mod tests {
     }
 
     #[test]
-    fn zero_count_is_transparent_but_valid() {
-        let bytes = overlay_png(0);
-        assert_eq!(
-            &bytes[..8],
-            &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
-        );
+    fn zero_count_removes_the_badge_instead_of_drawing_an_empty_one() {
+        // A transparent image is not equivalent to "no overlay": the slot stays
+        // occupied and the compositor can leave banding over the taskbar icon.
+        assert!(overlay_png(0).is_none());
     }
 
     #[test]
     fn text_is_drawn_for_large_counts() {
-        let bytes = overlay_png(42);
-        assert!(!bytes.is_empty());
-        let bytes = overlay_png(150);
-        assert!(!bytes.is_empty());
+        assert!(overlay_png(42).is_some());
+        assert!(overlay_png(150).is_some());
+    }
+
+    #[test]
+    fn two_digit_text_stays_inside_the_circle() {
+        // 64px canvas, 31px usable radius. Two glyphs at scale 4 span 44x28,
+        // whose corner sits 26.1px from centre -- inside the rim.
+        let bytes = overlay_png(12).expect("badge");
+        let image = decode_rgba(&bytes);
+        let mut max_radius = 0.0f32;
+        let center = (SIZE as f32 - 1.0) / 2.0;
+        for y in 0..SIZE {
+            for x in 0..SIZE {
+                let index = ((y * SIZE + x) * 4) as usize;
+                if image[index + 3] > 200 {
+                    let dx = x as f32 - center;
+                    let dy = y as f32 - center;
+                    max_radius = max_radius.max((dx * dx + dy * dy).sqrt());
+                }
+            }
+        }
+        assert!(
+            max_radius <= center,
+            "badge content reached {max_radius:.1}px from centre, outside the {center:.1}px radius"
+        );
+    }
+
+    /// Decode our own stored-deflate PNG back to RGBA so the pixel assertions
+    /// above run against the real encoder output rather than a parallel path.
+    fn decode_rgba(bytes: &[u8]) -> Vec<u8> {
+        // Skip the 8-byte signature, walk chunks, inflate stored IDAT blocks.
+        let mut offset = 8;
+        let mut raw = Vec::new();
+        while offset + 8 <= bytes.len() {
+            let length = u32::from_be_bytes([
+                bytes[offset],
+                bytes[offset + 1],
+                bytes[offset + 2],
+                bytes[offset + 3],
+            ]) as usize;
+            let kind = &bytes[offset + 4..offset + 8];
+            let data = &bytes[offset + 8..offset + 8 + length];
+            if kind == b"IDAT" {
+                let mut i = 2; // zlib header
+                while i + 5 <= data.len() {
+                    let final_block = data[i] == 1;
+                    let len = u16::from_le_bytes([data[i + 1], data[i + 2]]) as usize;
+                    raw.extend_from_slice(&data[i + 5..i + 5 + len]);
+                    i += 5 + len;
+                    if final_block {
+                        break;
+                    }
+                }
+                break;
+            }
+            offset += 12 + length;
+        }
+        // Drop the per-row filter byte.
+        let stride = (SIZE * 4) as usize;
+        let mut pixels = Vec::with_capacity((SIZE * SIZE * 4) as usize);
+        for row in 0..SIZE as usize {
+            let start = row * (stride + 1) + 1;
+            pixels.extend_from_slice(&raw[start..start + stride]);
+        }
+        pixels
     }
 }

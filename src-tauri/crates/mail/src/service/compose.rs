@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use base64::Engine as _;
 use nuncio_core::events::MailChangeKind;
 use nuncio_core::models::{
-    Address, Draft, DraftAttachment, Folder, FolderRole, Identity, Importance, Language,
+    Account, Address, Draft, DraftAttachment, Folder, FolderRole, Identity, Importance, Language,
     MessageSummary, PendingOpState, ProviderKind, ReplyMode, Signature, StoredMessage,
 };
 use nuncio_core::{events, repo, AppError, Result};
@@ -464,22 +464,28 @@ impl MailService {
                 deleted_folder = Some(folder_id);
             }
             if let Some(local_id) = remote_local_id.take() {
-                let id_for_db = local_id.clone();
-                self.inner
-                    .ctx
-                    .db
-                    .write(move |db| {
-                        repo::messages::delete_local(db, &[id_for_db], true)?;
-                        Ok(())
-                    })
-                    .await?;
-                events::emit_mail_changed(
-                    self.inner.ctx.events.as_ref(),
-                    account.id.clone(),
-                    deleted_folder.into_iter().collect(),
-                    vec![local_id],
-                    MailChangeKind::Deleted,
-                );
+                // For Graph the queued deleteRemoteDraft op resolves the
+                // server id from this row (the payload only carries the
+                // synthetic UID), so it must survive until the op runs.  The
+                // next delta sync removes it once the server copy is gone.
+                if !crate::graph::uses_graph(&account) {
+                    let id_for_db = local_id.clone();
+                    self.inner
+                        .ctx
+                        .db
+                        .write(move |db| {
+                            repo::messages::delete_local(db, &[id_for_db], true)?;
+                            Ok(())
+                        })
+                        .await?;
+                    events::emit_mail_changed(
+                        self.inner.ctx.events.as_ref(),
+                        account.id.clone(),
+                        deleted_folder.into_iter().collect(),
+                        vec![local_id],
+                        MailChangeKind::Deleted,
+                    );
+                }
             }
             if pending_append.is_none() {
                 if let Some(folder) = server_drafts_folder {
@@ -531,6 +537,7 @@ impl MailService {
     /// Delete a draft locally, its staged files and its remote copy.
     pub async fn compose_discard(&self, draft_id: &str) -> Result<()> {
         let draft = self.compose_get_draft(draft_id).await?;
+        let account = self.account(&draft.account_id).await?;
         self.cancel_pending_draft_appends(&draft.account_id, draft_id)
             .await?;
         let mut folders: Vec<String> = Vec::new();
@@ -559,13 +566,18 @@ impl MailService {
                         }
                     }
                     folders.push(stored.summary.folder_id.clone());
-                    let id = stored.summary.id.clone();
-                    let _ = self
-                        .inner
-                        .ctx
-                        .db
-                        .write(move |db| repo::messages::delete_local(db, &[id], true))
-                        .await;
+                    // Keep the row for Graph until the queued delete can
+                    // resolve its server id (see compose_save); the delta sync
+                    // removes it afterwards.
+                    if !crate::graph::uses_graph(&account) {
+                        let id = stored.summary.id.clone();
+                        let _ = self
+                            .inner
+                            .ctx
+                            .db
+                            .write(move |db| repo::messages::delete_local(db, &[id], true))
+                            .await;
+                    }
                 }
             }
         }
@@ -601,6 +613,11 @@ impl MailService {
     /// Validate, build MIME, queue to the outbox and remove the draft.
     pub async fn compose_send(&self, draft: &Draft) -> Result<()> {
         let account = self.account(&draft.account_id).await?;
+        // Clear early dispatch: Microsoft accounts send through Graph, which
+        // also files the Sent copy, so the SMTP/outbox path is skipped.
+        if crate::graph::uses_graph(&account) {
+            return self.compose_send_graph(&account, draft).await;
+        }
         let recipients = all_recipients(draft)?;
         if account.smtp.is_none() {
             return Err(AppError::unsupported(
@@ -677,6 +694,132 @@ impl MailService {
         );
         self.update_badge().await;
         Ok(())
+    }
+
+    /// Send a draft through Microsoft Graph.
+    ///
+    /// Graph's `sendMail` accepts a base64 MIME payload and reads the
+    /// recipients from its headers, so the staged copy must keep the Bcc
+    /// header (`build_message_with_bcc`) -- unlike SMTP there is no envelope
+    /// to carry Bcc separately.  Graph files the Sent copy itself, so no
+    /// `appendToSent` operation is queued.  A failed send leaves the draft and
+    /// its local projection intact so the user can retry.
+    async fn compose_send_graph(&self, account: &Account, draft: &Draft) -> Result<()> {
+        all_recipients(draft)?;
+        let identity = self
+            .identity_for(account, std::slice::from_ref(&draft.from))
+            .await?;
+        let outgoing = self.outgoing_from_draft(draft, &identity, None)?;
+        let (bytes, _) = nuncio_mime::build_message_with_bcc(outgoing)?;
+        if bytes.len() as u64 > MAX_DRAFT_BYTES {
+            return Err(AppError::invalid_input("message exceeds 100 MB"));
+        }
+
+        let draft_id = draft.id.clone();
+        if let Some(draft_id) = draft_id.as_deref() {
+            self.cancel_pending_draft_appends(&account.id, draft_id)
+                .await?;
+        }
+
+        crate::graph::ops::send_raw(
+            &crate::graph::GraphMailClient::new(),
+            &self.inner.ctx,
+            &account.id,
+            &bytes,
+        )
+        .await?;
+
+        // The message is sent; everything below is best-effort cleanup and must
+        // not turn a delivered message into a reported failure.
+        self.queue_graph_remote_draft_removal(account, draft).await;
+        if let Err(error) = self.apply_source_flags(account, draft).await {
+            warn!(%error, "could not mark the source message as replied/forwarded");
+        }
+
+        let mut affected_folders: Vec<String> = Vec::new();
+        if let Some(draft_id) = draft_id {
+            let id = draft_id.clone();
+            if let Err(error) = self
+                .inner
+                .ctx
+                .db
+                .write(move |db| repo::drafts::delete(db, &id))
+                .await
+            {
+                warn!(%error, draft = %draft_id, "could not delete the sent draft");
+            }
+            match self.remove_draft_message(&draft_id).await {
+                Ok(Some(folder_id)) => affected_folders.push(folder_id),
+                Ok(None) => {}
+                Err(error) => {
+                    debug!(%error, draft = %draft_id, "could not remove the draft projection")
+                }
+            }
+            let dir = self.inner.ctx.paths.draft_staging_dir(&draft_id);
+            let _ = tokio::fs::remove_dir_all(dir).await;
+        }
+        events::emit_mail_changed(
+            self.inner.ctx.events.as_ref(),
+            account.id.clone(),
+            affected_folders,
+            Vec::new(),
+            MailChangeKind::Updated,
+        );
+        self.update_badge().await;
+        Ok(())
+    }
+
+    /// Queue deletion of the server copy of a draft, keeping the local row.
+    ///
+    /// The queued payload only carries the synthetic UID; the Graph executor
+    /// resolves the real message id from the row.  Deleting the row here (as
+    /// the IMAP path does) would make the operation unresolvable, so it is
+    /// left for the next delta sync to remove.
+    async fn queue_graph_remote_draft_removal(&self, account: &Account, draft: &Draft) {
+        let mut remote: Option<StoredMessage> = None;
+        if let Some(message_id) = draft.remote_draft_message_id.as_deref() {
+            if let Ok(stored) = self.stored(message_id).await {
+                if stored.summary.account_id == account.id {
+                    remote = Some(stored);
+                }
+            }
+        }
+        if remote.is_none() {
+            if let (Some(draft_id), Some(folder)) = (
+                draft.id.as_deref(),
+                self.folder_by_role(&account.id, FolderRole::Drafts)
+                    .await
+                    .ok()
+                    .flatten(),
+            ) {
+                let header = draft_message_id(draft_id);
+                remote = self
+                    .find_remote_draft(account, &folder, draft, &header)
+                    .await
+                    .ok()
+                    .flatten();
+            }
+        }
+        let Some(stored) = remote else { return };
+        let Some(uid) = stored.uid else { return };
+        let payload = DeleteRemoteDraftOp {
+            folder_id: stored.summary.folder_id.clone(),
+            uid,
+        };
+        let Ok(value) = serde_json::to_value(payload) else {
+            return;
+        };
+        if let Err(error) = ops::enqueue_operation(
+            &self.inner.ctx,
+            &account.id,
+            KIND_DELETE_REMOTE_DRAFT,
+            value,
+            "Remove remote draft",
+        )
+        .await
+        {
+            debug!(%error, "could not queue remote draft deletion");
+        }
     }
 
     /* ───────────────────── attachments / suggestions ───────────────────── */

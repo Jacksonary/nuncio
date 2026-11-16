@@ -505,13 +505,31 @@ pub async fn connect_account(ctx: &CoreContext, account: &Account) -> Result<Ima
     match connect(config, &auth).await {
         Ok(connection) => Ok(connection),
         Err(error) if error.code() == "auth" => {
-            warn!(account = %account.id, "IMAP authentication failed; requesting fresh credentials");
+            // The server's own wording is the only thing that distinguishes
+            // "this token has no IMAP scope" from "this mailbox is blocked" or
+            // "the audience is wrong"; dropping it leaves nothing to diagnose
+            // with. The message carries no credential (servers quote the
+            // username at most), so it is safe to keep in the log.
+            warn!(
+                account = %account.id,
+                host = %config.host,
+                error = %error.message(),
+                "IMAP authentication failed; requesting fresh credentials"
+            );
+            log_token_claims(&account.id, &auth);
             ctx.creds
                 .report_auth_failure(&account.id, nuncio_core::traits::TokenResource::Mail)
                 .await;
             let refreshed = ctx.creds.mail_auth(account).await?;
             connect(config, &refreshed).await.map_err(|second| {
                 if second.code() == "auth" {
+                    warn!(
+                        account = %account.id,
+                        host = %config.host,
+                        error = %second.message(),
+                        "IMAP rejected the refreshed token"
+                    );
+                    log_token_claims(&account.id, &refreshed);
                     AppError::auth("IMAP authentication failed after token refresh")
                 } else {
                     second
@@ -520,6 +538,55 @@ pub async fn connect_account(ctx: &CoreContext, account: &Account) -> Result<Ima
         }
         Err(error) => Err(error),
     }
+}
+
+/// Log the claims that decide whether a provider will accept a token.
+///
+/// Only the *claims* are logged, never the credential itself: `scp` tells us
+/// which scopes were actually granted, `aud` and `tid` tell us which resource
+/// and tenant the token was issued for. When IMAP rejects a token that Graph
+/// accepts, one of those three is the reason — and without them the failure is
+/// indistinguishable from a dozen unrelated causes.
+fn log_token_claims(account_id: &str, auth: &nuncio_core::traits::MailAuth) {
+    let nuncio_core::traits::MailAuth::XOAuth2 { access_token, .. } = auth else {
+        return;
+    };
+    let Some(claims) = decode_jwt_claims(access_token) else {
+        debug!(account = %account_id, "the access token is not a JWT; no claims to inspect");
+        return;
+    };
+    let read = |key: &str| {
+        claims
+            .get(key)
+            .and_then(|value| value.as_str())
+            .unwrap_or("<absent>")
+            .to_string()
+    };
+    warn!(
+        account = %account_id,
+        scp = %read("scp"),
+        aud = %read("aud"),
+        tid = %read("tid"),
+        // `ver` distinguishes the v1 and v2 token formats; v1 tokens carry the
+        // scopes in a space-separated `scp` too, but some resources only accept
+        // a specific generation.
+        ver = %read("ver"),
+        "access token claims"
+    );
+}
+
+/// Decode a JWT payload without verifying it.
+///
+/// The token came from the provider's token endpoint over TLS in response to
+/// our own request, so the signature adds nothing here; we only want to read
+/// back what was issued. Returns `None` for opaque (non-JWT) tokens.
+fn decode_jwt_claims(token: &str) -> Option<serde_json::Value> {
+    use base64::Engine;
+    let payload = token.split('.').nth(1)?;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .ok()?;
+    serde_json::from_slice(&raw).ok()
 }
 
 /// Resolve `host:port`, preferring IPv4.

@@ -7,6 +7,7 @@
  * authoritative values and mirrors them into the native window theme.
  */
 import { isTauri } from "@tauri-apps/api/core";
+import type { UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { ThemeMode } from "@/ipc/types";
 
@@ -37,14 +38,22 @@ export function resolveTheme(mode: ThemeMode): ResolvedTheme {
   return mode === "dark" ? "dark" : "light";
 }
 
-/** Apply a theme mode to <html data-theme> and cache it for next launch. */
-export function applyTheme(mode: ThemeMode): ResolvedTheme {
-  const resolved = resolveTheme(mode);
+/**
+ * Apply a theme mode to <html data-theme> and cache it for next launch.
+ *
+ * `resolved` overrides the matchMedia lookup. Callers pass it when they
+ * already know the effective theme from a more authoritative source — the
+ * native window, or the payload of a Tauri theme-change event — because
+ * `prefers-color-scheme` inside the webview can lag behind an OS change (or
+ * still report the value it was pinned to).
+ */
+export function applyTheme(mode: ThemeMode, resolved?: ResolvedTheme): ResolvedTheme {
+  const value = resolved ?? resolveTheme(mode);
   if (typeof document !== "undefined") {
-    document.documentElement.dataset.theme = resolved;
+    document.documentElement.dataset.theme = value;
   }
   storage()?.setItem(THEME_STORAGE_KEY, mode);
-  return resolved;
+  return value;
 }
 
 export function readCachedThemeMode(): ThemeMode {
@@ -114,23 +123,116 @@ export function bootstrapTheme(): void {
  * Mirror the theme into the native window so the webview's
  * prefers-color-scheme (and OS chrome) follow the app setting, including
  * inside mail iframes. Errors (e.g. running in a plain browser) are ignored.
+ *
+ * IMPORTANT: pass `null` for "system", never the *resolved* light/dark value.
+ * `setTheme(null)` is what tells the runtime "follow the OS"; a concrete value
+ * pins the window (and on Windows `ICoreWebView2Profile::SetPreferredColorScheme`)
+ * to that scheme permanently. Once pinned, tao short-circuits the
+ * `WM_SETTINGCHANGE` handler (`preferred_theme.is_some()` → return) so it never
+ * emits `ThemeChanged`, and the webview's `prefers-color-scheme` media query is
+ * frozen at the pinned value. That silently kills every theme-change listener,
+ * including our own `watchSystemTheme`, and the UI stops following the OS while
+ * the theme mode still reads "system" — a self-lock. Resolve the *display*
+ * value, never the *native* value.
  */
 export async function syncNativeTheme(mode: ThemeMode): Promise<void> {
   if (!isTauri()) return;
   try {
-    await getCurrentWindow().setTheme(resolveTheme(mode));
+    await getCurrentWindow().setTheme(mode === "system" ? null : mode);
   } catch {
     // Not fatal: the CSS theme is already applied.
   }
 }
 
-/** Subscribe to OS theme changes (only meaningful for theme === "system"). */
-export function watchSystemTheme(listener: () => void): () => void {
-  if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
-    return () => undefined;
+/**
+ * The OS theme as the native layer sees it right now, or null when unavailable
+ * (plain browser, or the platform has no notion of a window theme).
+ *
+ * Preferred over `matchMedia` when un-pinning: a webview that was just released
+ * from a forced scheme may keep reporting the old `prefers-color-scheme` for a
+ * while, whereas the native window value is read straight from the OS.
+ */
+export async function nativeSystemTheme(): Promise<ResolvedTheme | null> {
+  if (!isTauri()) return null;
+  try {
+    const theme = await getCurrentWindow().theme();
+    return theme === "dark" ? "dark" : theme === "light" ? "light" : null;
+  } catch {
+    return null;
   }
-  const media = window.matchMedia("(prefers-color-scheme: dark)");
-  const handler = () => listener();
-  media.addEventListener("change", handler);
-  return () => media.removeEventListener("change", handler);
+}
+
+/**
+ * Resolve the effective theme after the native window has been switched back
+ * to "follow system", preferring the native value and falling back to
+ * matchMedia for the browser dev build.
+ */
+export async function resolveNativeSystemTheme(): Promise<ResolvedTheme> {
+  const native = await nativeSystemTheme();
+  return native ?? resolveTheme("system");
+}
+
+/**
+ * Subscribe to OS theme changes (only meaningful for theme === "system").
+ *
+ * The Tauri window event is the primary source: once the window is no longer
+ * pinned, the runtime emits it on every OS theme flip and its payload is the
+ * authoritative new theme. `matchMedia` is only a fallback for the browser dev
+ * build and for a failed native subscription — deliberately not both at once.
+ * On Windows the runtime re-applies the OS scheme to the webview on each
+ * `ThemeChanged` (`SetPreferredColorScheme`), so a `change` event can arrive a
+ * tick later still describing the previous scheme and would overwrite the
+ * correct value. One source, no race.
+ *
+ * Returns a cleanup function synchronously even though subscribing is async:
+ * `onThemeChanged` resolves to an `UnlistenFn`, so disposal is tracked with a
+ * flag and the handle is released as soon as it arrives after an early
+ * cleanup. Without that, a consumer that unmounts before the IPC round-trip
+ * finishes would leak a listener for the lifetime of the window.
+ */
+export function watchSystemTheme(listener: (theme?: ResolvedTheme) => void): () => void {
+  let disposed = false;
+  let unlistenTheme: UnlistenFn | null = null;
+  let unlistenMedia: (() => void) | null = null;
+
+  const subscribeMedia = () => {
+    if (disposed) return;
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
+    if (unlistenMedia) return;
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    const handler = () => {
+      if (!disposed) listener();
+    };
+    media.addEventListener("change", handler);
+    unlistenMedia = () => media.removeEventListener("change", handler);
+  };
+
+  if (isTauri()) {
+    getCurrentWindow()
+      .onThemeChanged(({ payload }) => {
+        if (!disposed) listener(payload === "dark" ? "dark" : "light");
+      })
+      .then((unlisten) => {
+        if (disposed) {
+          // The subscription outlived its caller: drop it immediately.
+          unlisten();
+          return;
+        }
+        unlistenTheme = unlisten;
+      })
+      .catch(() => {
+        // Unsupported platform: fall through to matchMedia.
+        subscribeMedia();
+      });
+  } else {
+    subscribeMedia();
+  }
+
+  return () => {
+    disposed = true;
+    unlistenMedia?.();
+    unlistenMedia = null;
+    unlistenTheme?.();
+    unlistenTheme = null;
+  };
 }

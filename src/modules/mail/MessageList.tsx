@@ -33,12 +33,12 @@ import {
   Mail16Regular,
   MailRead16Regular,
   MailUnread16Regular,
-  MoreHorizontal16Regular,
   Options16Regular,
   Open16Regular,
   Print16Regular,
   Save16Regular,
   Search16Regular,
+  SelectAllOn16Regular,
   Send16Regular,
   TaskListSquareLtr16Regular,
   Warning16Regular,
@@ -47,7 +47,6 @@ import {
   Avatar,
   Button,
   Checkbox,
-  CountBadge,
   DatePicker,
   EmptyState,
   IconButton,
@@ -1168,9 +1167,18 @@ export function MessageList() {
     setFilter("all");
   }, []);
 
-  const showBatchBar =
-    !outboxView &&
-    (selected.ids.length > 1 || (selectionMode && selected.ids.length > 0));
+  // The bulk row is always on screen (except in the outbox view): hiding it
+  // until something was selected made "select all" undiscoverable, and the
+  // actions are cheap no-ops when the selection is empty.
+  const hasSelection = selected.ids.length > 0;
+
+  // Every row currently in the list is selected, which turns the toggle into
+  // "deselect all". Selection can also hold ids that are no longer listed (a
+  // filter or search change), hence the per-id check rather than a length
+  // comparison — and a Set, because the list can hold thousands of rows.
+  const selectedIdSet = useMemo(() => new Set(selected.ids), [selected.ids]);
+  const allListedSelected =
+    orderedIds.length > 0 && orderedIds.every((id) => selectedIdSet.has(id));
 
   const title = searchText
     ? tt("mail.list.searchTitle")
@@ -1266,38 +1274,38 @@ export function MessageList() {
               </Button>
             ) : (
               <>
-                <Tooltip content={tt("mail.list.sync")} placement="bottom">
-                  <span>
-                    <IconButton
-                      icon={syncing ? <Spinner size="tiny" /> : <ArrowSync16Regular />}
-                      label={tt("mail.list.sync")}
-                      size="small"
-                      onClick={() => void syncNow()}
-                      disabled={syncing}
-                    />
-                  </span>
+                {/* No Tooltip wrapper here: IconButton already renders one from
+                    `label`, so wrapping it produced two bubbles for one button. */}
+                <IconButton
+                  icon={syncing ? <Spinner size="tiny" /> : <ArrowSync16Regular />}
+                  label={tt("mail.list.sync")}
+                  size="small"
+                  onClick={() => void syncNow()}
+                  disabled={syncing}
+                />
+                <Tooltip content={tt("mail.list.conversation")}>
+                  <ToggleButton
+                    pressed={conversation}
+                    onPressedChange={(pressed) =>
+                      updateSettings.mutate({ mail: { conversationView: pressed } })
+                    }
+                    icon={<ChatMultiple16Regular />}
+                    size="small"
+                    aria-label={tt("mail.list.conversation")}
+                  />
                 </Tooltip>
-                <ToggleButton
-                  pressed={conversation}
-                  onPressedChange={(pressed) =>
-                    updateSettings.mutate({ mail: { conversationView: pressed } })
-                  }
-                  icon={<ChatMultiple16Regular />}
-                  size="small"
-                  title={tt("mail.list.conversation")}
-                  aria-label={tt("mail.list.conversation")}
-                />
-                <ToggleButton
-                  pressed={selectionMode}
-                  onPressedChange={(pressed) => {
-                    setSelectionMode(pressed);
-                    dispatchSelection({ type: "clear" });
-                  }}
-                  icon={<CheckboxChecked16Regular />}
-                  size="small"
-                  title={tt("mail.list.selectionMode")}
-                  aria-label={tt("mail.list.selectionMode")}
-                />
+                <Tooltip content={tt("mail.list.selectionMode")}>
+                  <ToggleButton
+                    pressed={selectionMode}
+                    onPressedChange={(pressed) => {
+                      setSelectionMode(pressed);
+                      dispatchSelection({ type: "clear" });
+                    }}
+                    icon={<CheckboxChecked16Regular />}
+                    size="small"
+                    aria-label={tt("mail.list.selectionMode")}
+                  />
+                </Tooltip>
                 <MenuButton
                   label={tt("mail.list.filter")}
                   icon={<Options16Regular />}
@@ -1310,11 +1318,30 @@ export function MessageList() {
           </div>
         </div>
 
-        {showBatchBar ? (
+        {outboxView ? null : (
           <div className={styles.batchBar} role="toolbar" aria-label={tt("mail.list.batchBar")}>
-            <span className={styles.batchCount}>
-              {tt("mail.list.selectedCount", { count: selected.ids.length })}
-            </span>
+            {/* Same control and the same pressed look as the header's selection
+                toggle: one icon, state shown by the button being pressed. */}
+            <Tooltip
+              content={
+                allListedSelected ? tt("mail.list.selectNone") : tt("mail.list.selectAll")
+              }
+            >
+              <ToggleButton
+                pressed={allListedSelected}
+                onPressedChange={() =>
+                  dispatchSelection(
+                    allListedSelected
+                      ? { type: "clear" }
+                      : { type: "replace", ids: orderedIds },
+                  )
+                }
+                icon={<SelectAllOn16Regular />}
+                size="small"
+                aria-label={tt("mail.list.selectAll")}
+                disabled={orderedIds.length === 0}
+              />
+            </Tooltip>
             <IconButton
               icon={<Archive16Regular />}
               label={tt("mail.action.archive")}
@@ -1353,133 +1380,125 @@ export function MessageList() {
               size="small"
               disabled={moveMenuEntries.length === 0}
             />
-            <span className={styles.batchSpacer} />
-            <Button
-              size="small"
-              appearance="subtle"
-              onClick={() => dispatchSelection({ type: "clear" })}
-            >
-              {tt("mail.list.batchClear")}
-            </Button>
+            {hasSelection ? (
+              <span className={styles.batchCount}>{selected.ids.length}</span>
+            ) : null}
           </div>
-        ) : (
-          <>
-            <div className={styles.searchRow}>
-              <SearchBox
-                ref={searchRef}
-                value={searchInput}
-                onChange={setSearchInput}
-                placeholder={tt("mail.list.searchPlaceholder")}
-                shortcut={formatShortcut("Mod+E")}
-              />
-              <IconButton
-                icon={<Options16Regular />}
-                label={tt("mail.list.advanced")}
+        )}
+        <div className={styles.searchRow}>
+          <SearchBox
+            ref={searchRef}
+            value={searchInput}
+            onChange={setSearchInput}
+            placeholder={tt("mail.list.searchPlaceholder")}
+            shortcut={formatShortcut("Mod+E")}
+          />
+          <IconButton
+            icon={<Options16Regular />}
+            label={tt("mail.list.advanced")}
+            size="small"
+            selected={advancedOpen}
+            onClick={() => setAdvancedOpen((open) => !open)}
+          />
+        </div>
+        <div className={styles.scopeRow}>
+            <span className={styles.scopeLabel}>{tt("mail.list.searchScope")}</span>
+            <div className={styles.scopeChips} role="group" aria-label={tt("mail.list.searchScope")}>
+              <ToggleButton
+                pressed={effectiveSearchScope === "folder"}
+                onPressedChange={() => setSearchScope("folder")}
+                disabled={!canScopeFolder}
                 size="small"
-                selected={advancedOpen}
-                onClick={() => setAdvancedOpen((open) => !open)}
+              >
+                {tt("mail.list.scopeFolder")}
+              </ToggleButton>
+              <ToggleButton
+                pressed={effectiveSearchScope === "all"}
+                onPressedChange={() => setSearchScope("all")}
+                size="small"
+              >
+                {tt("mail.list.scopeAll")}
+              </ToggleButton>
+            </div>
+          </div>
+        {advancedOpen ? (
+          <div className={styles.advancedPanel}>
+            <div className={styles.advancedGrid}>
+              <Input
+                size="small"
+                label={tt("mail.list.from")}
+                value={advanced.from}
+                onChange={(event) =>
+                  setAdvanced((value) => ({ ...value, from: event.target.value }))
+                }
+              />
+              <Input
+                size="small"
+                label={tt("mail.list.to")}
+                value={advanced.to}
+                onChange={(event) =>
+                  setAdvanced((value) => ({ ...value, to: event.target.value }))
+                }
+              />
+              <Input
+                size="small"
+                label={tt("mail.list.subject")}
+                value={advanced.subject}
+                onChange={(event) =>
+                  setAdvanced((value) => ({ ...value, subject: event.target.value }))
+                }
+              />
+              <DatePicker
+                label={tt("mail.list.dateFrom")}
+                value={advanced.dateFrom}
+                onChange={(value) => setAdvanced((current) => ({ ...current, dateFrom: value }))}
+              />
+              <DatePicker
+                label={tt("mail.list.dateTo")}
+                value={advanced.dateTo}
+                onChange={(value) => setAdvanced((current) => ({ ...current, dateTo: value }))}
               />
             </div>
-            <div className={styles.scopeRow}>
-                <span className={styles.scopeLabel}>{tt("mail.list.searchScope")}</span>
-                <div className={styles.scopeChips} role="group" aria-label={tt("mail.list.searchScope")}>
-                  <ToggleButton
-                    pressed={effectiveSearchScope === "folder"}
-                    onPressedChange={() => setSearchScope("folder")}
-                    disabled={!canScopeFolder}
-                    size="small"
-                  >
-                    {tt("mail.list.scopeFolder")}
-                  </ToggleButton>
-                  <ToggleButton
-                    pressed={effectiveSearchScope === "all"}
-                    onPressedChange={() => setSearchScope("all")}
-                    size="small"
-                  >
-                    {tt("mail.list.scopeAll")}
-                  </ToggleButton>
-                </div>
-              </div>
-            {advancedOpen ? (
-              <div className={styles.advancedPanel}>
-                <div className={styles.advancedGrid}>
-                  <Input
-                    size="small"
-                    label={tt("mail.list.from")}
-                    value={advanced.from}
-                    onChange={(event) =>
-                      setAdvanced((value) => ({ ...value, from: event.target.value }))
-                    }
-                  />
-                  <Input
-                    size="small"
-                    label={tt("mail.list.to")}
-                    value={advanced.to}
-                    onChange={(event) =>
-                      setAdvanced((value) => ({ ...value, to: event.target.value }))
-                    }
-                  />
-                  <Input
-                    size="small"
-                    label={tt("mail.list.subject")}
-                    value={advanced.subject}
-                    onChange={(event) =>
-                      setAdvanced((value) => ({ ...value, subject: event.target.value }))
-                    }
-                  />
-                  <DatePicker
-                    label={tt("mail.list.dateFrom")}
-                    value={advanced.dateFrom}
-                    onChange={(value) => setAdvanced((current) => ({ ...current, dateFrom: value }))}
-                  />
-                  <DatePicker
-                    label={tt("mail.list.dateTo")}
-                    value={advanced.dateTo}
-                    onChange={(value) => setAdvanced((current) => ({ ...current, dateTo: value }))}
-                  />
-                </div>
-                <div className={styles.advancedChecks}>
-                  <Checkbox
-                    label={tt("mail.list.hasAttachment")}
-                    checked={advanced.hasAttachment}
-                    onChange={(event) =>
-                      setAdvanced((value) => ({ ...value, hasAttachment: event.target.checked }))
-                    }
-                  />
-                  <Checkbox
-                    label={tt("mail.list.unreadOnly")}
-                    checked={advanced.unread}
-                    onChange={(event) =>
-                      setAdvanced((value) => ({ ...value, unread: event.target.checked }))
-                    }
-                  />
-                  <Checkbox
-                    label={tt("mail.list.flaggedOnly")}
-                    checked={advanced.flagged}
-                    onChange={(event) =>
-                      setAdvanced((value) => ({ ...value, flagged: event.target.checked }))
-                    }
-                  />
-                  <Switch
-                    label={tt("mail.list.includeServer")}
-                    checked={advanced.includeServer}
-                    onChange={(checked) =>
-                      setAdvanced((value) => ({ ...value, includeServer: checked }))
-                    }
-                  />
-                </div>
-                <div className={styles.advancedActions}>
-                  <Button size="small" appearance="subtle" onClick={clearSearch}>
-                    {tt("mail.list.clearFilters")}
-                  </Button>
-                  <Button size="small" appearance="primary" onClick={() => setAdvancedOpen(false)}>
-                    {tt("common.done")}
-                  </Button>
-                </div>
-              </div>
-            ) : null}
-          </>
-        )}
+            <div className={styles.advancedChecks}>
+              <Checkbox
+                label={tt("mail.list.hasAttachment")}
+                checked={advanced.hasAttachment}
+                onChange={(event) =>
+                  setAdvanced((value) => ({ ...value, hasAttachment: event.target.checked }))
+                }
+              />
+              <Checkbox
+                label={tt("mail.list.unreadOnly")}
+                checked={advanced.unread}
+                onChange={(event) =>
+                  setAdvanced((value) => ({ ...value, unread: event.target.checked }))
+                }
+              />
+              <Checkbox
+                label={tt("mail.list.flaggedOnly")}
+                checked={advanced.flagged}
+                onChange={(event) =>
+                  setAdvanced((value) => ({ ...value, flagged: event.target.checked }))
+                }
+              />
+              <Switch
+                label={tt("mail.list.includeServer")}
+                checked={advanced.includeServer}
+                onChange={(checked) =>
+                  setAdvanced((value) => ({ ...value, includeServer: checked }))
+                }
+              />
+            </div>
+            <div className={styles.advancedActions}>
+              <Button size="small" appearance="subtle" onClick={clearSearch}>
+                {tt("mail.list.clearFilters")}
+              </Button>
+              <Button size="small" appearance="primary" onClick={() => setAdvancedOpen(false)}>
+                {tt("common.done")}
+              </Button>
+            </div>
+          </div>
+        ) : null}
       </header>
 
       <div className={styles.listBody} ref={listWrapRef}>

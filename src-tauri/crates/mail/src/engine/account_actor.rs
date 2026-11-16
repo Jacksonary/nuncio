@@ -106,6 +106,10 @@ pub(crate) async fn spawn(
     let mut tasks = Vec::new();
     let is_pop3 = account.provider == ProviderKind::Pop3
         || (account.imap.is_none() && account.pop3.is_some());
+    // Third transport: Microsoft OAuth accounts are served by Graph.  This is
+    // the ONE predicate every branch in the crate calls, so a mailbox cannot
+    // end up half on IMAP and half on Graph.
+    let is_graph = crate::graph::uses_graph(&account);
 
     if is_pop3 {
         tasks.push(tokio::spawn(pop3_loop(
@@ -117,6 +121,23 @@ pub(crate) async fn spawn(
             ctx.clone(),
             account.id.clone(),
             None,
+            cancel.clone(),
+        )));
+    } else if is_graph {
+        // Graph has no IDLE and no IMAP worker: one serialized loop polls on
+        // the existing no-IDLE cadence, handles commands (body fetch, sync
+        // now) and drains the operation queue.  IDLE/keepalive stay IMAP-only.
+        tasks.push(tokio::spawn(graph_loop(
+            ctx.clone(),
+            account.id.clone(),
+            rx,
+            cancel.clone(),
+            config.clone(),
+        )));
+        tasks.push(tokio::spawn(ops_ticker(
+            ctx.clone(),
+            account.id.clone(),
+            Some(tx.clone()),
             cancel.clone(),
         )));
     } else {
@@ -153,13 +174,23 @@ pub(crate) async fn spawn(
             cancel.clone(),
         )));
     }
-    tasks.push(tokio::spawn(outbox_loop(
-        ctx,
-        account.id.clone(),
-        cancel.clone(),
-    )));
+    if !is_graph {
+        // Graph sends happen synchronously through `sendMail`; there is no
+        // SMTP outbox to drain (and an SMTP attempt for an MSA mailbox would
+        // only fail).  The outbox loop stays IMAP/POP3-only.
+        tasks.push(tokio::spawn(outbox_loop(
+            ctx,
+            account.id.clone(),
+            cancel.clone(),
+        )));
+    }
 
-    info!(account = %account.id, pop3 = is_pop3, "mail account actor started");
+    info!(
+        account = %account.id,
+        pop3 = is_pop3,
+        graph = is_graph,
+        "mail account actor started"
+    );
     Ok(AccountRuntime { tx, cancel, tasks })
 }
 
@@ -1112,6 +1143,443 @@ async fn pop3_loop(ctx: CoreContext, account_id: String, cancel: CancellationTok
                 debug!(%error, account = %account_id, "POP3 sync failed");
             }
         }
+    }
+}
+
+/* ────────────────────────────── Graph ─────────────────────────────── */
+
+/// Per-account worker for Microsoft Graph accounts.
+///
+/// Commands arrive on the same channel as the IMAP worker, so `sync_now`,
+/// `fetch_body` and `flush_ops` keep working unchanged.  When idle the loop
+/// performs a periodic full refresh on the existing no-IDLE poll cadence; a
+/// failure backs off exponentially with the shared [`Backoff`].  There is no
+/// IDLE and no keepalive: Graph is request/response, so a long-poll session
+/// would only hold a socket open.
+async fn graph_loop(
+    ctx: CoreContext,
+    account_id: String,
+    mut rx: mpsc::Receiver<AccountCommand>,
+    cancel: CancellationToken,
+    config: EngineConfig,
+) {
+    let base = config.no_idle_poll_interval.max(Duration::from_secs(30));
+    let mut backoff = Backoff::new(Duration::from_secs(5), Duration::from_secs(300));
+    let mut delay = base;
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            command = rx.recv() => {
+                let Some(command) = command else { break };
+                handle_graph_command(&ctx, &account_id, command).await;
+                // A command is an explicit wake-up: retry immediately if it
+                // failed, then return to the normal cadence.
+                backoff.reset();
+                delay = base;
+            }
+            _ = sleep(delay) => {
+                match graph_sync_account(&ctx, &account_id).await {
+                    Ok(()) => {
+                        backoff.reset();
+                        delay = base;
+                    }
+                    Err(error) => {
+                        delay = backoff.next_delay();
+                        debug!(
+                            account = %account_id,
+                            %error,
+                            retry_seconds = delay.as_secs(),
+                            "Graph sync failed; backing off"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    debug!(account = %account_id, "Graph loop stopped");
+}
+
+/// Full Graph sync: reconcile folders, then every Inbox/favourite/
+/// sync-enabled folder.
+///
+/// This mirrors `sync::sync_account_with`, which cannot be reused directly
+/// because it requires an `ImapConnection`.  The per-folder work and the
+/// notification step are the same shared functions.
+async fn graph_sync_account(ctx: &CoreContext, account_id: &str) -> Result<()> {
+    let account = load_account(ctx, account_id).await?;
+    if !crate::graph::uses_graph(&account) {
+        return Ok(());
+    }
+    ctx.sync_status
+        .begin(&account.id, nuncio_core::models::SyncModule::Mail, None);
+
+    let all_folders = match sync::folders::sync_graph(ctx, &account).await {
+        Ok(folders) => folders,
+        Err(error) => {
+            ctx.sync_status.fail(
+                &account.id,
+                nuncio_core::models::SyncModule::Mail,
+                error.message(),
+            );
+            return Err(error);
+        }
+    };
+
+    let mut targets: Vec<nuncio_core::models::Folder> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut push = |folder: &nuncio_core::models::Folder, targets: &mut Vec<_>| {
+        if folder.is_selectable && seen.insert(folder.id.clone()) {
+            targets.push(folder.clone());
+        }
+    };
+    if let Some(inbox) = all_folders
+        .iter()
+        .find(|folder| folder.role == FolderRole::Inbox)
+    {
+        push(inbox, &mut targets);
+    }
+    for folder in all_folders.iter().filter(|folder| folder.is_favorite) {
+        push(folder, &mut targets);
+    }
+    for folder in all_folders.iter().filter(|folder| folder.sync_enabled) {
+        push(folder, &mut targets);
+    }
+
+    let mut first_error: Option<AppError> = None;
+    for folder in &targets {
+        match sync::messages::sync_folder_graph(ctx, &account, folder).await {
+            Ok(outcome) => {
+                if let Err(error) = sync::notify::after_new_mail(
+                    ctx,
+                    &account,
+                    folder,
+                    &outcome.new_messages,
+                    outcome.initial,
+                )
+                .await
+                {
+                    warn!(%error, folder = %folder.remote_path, "notification step failed");
+                }
+            }
+            Err(error) => {
+                warn!(%error, folder = %folder.remote_path, "Graph folder sync failed");
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+
+    let now = nuncio_core::models::now();
+    let id = account.id.clone();
+    ctx.db
+        .write(move |db| repo::accounts::touch_synced_at(db, &id, now))
+        .await?;
+
+    match first_error {
+        Some(error) => {
+            ctx.sync_status.fail(
+                &account.id,
+                nuncio_core::models::SyncModule::Mail,
+                error.message(),
+            );
+            Err(error)
+        }
+        None => {
+            ctx.sync_status
+                .finish(&account.id, nuncio_core::models::SyncModule::Mail);
+            info!(
+                account = %account.id,
+                folders = targets.len(),
+                "Graph mail sync finished"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Handle one actor command on the Graph path.
+async fn handle_graph_command(ctx: &CoreContext, account_id: &str, command: AccountCommand) {
+    let account = match load_account(ctx, account_id).await {
+        Ok(account) => account,
+        Err(error) => {
+            respond_graph_error(command, &error);
+            return;
+        }
+    };
+    match command {
+        AccountCommand::SyncAll(reply) => {
+            let _ = reply.send(graph_sync_account(ctx, account_id).await);
+        }
+        AccountCommand::SyncFolder(folder_id, reply) => {
+            let result = async {
+                let folder = match folder_id {
+                    Some(folder_id) => {
+                        let id = folder_id;
+                        ctx.db
+                            .read(move |db| repo::folders::get_required(db, &id))
+                            .await?
+                    }
+                    None => {
+                        let folders = sync::load_folders(ctx, account_id).await?;
+                        folders
+                            .into_iter()
+                            .find(|folder| folder.role == FolderRole::Inbox)
+                            .ok_or_else(|| AppError::not_found("account has no Inbox folder"))?
+                    }
+                };
+                ctx.sync_status
+                    .begin(&account.id, nuncio_core::models::SyncModule::Mail, None);
+                match sync::messages::sync_folder_graph(ctx, &account, &folder).await {
+                    Ok(outcome) => {
+                        // Notifications are best-effort and must not leave the
+                        // sync indicator stuck in progress.
+                        if let Err(error) = sync::notify::after_new_mail(
+                            ctx,
+                            &account,
+                            &folder,
+                            &outcome.new_messages,
+                            outcome.initial,
+                        )
+                        .await
+                        {
+                            warn!(%error, folder = %folder.remote_path, "notification step failed");
+                        }
+                        ctx.sync_status
+                            .finish(&account.id, nuncio_core::models::SyncModule::Mail);
+                        Ok(())
+                    }
+                    Err(error) => {
+                        ctx.sync_status.fail(
+                            &account.id,
+                            nuncio_core::models::SyncModule::Mail,
+                            error.message(),
+                        );
+                        Err(error)
+                    }
+                }
+            }
+            .await;
+            let _ = reply.send(result);
+        }
+        AccountCommand::SyncOtherFolders => {
+            let result: Result<()> = async {
+                let folders = sync::load_folders(ctx, account_id).await?;
+                for folder in folders.into_iter().filter(|folder| {
+                    folder.sync_enabled && folder.is_selectable && folder.role != FolderRole::Inbox
+                }) {
+                    if let Err(error) =
+                        sync::messages::sync_folder_graph(ctx, &account, &folder).await
+                    {
+                        debug!(
+                            %error,
+                            folder = %folder.remote_path,
+                            "Graph other-folder sync failed"
+                        );
+                    }
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(error) = result {
+                debug!(%error, "Graph other-folder poll failed");
+            }
+        }
+        AccountCommand::FetchBody { message_id, reply } => {
+            let result = body::fetch_body_graph(ctx, &account, &message_id).await;
+            let _ = reply.send(result);
+        }
+        AccountCommand::FetchPart { reply, .. } => {
+            // Graph attachments need the separate `/attachments/{id}/$value`
+            // endpoint, which is not wired yet; fail loudly rather than
+            // returning an empty file.
+            let _ = reply.send(Err(AppError::unsupported(
+                "attachment download is not yet implemented for Microsoft Graph accounts",
+            )));
+        }
+        AccountCommand::Search { reply, .. } => {
+            // Graph `$search` is not wired; the caller already falls back to
+            // the local full-text index.
+            let _ = reply.send(Err(AppError::unsupported(
+                "server-side search is not implemented for Microsoft Graph accounts",
+            )));
+        }
+        AccountCommand::Append { reply, .. } => {
+            let _ = reply.send(Err(AppError::unsupported(
+                "APPEND is not available for Microsoft Graph accounts",
+            )));
+        }
+        AccountCommand::ListFolders(reply) => {
+            let result = sync::folders::sync_graph(ctx, &account).await;
+            let _ = reply.send(result);
+        }
+        AccountCommand::FolderCreate {
+            parent_id,
+            name,
+            reply,
+        } => {
+            let result = async {
+                let op = ops::executor::enqueue_folder_create_now(
+                    ctx,
+                    &account.id,
+                    parent_id.as_deref(),
+                    &name,
+                )
+                .await?;
+                ops::executor::run_one_graph_now(ctx, &account, &op).await
+            }
+            .await;
+            let _ = reply.send(result);
+        }
+        AccountCommand::FolderRename {
+            folder_id,
+            name,
+            reply,
+        } => {
+            let result = async {
+                let op =
+                    ops::executor::enqueue_folder_rename_now(ctx, &account.id, &folder_id, &name)
+                        .await?;
+                ops::executor::run_one_graph_now(ctx, &account, &op).await
+            }
+            .await;
+            let _ = reply.send(result);
+        }
+        AccountCommand::FolderDelete { folder_id, reply } => {
+            let result = async {
+                let op =
+                    ops::executor::enqueue_folder_delete_now(ctx, &account.id, &folder_id).await?;
+                ops::executor::run_one_graph_now(ctx, &account, &op).await
+            }
+            .await;
+            let _ = reply.send(result);
+        }
+        AccountCommand::FolderSubscribe {
+            folder_id,
+            subscribe,
+            reply,
+        } => {
+            let result = async {
+                let op = ops::executor::enqueue_folder_subscribe_now(
+                    ctx,
+                    &account.id,
+                    &folder_id,
+                    subscribe,
+                )
+                .await?;
+                ops::executor::run_one_graph_now(ctx, &account, &op).await
+            }
+            .await;
+            let _ = reply.send(result);
+        }
+        AccountCommand::FolderMove { reply, .. } => {
+            // Graph cannot reparent a folder in place; the UI would need to
+            // create/copy.  Refuse instead of silently doing nothing.
+            let _ = reply.send(Err(AppError::unsupported(
+                "moving a folder is not supported for Microsoft Graph accounts",
+            )));
+        }
+        AccountCommand::Expunge { reply, .. } => {
+            let _ = reply.send(Err(AppError::unsupported(
+                "emptying a folder is not supported for Microsoft Graph accounts",
+            )));
+        }
+        AccountCommand::ExecuteOps { reply } => {
+            let result = async {
+                let outcome = ops::executor::run_due_graph(ctx, &account).await?;
+                for folder_id in outcome.resync_folders {
+                    let folder = {
+                        let id = folder_id.clone();
+                        ctx.db
+                            .read(move |db| repo::folders::get_required(db, &id))
+                            .await
+                    };
+                    match folder {
+                        Ok(folder) => {
+                            if let Err(error) =
+                                sync::messages::sync_folder_graph(ctx, &account, &folder).await
+                            {
+                                debug!(%error, "post-op Graph folder resync failed");
+                            }
+                        }
+                        Err(error) => {
+                            debug!(%error, folder = %folder_id, "resync folder vanished");
+                        }
+                    }
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(error) = &result {
+                debug!(%error, "Graph op queue pass failed");
+            }
+            if let Some(reply) = reply {
+                let _ = reply.send(result);
+            }
+        }
+        AccountCommand::KeepAlive => {
+            // Graph needs no keepalive; the periodic refresh is the heartbeat.
+        }
+        AccountCommand::Reconnect => {
+            // The next periodic tick re-syncs; an explicit command has no
+            // socket to drop.
+        }
+    }
+}
+
+/// Answer a command with an account-load error where the variant has a reply
+/// channel; commands without one simply fail silently (they are background
+/// triggers).
+fn respond_graph_error(command: AccountCommand, error: &AppError) {
+    let message = error.message();
+    match command {
+        AccountCommand::SyncAll(reply) => {
+            let _ = reply.send(Err(AppError::internal(message)));
+        }
+        AccountCommand::SyncFolder(_, reply) => {
+            let _ = reply.send(Err(AppError::internal(message)));
+        }
+        AccountCommand::FetchBody { reply, .. } => {
+            let _ = reply.send(Err(AppError::internal(message)));
+        }
+        AccountCommand::FetchPart { reply, .. } => {
+            let _ = reply.send(Err(AppError::internal(message)));
+        }
+        AccountCommand::Search { reply, .. } => {
+            let _ = reply.send(Err(AppError::internal(message)));
+        }
+        AccountCommand::Append { reply, .. } => {
+            let _ = reply.send(Err(AppError::internal(message)));
+        }
+        AccountCommand::ListFolders(reply) => {
+            let _ = reply.send(Err(AppError::internal(message)));
+        }
+        AccountCommand::FolderCreate { reply, .. } => {
+            let _ = reply.send(Err(AppError::internal(message)));
+        }
+        AccountCommand::FolderRename { reply, .. } => {
+            let _ = reply.send(Err(AppError::internal(message)));
+        }
+        AccountCommand::FolderMove { reply, .. } => {
+            let _ = reply.send(Err(AppError::internal(message)));
+        }
+        AccountCommand::FolderDelete { reply, .. } => {
+            let _ = reply.send(Err(AppError::internal(message)));
+        }
+        AccountCommand::FolderSubscribe { reply, .. } => {
+            let _ = reply.send(Err(AppError::internal(message)));
+        }
+        AccountCommand::Expunge { reply, .. } => {
+            let _ = reply.send(Err(AppError::internal(message)));
+        }
+        AccountCommand::ExecuteOps { reply } => {
+            if let Some(reply) = reply {
+                let _ = reply.send(Err(AppError::internal(message)));
+            }
+        }
+        AccountCommand::SyncOtherFolders
+        | AccountCommand::KeepAlive
+        | AccountCommand::Reconnect => {}
     }
 }
 

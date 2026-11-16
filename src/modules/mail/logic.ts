@@ -263,18 +263,15 @@ export function isSameOrDescendant(
   return false;
 }
 
-/** Folders shown before "More" is expanded: the system folders + favourites. */
+/**
+ * Folders shown before "More" is expanded: the inbox, the drafts folder and
+ * the user's favourites. Everything else (sent, archive, junk, trash, custom
+ * folders) lives in the collapsed "More" section, except a non-empty outbox
+ * which `splitAccountFolders` promotes back to the top.
+ */
 export function isPrimaryFolder(folder: Folder): boolean {
   if (folder.isFavorite) return true;
-  return (
-    folder.role === "inbox" ||
-    folder.role === "drafts" ||
-    folder.role === "sent" ||
-    folder.role === "trash" ||
-    folder.role === "junk" ||
-    folder.role === "archive" ||
-    folder.role === "outbox"
-  );
+  return folder.role === "inbox" || folder.role === "drafts";
 }
 
 /** Names Gmail gives the container holding its system folders. */
@@ -404,8 +401,9 @@ export function displayFolderTree(tree: FolderNode[]): FolderNode[] {
 }
 
 /**
- * Tree of the folders that belong to the always-visible section. Children of
- * a primary folder are included so nested custom folders remain reachable.
+ * Tree of the folders shown at the top of an account section: the inbox, the
+ * drafts folder and favourites. Children of a primary folder are included so
+ * nested custom folders remain reachable.
  */
 export function primaryNodes(tree: FolderNode[]): FolderNode[] {
   const keep = (node: FolderNode): FolderNode | null => {
@@ -456,6 +454,53 @@ export function secondaryNodes(tree: FolderNode[], primary: FolderNode[] = []): 
     return result;
   };
   return prune(tree);
+}
+
+/** Sum of `unreadCount` over these nodes and every descendant. */
+export function aggregateUnread(nodes: FolderNode[]): number {
+  let total = 0;
+  for (const node of nodes) {
+    total += node.folder.unreadCount;
+    total += aggregateUnread(node.children);
+  }
+  return total;
+}
+
+export interface AccountFolderSections {
+  /** Rows rendered directly under the account header. */
+  primary: FolderNode[];
+  /** Rows folded behind the "More" row. */
+  secondary: FolderNode[];
+}
+
+/**
+ * An outbox only earns a permanent row while something is queued in it.
+ * `totalCount` is the queued-message count; when it drops to 0 the row joins
+ * the rest of the folded section.
+ */
+function isQueuedOutbox(node: FolderNode): boolean {
+  return node.folder.role === "outbox" && node.folder.totalCount > 0;
+}
+
+/**
+ * Split an account's tree into the rows shown at the top and the rows folded
+ * behind "More".
+ *
+ * A non-empty outbox is promoted to the end of the primary section: it only
+ * exists while a send is pending, and burying it behind "More" would hide
+ * exactly the folder the user needs at that moment.
+ */
+export function splitAccountFolders(tree: FolderNode[]): AccountFolderSections {
+  const primary = primaryNodes(tree);
+  const secondary = secondaryNodes(tree, primary);
+  const promoted: FolderNode[] = [];
+  const folded: FolderNode[] = [];
+  for (const node of secondary) {
+    if (isQueuedOutbox(node)) promoted.push(node);
+    else folded.push(node);
+  }
+  if (promoted.length === 0) return { primary, secondary };
+  return { primary: [...primary, ...promoted], secondary: folded };
 }
 
 /** Flatten a tree depth-first, used for move-to-folder menus. */

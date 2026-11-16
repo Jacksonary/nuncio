@@ -171,29 +171,30 @@ describe("Outlook.com / Microsoft 365", () => {
     { path: "Projects/Alpha", name: "Alpha", role: "other" },
   ];
 
-  it("keeps the six system folders on top and the rest under More", () => {
+  it("keeps only Inbox and Drafts on top and folds the system folders into More", () => {
     const view = render("outlook", account);
-    expect(view.primaryNames).toEqual([
-      "INBOX",
-      "Drafts",
+    expect(view.primaryNames).toEqual(["INBOX", "Drafts"]);
+    expect(view.secondaryNames).toEqual([
       "Sent Items",
       "Archive",
       "Junk Email",
       "Deleted Items",
+      "Conversation History",
+      "Notes",
+      "Outbox",
+      "Projects",
     ]);
-    expect(view.secondaryNames.sort()).toEqual(
-      ["Conversation History", "Notes", "Outbox", "Projects"].sort(),
-    );
     expect(view.childNames("Projects")).toEqual(["Alpha"]);
   });
 
-  it("keeps subfolders of a system folder reachable", () => {
+  it("keeps subfolders of a folded folder reachable", () => {
     const view = render("outlook-nested", [
       { path: "INBOX", name: "INBOX", role: "inbox" },
       { path: "Sent Items", name: "Sent Items", role: "sent" },
       { path: "Sent Items/2026", name: "2026", role: "other" },
     ]);
-    expect(view.primaryNames).toEqual(["INBOX", "Sent Items"]);
+    expect(view.primaryNames).toEqual(["INBOX"]);
+    expect(view.secondaryNames).toEqual(["Sent Items"]);
     expect(view.childNames("Sent Items")).toEqual(["2026"]);
   });
 });
@@ -212,17 +213,21 @@ describe("iCloud", () => {
     { path: "Receipts", name: "Receipts", role: "other" },
   ];
 
-  it("does not hoist Deleted Messages or Archive", () => {
+  it("keeps Deleted Messages and Archive at the account root, folded into More", () => {
     const view = render("icloud", account);
-    expect(view.primaryNames).toEqual([
-      "INBOX",
-      "Drafts",
+    expect(view.primaryNames).toEqual(["INBOX", "Drafts"]);
+    expect(view.secondaryNames).toEqual([
       "Sent Messages",
       "Archive",
       "Junk",
       "Deleted Messages",
+      "Notes",
+      "Receipts",
     ]);
-    expect(view.secondaryNames.sort()).toEqual(["Notes", "Receipts"].sort());
+    // Nothing was hoisted: both are roots of the displayed tree.
+    expect(view.tree.map((node) => node.folder.name)).toEqual(
+      expect.arrayContaining(["Archive", "Deleted Messages"]),
+    );
   });
 
   it("keeps Archive subfolders visible", () => {
@@ -248,15 +253,8 @@ describe("Yahoo", () => {
       { path: "Trash", name: "Trash", role: "trash" },
       { path: "Family", name: "Family", role: "other" },
     ]);
-    expect(view.primaryNames).toEqual([
-      "Inbox",
-      "Draft",
-      "Sent",
-      "Archive",
-      "Bulk Mail",
-      "Trash",
-    ]);
-    expect(view.secondaryNames).toEqual(["Family"]);
+    expect(view.primaryNames).toEqual(["Inbox", "Draft"]);
+    expect(view.secondaryNames).toEqual(["Sent", "Archive", "Bulk Mail", "Trash", "Family"]);
   });
 });
 
@@ -271,13 +269,13 @@ describe("AOL", () => {
       { path: "Saved", name: "Saved", role: "other" },
       { path: "Recently Deleted", name: "Recently Deleted", role: "other" },
     ]);
-    expect(view.primaryNames).toEqual(["Inbox", "Drafts", "Sent", "Spam", "Trash"]);
-    expect(view.secondaryNames.sort()).toEqual(["Recently Deleted", "Saved"].sort());
+    expect(view.primaryNames).toEqual(["Inbox", "Drafts"]);
+    expect(view.secondaryNames).toEqual(["Sent", "Spam", "Trash", "Saved", "Recently Deleted"]);
   });
 });
 
 describe("GMX / mail.ru", () => {
-  it("shows the five system folders on top", () => {
+  it("shows only Inbox and Drafts on top and keeps the system folders in More", () => {
     const view = render("gmx", [
       { path: "INBOX", name: "INBOX", role: "inbox" },
       { path: "Drafts", name: "Drafts", role: "drafts" },
@@ -285,8 +283,8 @@ describe("GMX / mail.ru", () => {
       { path: "Spam", name: "Spam", role: "junk" },
       { path: "Trash", name: "Trash", role: "trash" },
     ]);
-    expect(view.primaryNames).toEqual(["INBOX", "Drafts", "Sent", "Spam", "Trash"]);
-    expect(view.secondaryNames).toEqual([]);
+    expect(view.primaryNames).toEqual(["INBOX", "Drafts"]);
+    expect(view.secondaryNames).toEqual(["Sent", "Spam", "Trash"]);
   });
 });
 
@@ -308,8 +306,8 @@ describe("QQ / Foxmail (modified UTF-7 on the wire)", () => {
       },
       { path: "&mHlM0Gs-/&V4NXPpCuTvY2A-", name: "订阅邮件", role: "other" },
     ]);
-    expect(view.primaryNames).toEqual(["INBOX", "草稿箱", "已发送", "垃圾邮件", "已删除"]);
-    expect(view.secondaryNames).toEqual(["其他文件夹"]);
+    expect(view.primaryNames).toEqual(["INBOX", "草稿箱"]);
+    expect(view.secondaryNames).toEqual(["已发送", "垃圾邮件", "已删除", "其他文件夹"]);
     expect(view.childNames("其他文件夹")).toEqual(["订阅邮件"]);
   });
 });
@@ -324,8 +322,8 @@ describe("Tencent Exmail", () => {
       { path: "&V4NXPpCuTvY-", name: "垃圾邮件", role: "junk" },
       { path: "&ZLm8SA-", name: "日报", role: "other" },
     ]);
-    expect(view.primaryNames).toEqual(["INBOX", "草稿箱", "已发送邮件", "垃圾邮件", "已删除邮件"]);
-    expect(view.secondaryNames).toEqual(["日报"]);
+    expect(view.primaryNames).toEqual(["INBOX", "草稿箱"]);
+    expect(view.secondaryNames).toEqual(["已发送邮件", "垃圾邮件", "已删除邮件", "日报"]);
   });
 });
 
@@ -339,8 +337,8 @@ describe("Aliyun / Sina / Sohu", () => {
       { path: "&V4NXPpCuTvY-", name: "垃圾邮件", role: "junk" },
       { path: "&V4NXPpCuTvY2A-", name: "订阅邮件", role: "other" },
     ]);
-    expect(view.primaryNames).toEqual(["INBOX", "草稿箱", "已发送", "垃圾邮件", "已删除"]);
-    expect(view.secondaryNames).toEqual(["订阅邮件"]);
+    expect(view.primaryNames).toEqual(["INBOX", "草稿箱"]);
+    expect(view.secondaryNames).toEqual(["已发送", "垃圾邮件", "已删除", "订阅邮件"]);
   });
 
   it("maps 139's 发件箱 to Sent and 广告邮件 to Junk", () => {
@@ -352,9 +350,9 @@ describe("Aliyun / Sina / Sohu", () => {
       { path: "&V4NXPpCuTvY-", name: "垃圾邮件", role: "junk" },
       { path: "&mr3NqA-", name: "广告邮件", role: "junk" },
     ]);
-    expect(view.primaryNames).toEqual(["INBOX", "草稿箱", "发件箱", "垃圾邮件", "已删除邮件"]);
+    expect(view.primaryNames).toEqual(["INBOX", "草稿箱"]);
     // The duplicate junk folder is folded away, but its children would not be.
-    expect(view.secondaryNames).toEqual([]);
+    expect(view.secondaryNames).toEqual(["发件箱", "垃圾邮件", "已删除邮件"]);
   });
 });
 
@@ -374,8 +372,16 @@ describe("Fastmail", () => {
       { path: "Work", name: "Work", role: "other" },
       { path: "Work/2026", name: "2026", role: "other" },
     ]);
-    expect(view.primaryNames).toEqual(["INBOX", "Drafts", "Sent", "Archive", "Junk Mail", "Trash"]);
-    expect(view.secondaryNames.sort()).toEqual(["Notes", "Templates", "Work"].sort());
+    expect(view.primaryNames).toEqual(["INBOX", "Drafts"]);
+    expect(view.secondaryNames).toEqual([
+      "Sent",
+      "Archive",
+      "Junk Mail",
+      "Trash",
+      "Notes",
+      "Templates",
+      "Work",
+    ]);
     expect(view.childNames("Work")).toEqual(["2026"]);
   });
 });
@@ -390,8 +396,8 @@ describe("Zoho / Yandex", () => {
       { path: "Templates", name: "Templates", role: "other" },
       { path: "Trash", name: "Trash", role: "trash" },
     ]);
-    expect(view.primaryNames).toEqual(["Inbox", "Drafts", "Sent", "Spam", "Trash"]);
-    expect(view.secondaryNames).toEqual(["Templates"]);
+    expect(view.primaryNames).toEqual(["Inbox", "Drafts"]);
+    expect(view.secondaryNames).toEqual(["Sent", "Spam", "Trash", "Templates"]);
   });
 
   it("maps Yandex's Deleted Items", () => {
@@ -403,8 +409,8 @@ describe("Zoho / Yandex", () => {
       { path: "Spam", name: "Spam", role: "junk" },
       { path: "Templates", name: "Templates", role: "other" },
     ]);
-    expect(view.primaryNames).toEqual(["Inbox", "Drafts", "Sent", "Spam", "Deleted Items"]);
-    expect(view.secondaryNames).toEqual(["Templates"]);
+    expect(view.primaryNames).toEqual(["Inbox", "Drafts"]);
+    expect(view.secondaryNames).toEqual(["Sent", "Spam", "Deleted Items", "Templates"]);
   });
 });
 
@@ -424,10 +430,17 @@ describe("Proton Bridge", () => {
       { path: "Starred", name: "Starred", role: "flagged" },
       { path: "Trash", name: "Trash", role: "trash" },
     ]);
-    expect(view.primaryNames).toEqual(["INBOX", "Drafts", "Sent", "Archive", "Spam", "Trash"]);
-    expect(view.secondaryNames.sort()).toEqual(
-      ["All Mail", "Folders", "Labels", "Starred"].sort(),
-    );
+    expect(view.primaryNames).toEqual(["INBOX", "Drafts"]);
+    expect(view.secondaryNames).toEqual([
+      "Sent",
+      "Archive",
+      "Spam",
+      "Trash",
+      "Starred",
+      "All Mail",
+      "Folders",
+      "Labels",
+    ]);
     expect(view.childNames("Folders")).toEqual(["Receipts"]);
     expect(view.childNames("Labels")).toEqual(["Travel"]);
   });
@@ -444,15 +457,14 @@ describe("GMX / mail.ru / Yandex (localised system folder names)", () => {
       { path: "Archiv", name: "Archiv", role: "archive" },
       { path: "Familie", name: "Familie", role: "other" },
     ]);
-    expect(view.primaryNames).toEqual([
-      "Posteingang",
-      "Entwürfe",
+    expect(view.primaryNames).toEqual(["Posteingang", "Entwürfe"]);
+    expect(view.secondaryNames).toEqual([
       "Gesendet",
       "Archiv",
       "Spamverdacht",
       "Papierkorb",
+      "Familie",
     ]);
-    expect(view.secondaryNames).toEqual(["Familie"]);
   });
 
   it("maps Yandex / mail.ru Cyrillic names", () => {
@@ -464,8 +476,8 @@ describe("GMX / mail.ru / Yandex (localised system folder names)", () => {
       { path: "&BCEEPwQwBDw-", name: "Спам", role: "junk" },
       { path: "Рассылки", name: "Рассылки", role: "other" },
     ]);
-    expect(view.primaryNames).toEqual(["INBOX", "Черновики", "Отправленные", "Спам", "Корзина"]);
-    expect(view.secondaryNames).toEqual(["Рассылки"]);
+    expect(view.primaryNames).toEqual(["INBOX", "Черновики"]);
+    expect(view.secondaryNames).toEqual(["Отправленные", "Спам", "Корзина", "Рассылки"]);
   });
 });
 
@@ -484,9 +496,11 @@ describe("generic IMAP", () => {
       { path: "Projects/2026/Deep", name: "Deep", role: "other" },
       { path: "重要", name: "重要", role: "important" },
     ]);
-    expect(view.primaryNames).toEqual(["INBOX", "Sent"]);
+    expect(view.primaryNames).toEqual(["INBOX"]);
     // Exactly one folder per role survives; the collision does not duplicate.
-    expect(view.primaryNames.filter((name) => name === "Sent")).toHaveLength(1);
+    expect([...view.primaryNames, ...view.secondaryNames].filter((name) => name === "Sent")).toHaveLength(
+      1,
+    );
     // No folder is lost: the losing duplicate's children are re-parented.
     const secondaryRoles = view.secondary
       .flatMap((node) => [node.folder, ...node.children.map((child) => child.folder)])
@@ -507,7 +521,8 @@ describe("generic IMAP", () => {
       ],
       ".",
     );
-    expect(view.primaryNames).toEqual(["INBOX", "Drafts", "Sent", "Trash"]);
+    expect(view.primaryNames).toEqual(["INBOX", "Drafts"]);
+    expect(view.secondaryNames).toEqual(["Sent", "Trash", "2026"]);
     expect(view.childNames("INBOX")).toEqual(["Sub"]);
   });
 
@@ -524,10 +539,16 @@ describe("generic IMAP", () => {
       { path: "[Gmail]/Trash", name: "Trash", role: "trash" },
       { path: "Receipts", name: "Receipts", role: "other" },
     ]);
-    expect(view.primaryNames).toEqual(["INBOX", "Drafts", "Sent Mail", "Spam", "Trash"]);
-    expect(view.secondaryNames.sort()).toEqual(
-      ["All Mail", "Important", "Receipts", "Starred"].sort(),
-    );
+    expect(view.primaryNames).toEqual(["INBOX", "Drafts"]);
+    expect(view.secondaryNames).toEqual([
+      "Sent Mail",
+      "Spam",
+      "Trash",
+      "Starred",
+      "Important",
+      "All Mail",
+      "Receipts",
+    ]);
   });
 });
 
@@ -615,8 +636,9 @@ describe("structural edge cases", () => {
       { path: "Archive/2024", name: "2024", role: "other" },
       { path: "Archive/2025", name: "2025", role: "other" },
     ]);
-    // The container is primary (role archive) and its children stay nested.
-    expect(view.primaryNames).toEqual(["INBOX", "Archive"]);
+    // The container is folded into More and its children stay nested under it.
+    expect(view.primaryNames).toEqual(["INBOX"]);
+    expect(view.secondaryNames).toEqual(["Archive"]);
     expect(view.childNames("Archive").sort()).toEqual(["2024", "2025"]);
   });
 

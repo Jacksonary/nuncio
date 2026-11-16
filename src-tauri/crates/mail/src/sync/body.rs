@@ -11,10 +11,11 @@ use async_imap::imap_proto::SectionPath;
 use async_imap::types::Fetch;
 use chrono::Utc;
 use futures::TryStreamExt;
-use nuncio_core::models::{Attachment, Folder, ProviderKind, StoredMessage};
+use nuncio_core::models::{Account, Attachment, Folder, ProviderKind, StoredMessage};
 use nuncio_core::{repo, AppError, CoreContext, Result};
 use tracing::{debug, warn};
 
+use crate::graph::GraphMailClient;
 use crate::imap::conn::{ImapConnection, FETCH_TIMEOUT};
 use crate::util::{attachment_id, imap_error};
 
@@ -40,6 +41,18 @@ pub async fn fetch_body(
         })
         .await?
         .ok_or_else(|| AppError::not_found(format!("message {message_id} not found")))?;
+
+    // Clear early dispatch: a Microsoft account is refused an IMAP session, so
+    // its body comes from Graph.  The IMAP branch below stays untouched.
+    let account = {
+        let account_id = account_id.to_string();
+        ctx.db
+            .read(move |db| repo::accounts::get_required(db, &account_id))
+            .await?
+    };
+    if crate::graph::uses_graph(&account) {
+        return fetch_body_graph_stored(ctx, &account, stored).await;
+    }
 
     if let Some(path) = stored.body_path.as_deref() {
         let path = PathBuf::from(path);
@@ -114,6 +127,125 @@ pub async fn fetch_body(
         .map_err(|error| AppError::io(format!("cannot write message cache: {error}")))?;
 
     store_parsed_body(ctx, stored, path.clone(), raw).await?;
+    Ok(path)
+}
+
+/// Download one message body through Microsoft Graph and cache it as `.eml`.
+///
+/// Graph returns rendered HTML, not raw RFC822.  Rebuilding a minimal RFC822
+/// document with the stored headers keeps the rest of the reading path
+/// unchanged: the reader parses `.eml`, `raw_message` returns bytes, and the
+/// cid/attachment cache logic sees a normal MIME document.  Attachment bytes
+/// are still server-side (Graph exposes them through a separate endpoint), so
+/// a Graph message's attachments are only listed, not downloadable, until that
+/// endpoint is wired.
+pub async fn fetch_body_graph(
+    ctx: &CoreContext,
+    account: &Account,
+    message_id: &str,
+) -> Result<PathBuf> {
+    if !crate::graph::uses_graph(account) {
+        return Err(AppError::unsupported(
+            "message body fetch through Graph is only available for Microsoft accounts",
+        ));
+    }
+    let stored = ctx
+        .db
+        .read({
+            let message_id = message_id.to_string();
+            move |db| repo::messages::get(db, &message_id)
+        })
+        .await?
+        .ok_or_else(|| AppError::not_found(format!("message {message_id} not found")))?;
+    if stored.summary.account_id != account.id {
+        return Err(AppError::invalid_input(
+            "message belongs to another account",
+        ));
+    }
+    fetch_body_graph_stored(ctx, account, stored).await
+}
+
+/// Shared Graph body materialisation; `stored` is already loaded.
+async fn fetch_body_graph_stored(
+    ctx: &CoreContext,
+    account: &Account,
+    stored: StoredMessage,
+) -> Result<PathBuf> {
+    if let Some(path) = stored.body_path.as_deref() {
+        let path = PathBuf::from(path);
+        if tokio::fs::metadata(&path).await.is_ok() {
+            return Ok(path);
+        }
+        debug!(
+            message = %stored.summary.id,
+            "cached Graph body file is missing; re-downloading"
+        );
+    }
+
+    // `gm_msgid` holds the Graph id; the message id itself is the same value
+    // for rows written by the Graph sync, but older rows may differ.
+    let remote_id = stored
+        .gm_msgid
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&stored.summary.id);
+    let html =
+        crate::graph::messages::fetch_body(&GraphMailClient::new(), ctx, &account.id, remote_id)
+            .await?;
+
+    let mut message = nuncio_mime::OutgoingMessage::new(
+        stored
+            .summary
+            .r#from
+            .clone()
+            .unwrap_or_else(|| account.address()),
+        stored.summary.subject.clone(),
+        html.clone(),
+    );
+    message.to = stored.summary.to.clone();
+    message.cc = stored.summary.cc.clone();
+    message.bcc = stored.bcc.clone();
+    message.reply_to = stored.reply_to.clone();
+    message.in_reply_to = stored.in_reply_to.clone();
+    message.references = stored.references.clone();
+    message.importance = stored.summary.importance;
+    message.message_id = stored.message_id_header.clone();
+    message.date = Some(stored.summary.date);
+    // Graph's HTML already carries any read-receipt request; do not invent one.
+    message.request_read_receipt = false;
+    let (raw, _) = nuncio_mime::build_message_with_bcc(message)?;
+    if raw.len() as u64 > MAX_MESSAGE_BYTES {
+        return Err(AppError::invalid_input(
+            "message body exceeds the size limit; only metadata was stored",
+        ));
+    }
+
+    let path = ctx.paths.mime_path(&account.id, &stored.summary.id);
+    ctx.paths.ensure_parent(&path)?;
+    tokio::fs::write(&path, &raw)
+        .await
+        .map_err(|error| AppError::io(format!("cannot write message cache: {error}")))?;
+
+    // Graph gives HTML; store the same plain-text projection the IMAP parser
+    // would produce so search and previews behave identically.
+    let text = nuncio_mime::html_to_text(&html);
+    let preview = nuncio_core::text::trim_preview(&text, 300);
+    let path_string = path.to_string_lossy().to_string();
+    let message_id = stored.summary.id.clone();
+    let text_for_db = text;
+    ctx.db
+        .write(move |db| {
+            repo::messages::set_body(db, &message_id, Some(&path_string), Some(&text_for_db))?;
+            repo::messages::update_preview(db, &message_id, &preview)
+        })
+        .await?;
+
+    debug!(
+        message = %stored.summary.id,
+        bytes = raw.len(),
+        "Graph message body cached"
+    );
     Ok(path)
 }
 

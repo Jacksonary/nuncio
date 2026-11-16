@@ -27,6 +27,7 @@
 //! ```
 
 pub mod engine;
+pub mod graph;
 pub mod imap;
 pub mod ops;
 pub mod pop3;

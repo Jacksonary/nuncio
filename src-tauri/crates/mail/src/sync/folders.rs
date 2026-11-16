@@ -9,10 +9,11 @@ use std::collections::{HashMap, HashSet};
 use async_imap::imap_proto::NameAttribute;
 use futures::TryStreamExt;
 use nuncio_core::events;
-use nuncio_core::models::{Folder, FolderRole};
+use nuncio_core::models::{Account, Folder, FolderRole};
 use nuncio_core::{AppError, CoreContext, Result};
 use tracing::{debug, info, warn};
 
+use crate::graph::{self, GraphMailClient};
 use crate::imap::conn::{ImapConnection, COMMAND_TIMEOUT};
 use crate::util::imap_error;
 
@@ -27,9 +28,44 @@ pub struct RemoteFolder {
     pub name: String,
     pub attributes: Vec<String>,
     pub selectable: bool,
+    /// Provider-side identity when it differs from the IMAP-style `path`.
+    ///
+    /// IMAP names a mailbox by its path, but Graph addresses a folder by an
+    /// opaque id even though its tree still needs human paths locally.  The id
+    /// is recorded in `sync_state` (`graph_folder:{path}`) and resolved by
+    /// [`graph_folder_id`], so `Folder::remote_path` can keep the readable
+    /// hierarchy the rest of the app derives parents from.
+    pub provider_id: Option<String>,
 }
 
-/// Synchronize the local folder tree with the server's `LIST` result.
+/// Look up the Graph folder id recorded for a local folder path.
+///
+/// Returns `None` for IMAP folders (no mapping was written) and for a Graph
+/// folder that has not been reconciled yet.
+pub async fn graph_folder_id(
+    ctx: &CoreContext,
+    account_id: &str,
+    remote_path: &str,
+) -> Result<Option<String>> {
+    let key = graph_folder_key(remote_path);
+    let account_id = account_id.to_string();
+    ctx.db
+        .read(move |db| nuncio_core::repo::sync_state::get(db, &account_id, "mail", &key))
+        .await
+}
+
+fn graph_folder_key(remote_path: &str) -> String {
+    format!("graph_folder:{remote_path}")
+}
+
+/// Synchronize the local folder tree with the server's folder list.
+///
+/// This is the only folder-sync entry point the IMAP worker should use.  A
+/// Microsoft OAuth account is dispatched to Graph before any IMAP command is
+/// issued (see [`graph::uses_graph`]); every other account keeps the existing
+/// `LIST` path byte-for-byte.  Both paths then feed the exact same
+/// [`reconcile`] function, so roles, parent links, favourites and sort order
+/// cannot diverge between providers.
 ///
 /// Returns all local folders for the account after reconciliation.
 pub async fn sync(
@@ -37,7 +73,67 @@ pub async fn sync(
     conn: &mut ImapConnection,
     account_id: &str,
 ) -> Result<Vec<Folder>> {
+    let account = load_account(ctx, account_id).await?;
+    if graph::uses_graph(&account) {
+        // The connection argument is intentionally unused: a Graph account
+        // must not open an IMAP session at all (Exchange rejects it).
+        return sync_graph(ctx, &account).await;
+    }
     let remotes = list_remote(conn).await?;
+    // IMAP mailbox names arrive in modified UTF-7.  `LIST` is all-or-nothing:
+    // a failure anywhere propagates above, so a returned list is the whole
+    // mailbox and pruning is safe.
+    reconcile(ctx, account_id, remotes, true, true).await
+}
+
+/// Synchronize folders for a Microsoft Graph account without an IMAP
+/// connection.
+///
+/// Used by the Graph account loop and by account commands that have no worker
+/// connection.  It shares [`reconcile`] with the IMAP path.
+pub async fn sync_graph(ctx: &CoreContext, account: &Account) -> Result<Vec<Folder>> {
+    let listing = graph::folders::list_folders(&GraphMailClient::new(), ctx, &account.id).await?;
+    if !listing.complete {
+        // A transient childFolders failure or the pagination cap makes the
+        // listing partial.  The upserts below are still safe, but deleting
+        // folders missing from it would destroy a whole subtree locally.
+        warn!(
+            account = %account.id,
+            folders = listing.folders.len(),
+            "Graph folder listing is incomplete; keeping locally known folders that are missing from it"
+        );
+    }
+    // Graph display names are already Unicode; running them through the IMAP
+    // modified-UTF-7 decoder would corrupt a name such as "A&B-2026".
+    reconcile(ctx, &account.id, listing.folders, false, listing.complete).await
+}
+
+async fn load_account(ctx: &CoreContext, account_id: &str) -> Result<Account> {
+    let account_id = account_id.to_string();
+    ctx.db
+        .read(move |db| nuncio_core::repo::accounts::get_required(db, &account_id))
+        .await
+}
+
+/// Shared reconciliation of a remote folder list into the local folder tree.
+///
+/// `remotes` may come from IMAP `LIST` or from Graph's `mailFolders` tree; the
+/// shape is identical (`RemoteFolder`) and everything below is provider
+/// agnostic.  `decode_names` is the only provider difference: IMAP mailbox
+/// names are modified UTF-7, Graph display names are already Unicode.
+///
+/// `prune_missing` says whether `remotes` is the authoritative full tree.  Only
+/// then may local folders absent from it be deleted: a partial listing means
+/// "not read this time", not "deleted on the server", and deleting would drop
+/// the folder's messages and favourite state until the next sync recreates it
+/// under a new id.  IMAP `LIST` is all-or-nothing and always passes `true`.
+async fn reconcile(
+    ctx: &CoreContext,
+    account_id: &str,
+    remotes: Vec<RemoteFolder>,
+    decode_names: bool,
+    prune_missing: bool,
+) -> Result<Vec<Folder>> {
     debug!(
         count = remotes.len(),
         account = account_id,
@@ -73,13 +169,14 @@ pub async fn sync(
     let remote_paths: HashSet<&str> = remotes.iter().map(|folder| folder.path.as_str()).collect();
     let mut upserted: Vec<Folder> = Vec::new();
 
+    // One role per folder, resolved across the whole listing: several folders
+    // can look like the same system folder, and `by_role` must not be able to
+    // pick a different one on every sort.
+    let roles = resolve_role_conflicts(&remotes);
+
     for (index, remote) in remotes.iter().enumerate() {
         let existing = local_by_path.remove(&remote.path);
-        let role = role_for(
-            &remote.path,
-            remote.delimiter.as_deref(),
-            &remote.attributes,
-        );
+        let role = roles[index];
         let parent_path = remote
             .delimiter
             .as_deref()
@@ -107,14 +204,36 @@ pub async fn sync(
                 | FolderRole::Important
         );
 
+        // A folder that loses a system role must not keep the star that role
+        // granted it.  `resolve_role_conflicts` can demote a folder that a
+        // previous sync auto-starred as the account's Sent/Trash (an Outlook.com
+        // mailbox carries a stray `发件箱` next to its real `已发送邮件`); without
+        // this it stayed pinned at the top of the sidebar as an empty folder.
+        let lost_system_role = existing
+            .as_ref()
+            .map(|folder| {
+                folder.is_favorite
+                    && role == FolderRole::Other
+                    && matches!(
+                        folder.role,
+                        FolderRole::Inbox | FolderRole::Sent | FolderRole::Drafts
+                    )
+            })
+            .unwrap_or(false);
+
         let folder = Folder {
             id: id_by_path.get(&remote.path).cloned().unwrap_or_default(),
             account_id: account_id.to_string(),
             parent_id,
             remote_path: remote.path.clone(),
-            // Folder names arrive in modified UTF-7 (and occasionally as RFC
-            // 2047 encoded words); store the readable form.
-            name: crate::util::decode_mailbox_name(&remote.name),
+            // IMAP folder names arrive in modified UTF-7 (and occasionally as
+            // RFC 2047 encoded words); store the readable form.  Graph names
+            // are already Unicode, so they are used verbatim.
+            name: if decode_names {
+                crate::util::decode_mailbox_name(&remote.name)
+            } else {
+                remote.name.clone()
+            },
             role,
             unread_count: existing.as_ref().map(|f| f.unread_count).unwrap_or(0),
             total_count: existing.as_ref().map(|f| f.total_count).unwrap_or(0),
@@ -134,26 +253,87 @@ pub async fn sync(
             last_sync_at: existing.as_ref().and_then(|f| f.last_sync_at),
         };
 
+        // Graph and IMAP differ in one place: Graph's server-side identity is
+        // an opaque id while the local tree is keyed by the readable path.
+        // Persist the id next to the folder so message sync and the executor
+        // can address the right mailbox.
+        let provider_id = remote.provider_id.clone();
+        let provider_path = remote.path.clone();
+        let account_for_map = account_id.to_string();
         let stored = ctx
             .db
-            .write(move |db| nuncio_core::repo::folders::upsert_remote(db, &folder))
+            .write(move |db| {
+                let stored = nuncio_core::repo::folders::upsert_remote(db, &folder)?;
+                // `upsert_remote` never touches `is_favorite` on an existing
+                // row (it is the user's choice), so the stale auto-star has to
+                // be cleared explicitly rather than through the upsert.
+                let stored = if lost_system_role {
+                    nuncio_core::repo::folders::set_favorite(db, &stored.id, false)
+                        .map(|()| Folder {
+                            is_favorite: false,
+                            ..stored
+                        })?
+                } else {
+                    stored
+                };
+                if let Some(provider_id) = provider_id {
+                    let key = graph_folder_key(&provider_path);
+                    nuncio_core::repo::sync_state::set(
+                        db,
+                        &account_for_map,
+                        "mail",
+                        &key,
+                        &provider_id,
+                    )?;
+                }
+                Ok(stored)
+            })
             .await?;
         upserted.push(stored);
     }
 
     // Remove folders that vanished on the server. Virtual/local roles are kept.
-    for folder in local_by_path.values() {
-        if folder.role == FolderRole::Outbox || folder.remote_path.starts_with(LOCAL_FOLDER_PREFIX)
-        {
-            continue;
+    //
+    // This step is destructive: `folders::delete` cascades to the folder's
+    // messages and discards favourite/sync choices.  It must therefore run only
+    // when the listing is the authoritative tree; on a partial listing the
+    // upserts above remain, but nothing is pruned.
+    if prune_missing {
+        for folder in local_by_path.values() {
+            if folder.role == FolderRole::Outbox
+                || folder.remote_path.starts_with(LOCAL_FOLDER_PREFIX)
+            {
+                continue;
+            }
+            if !remote_paths.contains(folder.remote_path.as_str()) {
+                let id = folder.id.clone();
+                let map_account = account_id.to_string();
+                let map_key = graph_folder_key(&folder.remote_path);
+                ctx.db
+                    .write(move |db| {
+                        nuncio_core::repo::folders::delete(db, &id)?;
+                        // The provider-id mapping must not outlive the folder.
+                        nuncio_core::repo::sync_state::delete_key(
+                            db,
+                            &map_account,
+                            "mail",
+                            &map_key,
+                        )
+                    })
+                    .await?;
+                debug!(folder = %folder.remote_path, "removed folder no longer on server");
+            }
         }
-        if !remote_paths.contains(folder.remote_path.as_str()) {
-            let id = folder.id.clone();
-            ctx.db
-                .write(move |db| nuncio_core::repo::folders::delete(db, &id))
-                .await?;
-            debug!(folder = %folder.remote_path, "removed folder no longer on server");
-        }
+    } else {
+        // `local_by_path` now holds every local folder that was not in the
+        // partial listing (including local-only ones such as Outbox), i.e. the
+        // folders whose deletion was skipped.
+        warn!(
+            account = account_id,
+            listed = remotes.len(),
+            unresolved_local = local_by_path.len(),
+            "incomplete folder listing; skipped folder reconciliation pruning so locally known folders (and their messages) are kept"
+        );
     }
 
     // Stable ordering: Inbox first, then role order, then name.
@@ -218,6 +398,8 @@ async fn list_remote(conn: &mut ImapConnection) -> Result<Vec<RemoteFolder>> {
                 name: display,
                 attributes,
                 selectable,
+                // IMAP addresses the mailbox by this same path.
+                provider_id: None,
             });
         }
         Ok::<Vec<RemoteFolder>, AppError>(names)
@@ -252,23 +434,8 @@ fn attribute_name(attribute: &NameAttribute<'_>) -> String {
 /// accepted: servers that only implement XLIST otherwise fall through to the
 /// name table, where a localised name can still lose its role.
 pub fn role_for(path: &str, delimiter: Option<&str>, attributes: &[String]) -> FolderRole {
-    let lower_attrs: Vec<String> = attributes
-        .iter()
-        .map(|value| value.to_lowercase())
-        .collect();
-    for attribute in &lower_attrs {
-        match attribute.as_str() {
-            "\\all" | "\\allmail" => return FolderRole::All,
-            "\\archive" => return FolderRole::Archive,
-            "\\drafts" => return FolderRole::Drafts,
-            "\\flagged" | "\\starred" => return FolderRole::Flagged,
-            "\\junk" | "\\spam" => return FolderRole::Junk,
-            "\\sent" | "\\sentmail" => return FolderRole::Sent,
-            "\\trash" => return FolderRole::Trash,
-            "\\important" => return FolderRole::Important,
-            "\\inbox" => return FolderRole::Inbox,
-            _ => {}
-        }
+    if let Some(role) = role_from_attributes(attributes) {
+        return role;
     }
 
     let lower_path = crate::util::decode_mailbox_name(path).to_lowercase();
@@ -307,6 +474,86 @@ pub fn role_for(path: &str, delimiter: Option<&str>, attributes: &[String]) -> F
     generic_leaf_role(&leaf)
 }
 
+/// The role a folder declares through a SPECIAL-USE attribute, if any.
+///
+/// This is the authoritative signal: the server itself says "this is the
+/// trash".  `None` means the role can only be guessed from the name, which is
+/// what [`resolve_role_conflicts`] treats as the weaker claim.
+fn role_from_attributes(attributes: &[String]) -> Option<FolderRole> {
+    for attribute in attributes {
+        let role = match attribute.to_lowercase().as_str() {
+            "\\all" | "\\allmail" => FolderRole::All,
+            "\\archive" => FolderRole::Archive,
+            "\\drafts" => FolderRole::Drafts,
+            "\\flagged" | "\\starred" => FolderRole::Flagged,
+            "\\junk" | "\\spam" => FolderRole::Junk,
+            "\\sent" | "\\sentmail" => FolderRole::Sent,
+            "\\trash" => FolderRole::Trash,
+            "\\important" => FolderRole::Important,
+            "\\inbox" => FolderRole::Inbox,
+            _ => continue,
+        };
+        return Some(role);
+    }
+    None
+}
+
+/// Give every role to at most one folder.
+///
+/// Servers regularly return several folders whose names all look like the same
+/// system folder.  An Outlook.com mailbox, for instance, commonly carries a
+/// plain `Trash` created by some other mail client next to its real
+/// `已删除邮件`.  Classifying each folder independently gave all of them the
+/// `trash` role, and `repo::folders::by_role` then returned whichever one
+/// happened to sort first -- so "delete" moved messages into the wrong folder.
+///
+/// The rule is that a folder which *declares* the role through a SPECIAL-USE
+/// attribute beats one that was only inferred from its name.  Remaining
+/// duplicates are demoted to [`FolderRole::Other`], which leaves them listed
+/// as ordinary folders instead of hijacking the system folder.  With no
+/// explicit claimant at all the first folder in server order keeps the role,
+/// which reproduces the previous behaviour for servers that publish no
+/// SPECIAL-USE at all.
+fn resolve_role_conflicts(remotes: &[RemoteFolder]) -> Vec<FolderRole> {
+    let claimed: Vec<FolderRole> = remotes
+        .iter()
+        .map(|remote| role_for(&remote.path, remote.delimiter.as_deref(), &remote.attributes))
+        .collect();
+
+    // Winner index per role, preferring an explicit attribute.
+    let mut winner: HashMap<FolderRole, usize> = HashMap::new();
+    for (index, role) in claimed.iter().enumerate() {
+        if *role == FolderRole::Other {
+            continue;
+        }
+        let explicit = role_from_attributes(&remotes[index].attributes) == Some(*role);
+        match winner.get(role) {
+            None => {
+                winner.insert(*role, index);
+            }
+            Some(&current) => {
+                let current_explicit =
+                    role_from_attributes(&remotes[current].attributes) == Some(*role);
+                if explicit && !current_explicit {
+                    winner.insert(*role, index);
+                }
+            }
+        }
+    }
+
+    claimed
+        .into_iter()
+        .enumerate()
+        .map(|(index, role)| {
+            if role == FolderRole::Other || winner.get(&role) == Some(&index) {
+                role
+            } else {
+                FolderRole::Other
+            }
+        })
+        .collect()
+}
+
 /// Well-known leaf names, shared by Gmail-style containers and flat folders.
 ///
 /// Besides English and Chinese this carries the German and Russian names that
@@ -320,8 +567,16 @@ pub fn role_for(path: &str, delimiter: Option<&str>, attributes: &[String]) -> F
 fn generic_leaf_role(leaf: &str) -> FolderRole {
     match leaf {
         "inbox" | "收件箱" | "posteingang" | "входящие" => FolderRole::Inbox,
-        "sent" | "sent mail" | "sent messages" | "sent items" | "已发送" | "已发送邮件"
-        | "发件箱" | "寄件备份" | "gesendet" | "отправленные" => FolderRole::Sent,
+        "sent"
+        | "sent mail"
+        | "sent messages"
+        | "sent items"
+        | "已发送"
+        | "已发送邮件"
+        | "发件箱"
+        | "寄件备份"
+        | "gesendet"
+        | "отправленные" => FolderRole::Sent,
         "drafts" | "draft" | "草稿" | "草稿箱" | "entwürfe" | "entwuerfe" | "черновики" => {
             FolderRole::Drafts
         }
@@ -330,7 +585,9 @@ fn generic_leaf_role(leaf: &str) -> FolderRole {
         | "geloescht" | "корзина" => FolderRole::Trash,
         "junk" | "junk e-mail" | "junk email" | "junk mail" | "spam" | "bulk mail" | "垃圾邮件"
         | "广告邮件" | "spamverdacht" | "спам" => FolderRole::Junk,
-        "archive" | "archives" | "归档" | "存档" | "archiv" | "архив" => FolderRole::Archive,
+        "archive" | "archives" | "归档" | "存档" | "archiv" | "архив" => {
+            FolderRole::Archive
+        }
         "all" | "all mail" => FolderRole::All,
         "flagged" | "starred" | "星标" => FolderRole::Flagged,
         "important" | "重要" => FolderRole::Important,
@@ -407,7 +664,10 @@ mod tests {
         role_for(
             path,
             delimiter,
-            &attributes.iter().map(|value| value.to_string()).collect::<Vec<_>>(),
+            &attributes
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>(),
         )
     }
 
@@ -422,11 +682,26 @@ mod tests {
     #[test]
     fn xlist_attributes_are_understood() {
         // Gmail's older XLIST names, still emitted by some servers.
-        assert_eq!(role_for("Whatever", None, &["\\SentMail".into()]), FolderRole::Sent);
-        assert_eq!(role_for("Whatever", None, &["\\AllMail".into()]), FolderRole::All);
-        assert_eq!(role_for("Whatever", None, &["\\Starred".into()]), FolderRole::Flagged);
-        assert_eq!(role_for("Whatever", None, &["\\Spam".into()]), FolderRole::Junk);
-        assert_eq!(role_for("Whatever", None, &["\\Drafts".into()]), FolderRole::Drafts);
+        assert_eq!(
+            role_for("Whatever", None, &["\\SentMail".into()]),
+            FolderRole::Sent
+        );
+        assert_eq!(
+            role_for("Whatever", None, &["\\AllMail".into()]),
+            FolderRole::All
+        );
+        assert_eq!(
+            role_for("Whatever", None, &["\\Starred".into()]),
+            FolderRole::Flagged
+        );
+        assert_eq!(
+            role_for("Whatever", None, &["\\Spam".into()]),
+            FolderRole::Junk
+        );
+        assert_eq!(
+            role_for("Whatever", None, &["\\Drafts".into()]),
+            FolderRole::Drafts
+        );
     }
 
     #[test]
@@ -523,10 +798,16 @@ mod tests {
     #[test]
     fn gmail_folders_and_google_mail_alias() {
         assert_eq!(role("[Gmail]/All Mail", Some("/"), &[]), FolderRole::All);
-        assert_eq!(role("[Gmail]/Important", Some("/"), &[]), FolderRole::Important);
+        assert_eq!(
+            role("[Gmail]/Important", Some("/"), &[]),
+            FolderRole::Important
+        );
         assert_eq!(role("[Gmail]/Sent Mail", Some("/"), &[]), FolderRole::Sent);
         assert_eq!(role("[Gmail]/Starred", Some("/"), &[]), FolderRole::Flagged);
-        assert_eq!(role("[Google Mail]/Sent Mail", Some("/"), &[]), FolderRole::Sent);
+        assert_eq!(
+            role("[Google Mail]/Sent Mail", Some("/"), &[]),
+            FolderRole::Sent
+        );
         assert_eq!(role("[Gmail]/Spam", Some("/"), &[]), FolderRole::Junk);
         assert_eq!(role("[Gmail]/Trash", Some("/"), &[]), FolderRole::Trash);
         assert_eq!(role("[Gmail]/Drafts", Some("/"), &[]), FolderRole::Drafts);
@@ -634,5 +915,238 @@ mod tests {
     fn display_name_uses_leaf() {
         assert_eq!(display_name("Projects/2026", Some("/")), "2026");
         assert_eq!(display_name("INBOX", Some("/")), "INBOX");
+    }
+}
+
+#[cfg(test)]
+mod reconcile_tests {
+    use super::*;
+    use nuncio_core::models::{AccountState, AuthKind, ProviderCapabilities, ProviderKind};
+
+    async fn test_ctx() -> CoreContext {
+        let dir = std::env::temp_dir().join(format!(
+            "nuncio-mail-folder-reconcile-{}",
+            nuncio_core::models::new_id()
+        ));
+        CoreContext::for_test(nuncio_core::Paths::new(dir))
+            .await
+            .expect("context")
+    }
+
+    async fn seed_account(ctx: &CoreContext) {
+        let account = Account {
+            id: "acc".into(),
+            provider: ProviderKind::Outlook,
+            email: "me@example.com".into(),
+            display_name: "Me".into(),
+            color: "#000000".into(),
+            auth_kind: AuthKind::Oauth,
+            oauth_provider: Some(nuncio_core::models::OAuthProvider::Microsoft),
+            imap: None,
+            smtp: None,
+            pop3: None,
+            caldav_url: None,
+            carddav_url: None,
+            sync_window_days: 90,
+            mail_enabled: true,
+            calendar_enabled: false,
+            contacts_enabled: false,
+            tasks_enabled: false,
+            notifications_enabled: false,
+            include_in_unified: true,
+            sort_order: 0,
+            state: AccountState::Ok,
+            state_message: None,
+            capabilities: ProviderCapabilities::defaults_for(ProviderKind::Outlook),
+            created_at: nuncio_core::models::now(),
+        };
+        ctx.db
+            .write(move |db| nuncio_core::repo::accounts::insert(db, &account))
+            .await
+            .expect("account");
+    }
+
+    fn remote(path: &str) -> RemoteFolder {
+        RemoteFolder {
+            path: path.to_string(),
+            delimiter: Some("/".to_string()),
+            name: path.rsplit('/').next().unwrap_or(path).to_string(),
+            attributes: Vec::new(),
+            selectable: true,
+            provider_id: None,
+        }
+    }
+
+    fn remote_with(path: &str, attributes: &[&str]) -> RemoteFolder {
+        let mut folder = remote(path);
+        folder.attributes = attributes.iter().map(|value| value.to_string()).collect();
+        folder
+    }
+
+    #[test]
+    fn explicit_special_use_wins_a_duplicate_role() {
+        // An Outlook.com mailbox: a plain `Trash` left behind by another client
+        // next to the real Deleted Items.  Only the latter carries `\Trash`.
+        let remotes = vec![
+            remote_with("Trash", &[]),
+            remote_with("已删除", &[]),
+            remote_with("已删除邮件", &["\\Trash"]),
+        ];
+        assert_eq!(
+            resolve_role_conflicts(&remotes),
+            vec![FolderRole::Other, FolderRole::Other, FolderRole::Trash]
+        );
+    }
+
+    #[test]
+    fn outbox_never_takes_the_sent_role_from_sent_items() {
+        // `发件箱` is the server's Outbox and is matched to `Sent` by name;
+        // `已发送邮件` declares `\Sent`.  The declared folder must win, or
+        // opening "Sent" would show the empty outbox.
+        let remotes = vec![remote("发件箱"), remote_with("已发送邮件", &["\\Sent"])];
+        assert_eq!(
+            resolve_role_conflicts(&remotes),
+            vec![FolderRole::Other, FolderRole::Sent]
+        );
+    }
+
+    #[test]
+    fn duplicate_roles_without_special_use_keep_the_first_folder() {
+        // Servers that publish no SPECIAL-USE at all still need one folder per
+        // role; the first in server order keeps it.
+        let remotes = vec![remote("Trash"), remote("已删除邮件")];
+        assert_eq!(
+            resolve_role_conflicts(&remotes),
+            vec![FolderRole::Trash, FolderRole::Other]
+        );
+    }
+
+    #[test]
+    fn distinct_roles_are_left_alone() {
+        let remotes = vec![
+            remote_with("INBOX", &["\\Inbox"]),
+            remote("已发送邮件"),
+            remote("垃圾邮件"),
+        ];
+        assert_eq!(
+            resolve_role_conflicts(&remotes),
+            vec![FolderRole::Inbox, FolderRole::Sent, FolderRole::Junk]
+        );
+    }
+
+    async fn local_paths(ctx: &CoreContext) -> Vec<String> {
+        ctx.db
+            .read(|db| nuncio_core::repo::folders::list(db, "acc"))
+            .await
+            .expect("folders")
+            .into_iter()
+            .map(|folder| folder.remote_path)
+            .collect()
+    }
+
+    async fn local_folder(ctx: &CoreContext, path: &str) -> Folder {
+        ctx.db
+            .read(|db| nuncio_core::repo::folders::list(db, "acc"))
+            .await
+            .expect("folders")
+            .into_iter()
+            .find(|folder| folder.remote_path == path)
+            .unwrap_or_else(|| panic!("folder {path} is missing"))
+    }
+
+    /// The real-world case: an Outlook.com mailbox carries a stray `发件箱`
+    /// (the server Outbox) next to its real `已发送邮件`.  Before roles were
+    /// resolved across the listing, `发件箱` sorted first and took the `sent`
+    /// role -- so "Sent" opened an empty folder and deletes/archives picked the
+    /// wrong target.  Once the real Sent appears, the stray folder must lose
+    /// both the role and the star it was given automatically.
+    #[tokio::test]
+    async fn the_real_system_folder_takes_over_from_a_name_guess() {
+        let ctx = test_ctx().await;
+        seed_account(&ctx).await;
+
+        // First sync: `发件箱` is the only Sent-looking folder.
+        reconcile(&ctx, "acc", vec![remote("INBOX"), remote("发件箱")], false, true)
+            .await
+            .expect("first reconcile");
+        let stray = local_folder(&ctx, "发件箱").await;
+        assert_eq!(stray.role, FolderRole::Sent);
+        assert!(stray.is_favorite, "the Sent default stars the folder");
+
+        // Second sync: the real Sent folder shows up, declaring `\Sent`.
+        reconcile(
+            &ctx,
+            "acc",
+            vec![
+                remote("INBOX"),
+                remote("发件箱"),
+                remote_with("已发送邮件", &["\\Sent"]),
+            ],
+            false,
+            true,
+        )
+        .await
+        .expect("second reconcile");
+
+        let real = local_folder(&ctx, "已发送邮件").await;
+        assert_eq!(real.role, FolderRole::Sent);
+        assert!(real.is_favorite);
+
+        let stray = local_folder(&ctx, "发件箱").await;
+        assert_eq!(stray.role, FolderRole::Other);
+        assert!(
+            !stray.is_favorite,
+            "a folder that lost its system role must not stay pinned in the sidebar"
+        );
+    }
+
+    /// The regression this guards: a partial Graph listing (one failed
+    /// `childFolders` call) must not delete the whole missing subtree.
+    #[tokio::test]
+    async fn incomplete_listing_keeps_folders_missing_from_it() {
+        let ctx = test_ctx().await;
+        seed_account(&ctx).await;
+        reconcile(
+            &ctx,
+            "acc",
+            vec![remote("INBOX"), remote("Projects"), remote("Projects/2026")],
+            false,
+            true,
+        )
+        .await
+        .expect("initial reconcile");
+
+        // The Projects subtree was not read this round: incomplete listing.
+        reconcile(&ctx, "acc", vec![remote("INBOX")], false, false)
+            .await
+            .expect("partial reconcile");
+
+        let paths = local_paths(&ctx).await;
+        assert!(paths.iter().any(|path| path == "Projects"));
+        assert!(paths.iter().any(|path| path == "Projects/2026"));
+    }
+
+    /// A complete listing must still prune, otherwise folders deleted on the
+    /// server would linger forever.
+    #[tokio::test]
+    async fn complete_listing_prunes_folders_missing_from_it() {
+        let ctx = test_ctx().await;
+        seed_account(&ctx).await;
+        reconcile(
+            &ctx,
+            "acc",
+            vec![remote("INBOX"), remote("Projects")],
+            false,
+            true,
+        )
+        .await
+        .expect("initial reconcile");
+
+        reconcile(&ctx, "acc", vec![remote("INBOX")], false, true)
+            .await
+            .expect("complete reconcile");
+
+        let paths = local_paths(&ctx).await;
+        assert!(!paths.iter().any(|path| path == "Projects"));
     }
 }

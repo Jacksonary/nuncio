@@ -16,7 +16,7 @@ use async_imap::types::Fetch;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures::TryStreamExt;
 use nuncio_core::models::SyncModule;
-use nuncio_core::models::{Folder, FolderRole};
+use nuncio_core::models::{Folder, FolderRole, PendingOpState};
 use nuncio_core::{events, repo, AppError, CoreContext, Result};
 use rusqlite::OptionalExtension;
 use tracing::{debug, warn};
@@ -53,6 +53,12 @@ pub async fn sync_folder(
             folder_id: folder.id.clone(),
             ..SyncOutcome::default()
         });
+    }
+
+    if crate::graph::uses_graph(account) {
+        // Clear early dispatch: a Microsoft account never touches the IMAP
+        // session that was opened for it (Exchange refuses the auth anyway).
+        return sync_folder_graph(ctx, account, folder).await;
     }
 
     let (stored_validity, stored_uidnext, stored_modseq) = ctx
@@ -148,6 +154,401 @@ pub async fn sync_folder(
         .await?;
 
     Ok(outcome)
+}
+
+/// Synchronize one folder through Microsoft Graph, without an IMAP connection.
+///
+/// The transport and delta-token recovery live in [`crate::graph::messages`];
+/// this function is the bridge into the same local model the IMAP path writes:
+/// every delta entry goes through `repo::messages::upsert`, deletions through
+/// `repo::messages::delete_local`, and folder counts are recomputed.  Reusing
+/// the repo layer (instead of a Graph-specific table writer) is what keeps
+/// listing, search, threading, rules and notifications provider agnostic.
+///
+/// Graph has no IMAP UID.  The existing service layer only queues server
+/// operations for rows that carry one, so each Graph message is given a
+/// deterministic synthetic UID derived from its immutable Graph id.  The
+/// executor resolves that UID back to the Graph id through the durable
+/// `graph_remote:{folder_id}:{uid}` mapping written here; the value never
+/// leaves the local database and is not sent to Microsoft.
+pub async fn sync_folder_graph(
+    ctx: &CoreContext,
+    account: &nuncio_core::models::Account,
+    folder: &Folder,
+) -> Result<SyncOutcome> {
+    if !folder.is_selectable {
+        return Ok(SyncOutcome {
+            folder_id: folder.id.clone(),
+            ..SyncOutcome::default()
+        });
+    }
+
+    let client = crate::graph::GraphMailClient::new();
+    let cursor_key = crate::graph::messages::delta_cursor_key(&folder.id);
+    let cursor = {
+        let account_id = account.id.clone();
+        let cursor_key = cursor_key.clone();
+        ctx.db
+            .read(move |db| repo::sync_state::get(db, &account_id, "mail", &cursor_key))
+            .await?
+    };
+
+    // `Folder::remote_path` is the readable local path; Graph delta and
+    // operation endpoints need the opaque folder id recorded at folder sync.
+    let graph_path = crate::sync::folders::graph_folder_id(ctx, &account.id, &folder.remote_path)
+        .await?
+        .ok_or_else(|| {
+            AppError::not_found(format!(
+                "Graph folder id is unknown for {}; refresh folders first",
+                folder.remote_path
+            ))
+        })?;
+    let mut graph_folder = folder.clone();
+    graph_folder.remote_path = graph_path;
+
+    let delta = crate::graph::messages::sync_messages(
+        &client,
+        ctx,
+        &account.id,
+        &graph_folder,
+        cursor.as_deref(),
+        account.sync_window_days,
+    )
+    .await?;
+    let initial = delta.full_sync;
+    // Snapshot the ids before the messages move into the write closure.  A
+    // complete delta scan is the Graph equivalent of an IMAP expunge pass: any
+    // local Graph row that the server did not return is gone.
+    let seen_ids: HashSet<String> = delta
+        .messages
+        .iter()
+        .map(|stored| stored.summary.id.clone())
+        .collect();
+
+    let account_id = account.id.clone();
+    let folder_id = folder.id.clone();
+    // Copy out of the borrowed account for the `'static` write closure.
+    let sync_window_days = account.sync_window_days;
+    let messages = delta.messages;
+    let mut removed_ids = delta.removed_remote_ids;
+    let resync_folder = folder.id.clone();
+
+    let (inserted, updated, removed_ids) = ctx
+        .db
+        .write(move |db| {
+            let mut inserted = Vec::new();
+            let mut updated = Vec::new();
+            for mut stored in messages {
+                // Graph, like IMAP, can hand out a new provider id for a
+                // message whose content did not change: every draft save
+                // deletes the old server copy and APPENDs a new one, and a
+                // move/copy also changes the id.  The Message-ID header is
+                // stable across that churn, so adopt the row that already
+                // represents it in this folder -- the same lookup the IMAP
+                // metadata path performs.  Without this the composer's local
+                // projection row and the APPEND echo become two rows for one
+                // draft.
+                let remote_id = stored.summary.id.clone();
+                if let Some(header) = stored.message_id_header.as_deref() {
+                    if let Some(existing_id) =
+                        local_id_for_message_id(db, &account_id, &folder_id, header)?
+                    {
+                        stored.summary.id = existing_id;
+                    }
+                }
+                // The service layer needs a UID to group queue entries; derive
+                // it from the row id that is actually used so it stays stable
+                // when a re-APPEND changes the Graph id of a draft.
+                if stored.uid.is_none() {
+                    stored.uid = Some(synthetic_uid(&stored.summary.id));
+                }
+                // Graph has no per-message answered/forwarded flag; both are
+                // local-only (set when the user replies or forwards). Carry
+                // the stored values into this upsert so a delta pass cannot
+                // reset them. IMAP is unaffected: FETCH returns real
+                // `\Answered`/`\Forwarded` flags and its path keeps calling
+                // `repo::messages::upsert` directly.
+                let existed = preserve_local_flags(db, &mut stored)?;
+                // Adopt a local ancestor conversation when one already exists,
+                // exactly like the IMAP metadata path does.
+                resolve_thread_id(db, &account_id, &mut stored)?;
+                repo::messages::upsert(db, &stored)?;
+                // Persist the uid -> Graph id mapping independently of the
+                // message row.  Optimistic actions move or even delete the row
+                // before the queued operation runs (permanent delete removes
+                // it outright), so the executor cannot always recover the
+                // Graph id from `message`.  The value must stay the Graph id,
+                // never the local row id: the executor sends it back to
+                // Microsoft, and the two differ after the reuse above.
+                if let Some(uid) = stored.uid {
+                    let key = format!("graph_remote:{folder_id}:{uid}");
+                    repo::sync_state::set(db, &account_id, "mail", &key, &remote_id)?;
+                }
+                if existed {
+                    updated.push(stored.summary.id.clone());
+                } else {
+                    inserted.push(stored.summary.clone());
+                }
+            }
+
+            if initial {
+                // A completed scan is authoritative for every synced row in
+                // the folder, including rows left over from the IMAP era.
+                removed_ids.extend(graph_prune_ids(
+                    db,
+                    &account_id,
+                    &folder_id,
+                    &seen_ids,
+                    sync_window_days,
+                )?);
+            }
+            if !removed_ids.is_empty() {
+                // Drop the uid mapping together with the row.  The mapping is
+                // keyed by that row's uid and a later sync derives a fresh uid
+                // for a new row, so a stale entry could only mislead.
+                for id in &removed_ids {
+                    let uid: Option<Option<i64>> = db
+                        .query_row(
+                            "SELECT uid FROM message WHERE id = ?1",
+                            rusqlite::params![id],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    if let Some(Some(uid)) = uid {
+                        let key = format!("graph_remote:{folder_id}:{uid}");
+                        repo::sync_state::delete_key(db, &account_id, "mail", &key)?;
+                    }
+                }
+                repo::messages::delete_local(db, &removed_ids, true)?;
+            }
+            repo::folders::set_last_sync_at(db, &resync_folder, Utc::now())?;
+            repo::folders::recompute_counts(db, &resync_folder)?;
+            Ok((inserted, updated, removed_ids))
+        })
+        .await?;
+
+    let inserted_ids: Vec<String> = inserted.iter().map(|item| item.id.clone()).collect();
+    if !inserted_ids.is_empty() {
+        events::emit_mail_new(
+            ctx.events.as_ref(),
+            account.id.clone(),
+            folder.id.clone(),
+            inserted_ids,
+        );
+    }
+    if !updated.is_empty() {
+        events::emit_mail_changed(
+            ctx.events.as_ref(),
+            account.id.clone(),
+            vec![folder.id.clone()],
+            updated,
+            events::MailChangeKind::Updated,
+        );
+    }
+    let deleted_ids = removed_ids.clone();
+    if !removed_ids.is_empty() {
+        events::emit_mail_changed(
+            ctx.events.as_ref(),
+            account.id.clone(),
+            vec![folder.id.clone()],
+            removed_ids,
+            events::MailChangeKind::Deleted,
+        );
+    }
+
+    debug!(
+        account = %account.id,
+        folder = %folder.remote_path,
+        inserted = inserted.len(),
+        initial,
+        "Graph message sync applied"
+    );
+
+    Ok(SyncOutcome {
+        new_messages: inserted,
+        updated_ids: Vec::new(),
+        deleted_ids,
+        initial,
+        folder_id: folder.id.clone(),
+    })
+}
+
+/// Deterministic synthetic UID for a Graph message.
+///
+/// Graph ids are opaque strings; the local queue keys flag/move operations by
+/// `(folder_id, uid)`.  A v5 UUID of the Graph id gives a stable positive
+/// 63-bit integer: stable across restarts (unlike `DefaultHasher`, whose keys
+/// are randomised per process) and effectively collision-free for one folder.
+fn synthetic_uid(remote_id: &str) -> i64 {
+    let uuid = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, remote_id.as_bytes());
+    let mut value = 0u64;
+    for byte in &uuid.as_bytes()[..8] {
+        value = (value << 8) | u64::from(*byte);
+    }
+    // Keep the sign bit clear so the value is a normal positive UID; 0 is
+    // reserved so it can never look like "no uid" in a numeric check.
+    let value = value & (i64::MAX as u64);
+    if value == 0 {
+        1
+    } else {
+        value as i64
+    }
+}
+
+/// Carry the local-only flags of an existing row into a Graph upsert.
+///
+/// Microsoft Graph exposes no per-message `answered` or `forwarded` state, so
+/// [`crate::graph::messages::map_message`] always maps them as `false`. The
+/// columns are set locally when the user replies or forwards
+/// (`service::compose`), and `repo::messages::upsert` deliberately takes the
+/// incoming value for them. Without this step the next delta pass would erase
+/// those flags.
+///
+/// This lives in the Graph bridge on purpose. The IMAP path gets real
+/// `\Answered` and `\Forwarded` flags from FETCH, so it must keep writing the
+/// fetched values through `repo::messages::upsert` unchanged.
+///
+/// Returns whether the row already existed, which the caller uses to classify
+/// the event (insert vs update).
+fn preserve_local_flags(
+    conn: &rusqlite::Connection,
+    stored: &mut nuncio_core::models::StoredMessage,
+) -> Result<bool> {
+    let existing: Option<(i64, i64)> = conn
+        .query_row(
+            "SELECT answered, forwarded FROM message WHERE id = ?1",
+            rusqlite::params![stored.summary.id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    match existing {
+        Some((answered, forwarded)) => {
+            stored.summary.answered = answered != 0;
+            stored.summary.forwarded = forwarded != 0;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+/// Local row id already representing `message_id_header` in `folder_id`.
+///
+/// Provider ids are not stable (Graph changes a message's id when a draft is
+/// re-APPENDed or a message is copied/moved) while the Message-ID is, so the
+/// sync updates the existing row instead of inserting a second one.  This is
+/// the same lookup the IMAP metadata path performs before its upsert.
+fn local_id_for_message_id(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+    folder_id: &str,
+    header: &str,
+) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT id FROM message
+             WHERE account_id = ?1 AND folder_id = ?2 AND message_id_header = ?3
+             LIMIT 1",
+            rusqlite::params![account_id, folder_id, header],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+/// Local ids a completed Graph full scan must delete.
+///
+/// The scan is authoritative for every row that has a remote counterpart, but
+/// rows without a `uid` are never candidates:
+///
+/// * a draft projection written by `compose_save` before its APPEND ran (the
+///   composer owns that row and deletes it on send/discard);
+/// * a row that was never synced at all.
+///
+/// Everything else is compared against the Graph ids the scan returned.  That
+/// deliberately includes rows from a previous IMAP sync, which carry a real
+/// `uid` but a NULL `gm_msgid`: they can never match a Graph id and must be
+/// removed, otherwise switching a Microsoft account from IMAP to Graph leaves
+/// every message listed twice.  A projection that was already synced but is
+/// being re-APPENDed (a pending `appendDraft` operation exists) is kept,
+/// because the disappearance of its old remote copy is expected and the new
+/// copy has not necessarily been echoed yet.
+///
+/// `sync_window_days` matters because a Graph full scan is `$filter`ed to that
+/// window: a row older than the window is simply not returned, so it cannot be
+/// treated as deleted.  Only rows clearly inside the window (one extra day of
+/// slack for clock/query skew) are judged.
+fn graph_prune_ids(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+    folder_id: &str,
+    seen_ids: &HashSet<String>,
+    sync_window_days: u32,
+) -> Result<Vec<String>> {
+    let cutoff = (sync_window_days > 0)
+        .then(|| Utc::now() - ChronoDuration::days(i64::from(sync_window_days).saturating_add(1)));
+    let awaiting_append = pending_append_draft_ids(conn, account_id)?;
+    let mut statement = conn.prepare(
+        "SELECT id, gm_msgid, is_draft, message_id_header, date FROM message
+         WHERE folder_id = ?1 AND uid IS NOT NULL",
+    )?;
+    let mut rows = statement.query(rusqlite::params![folder_id])?;
+    let mut removed = Vec::new();
+    while let Some(row) = rows.next()? {
+        let id: String = row.get(0)?;
+        let remote_id: Option<String> = row.get(1)?;
+        if remote_id
+            .as_deref()
+            .is_some_and(|remote| seen_ids.contains(remote))
+        {
+            continue;
+        }
+        if let Some(cutoff) = cutoff {
+            let date: String = row.get(4)?;
+            let in_window = DateTime::parse_from_rfc3339(&date)
+                .map(|date| date.with_timezone(&Utc) >= cutoff)
+                .unwrap_or(false);
+            if !in_window {
+                continue;
+            }
+        }
+        let is_draft: i64 = row.get(2)?;
+        let header: Option<String> = row.get(3)?;
+        let awaiting = is_draft != 0
+            && header
+                .as_deref()
+                .and_then(crate::util::draft_id_from_header)
+                .is_some_and(|draft_id| awaiting_append.contains(draft_id));
+        if !awaiting {
+            removed.push(id);
+        }
+    }
+    Ok(removed)
+}
+
+/// Draft ids whose server APPEND is still queued or running.
+///
+/// `compose_save` writes the projection row before it queues the APPEND, so a
+/// pending operation is the durable marker that the row's missing (or
+/// soon-to-be-replaced) server copy is temporary rather than a remote deletion
+/// to mirror locally.
+fn pending_append_draft_ids(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+) -> Result<HashSet<String>> {
+    let mut result = HashSet::new();
+    for op in repo::pending_ops::list(conn, Some(account_id))? {
+        if op.kind != crate::ops::KIND_APPEND_DRAFT
+            || !matches!(
+                op.state,
+                PendingOpState::Pending | PendingOpState::InProgress
+            )
+        {
+            continue;
+        }
+        if let Ok(payload) = repo::pending_ops::payload::<crate::ops::AppendDraftOp>(&op) {
+            result.insert(payload.draft_id);
+        }
+    }
+    Ok(result)
 }
 
 async fn initial_sync(
@@ -937,13 +1338,16 @@ async fn fill_previews(
             continue;
         }
         if let (Some(uid), Some(part)) = (meta.stored.uid, meta.text_part.as_deref()) {
-            let entry = groups.entry(part.to_string()).or_insert_with(|| {
-                (Vec::new(), HashMap::new())
-            });
+            let entry = groups
+                .entry(part.to_string())
+                .or_insert_with(|| (Vec::new(), HashMap::new()));
             entry.0.push(uid);
             entry.1.insert(
                 uid,
-                (meta.text_part_encoding.clone(), meta.text_part_charset.clone()),
+                (
+                    meta.text_part_encoding.clone(),
+                    meta.text_part_charset.clone(),
+                ),
             );
         }
     }
@@ -1282,5 +1686,361 @@ mod tests {
             Some(SectionPath::Part(vec![1, 2], None))
         );
         assert_eq!(section_path("bad"), None);
+    }
+
+    #[test]
+    fn synthetic_uids_are_stable_positive_and_distinct() {
+        let id = "AAMkAD/abc== +x";
+        let first = synthetic_uid(id);
+        assert!(first > 0, "a synthetic UID must look like a real UID");
+        assert_eq!(
+            first,
+            synthetic_uid(id),
+            "the same Graph id must map stably"
+        );
+        assert_ne!(first, synthetic_uid("AAMkAD/other"));
+    }
+
+    #[test]
+    fn graph_resync_keeps_local_answered_and_forwarded_flags() {
+        let db = nuncio_core::db::Db::open_in_memory().expect("in-memory database");
+        db.migrate_core().expect("core migrations");
+        let now = nuncio_core::models::now().to_rfc3339();
+
+        db.write_sync(|conn| {
+            conn.execute(
+                "INSERT INTO account (id, provider, email, auth_kind, created_at, updated_at)
+                 VALUES ('acc', 'outlook', 'me@example.com', 'oauth', ?1, ?1)",
+                rusqlite::params![now],
+            )?;
+            conn.execute(
+                "INSERT INTO folder (id, account_id, remote_path, name, role, created_at, updated_at)
+                 VALUES ('fld', 'acc', 'Inbox', 'Inbox', 'inbox', ?1, ?1)",
+                rusqlite::params![now],
+            )?;
+
+            // A row exactly as the Graph mapper builds it: answered/forwarded
+            // default to false because Graph has no such flags.
+            let graph_row = |id: &str| {
+                let summary = nuncio_core::models::MessageSummary::new(
+                    id,
+                    "acc",
+                    "fld",
+                    "thread",
+                    nuncio_core::models::now(),
+                );
+                nuncio_core::models::StoredMessage::new(summary)
+            };
+
+            // First sync inserts the row; the user then replies and forwards,
+            // which sets the local-only flags.
+            let mut first = graph_row("graph-1");
+            first.summary.answered = true;
+            first.summary.forwarded = true;
+            repo::messages::upsert(conn, &first)?;
+
+            // Next delta pass maps the same Graph message back to false.
+            let mut resynced = graph_row("graph-1");
+            assert!(!resynced.summary.answered && !resynced.summary.forwarded);
+            assert!(preserve_local_flags(conn, &mut resynced)?);
+            repo::messages::upsert(conn, &resynced)?;
+
+            let (answered, forwarded): (i64, i64) = conn.query_row(
+                "SELECT answered, forwarded FROM message WHERE id = 'graph-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            assert_eq!((answered, forwarded), (1, 1));
+
+            // A genuinely new message is not reported as existing and keeps
+            // the mapped values.
+            let mut fresh = graph_row("graph-2");
+            assert!(!preserve_local_flags(conn, &mut fresh)?);
+            assert!(!fresh.summary.answered && !fresh.summary.forwarded);
+            Ok(())
+        })
+        .expect("seed and re-sync");
+    }
+
+    /// Seed the account/folder Graph sync tests write into.
+    fn seed_graph_folder(conn: &rusqlite::Connection) {
+        let now = nuncio_core::models::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO account (id, provider, email, auth_kind, created_at, updated_at)
+             VALUES ('acc', 'outlook', 'me@example.com', 'oauth', ?1, ?1)",
+            rusqlite::params![now],
+        )
+        .expect("account");
+        conn.execute(
+            "INSERT INTO folder (id, account_id, remote_path, name, role, created_at, updated_at)
+             VALUES ('fld', 'acc', 'Inbox', 'Inbox', 'inbox', ?1, ?1)",
+            rusqlite::params![now],
+        )
+        .expect("folder");
+    }
+
+    /// Insert a `message` row with only the columns the prune reads.
+    fn insert_message(
+        conn: &rusqlite::Connection,
+        id: &str,
+        uid: Option<i64>,
+        gm_msgid: Option<&str>,
+        is_draft: bool,
+        header: Option<&str>,
+    ) {
+        conn.execute(
+            "INSERT INTO message (
+                 id, account_id, folder_id, uid, gm_msgid, message_id_header, thread_id,
+                 subject, date, preview, seen, flagged, answered, forwarded, is_draft,
+                 has_attachments, importance, size, created_at, updated_at
+             ) VALUES (?1, 'acc', 'fld', ?2, ?3, ?4, 'thread', 'subject', ?5, '', 1, 0, 0, 0,
+                       ?6, 0, 'normal', 0, ?5, ?5)",
+            rusqlite::params![
+                id,
+                uid,
+                gm_msgid,
+                header,
+                nuncio_core::models::now().to_rfc3339(),
+                is_draft as i64,
+            ],
+        )
+        .expect("insert message");
+    }
+
+    #[test]
+    fn graph_prune_preserves_draft_projections() {
+        let db = nuncio_core::db::Db::open_in_memory().expect("in-memory database");
+        db.migrate_core().expect("core migrations");
+
+        db.write_sync(|conn| {
+            seed_graph_folder(conn);
+            // Never synced: the composer's projection for a draft whose APPEND
+            // has not run yet.
+            insert_message(
+                conn,
+                "draft-local",
+                None,
+                None,
+                true,
+                Some("nuncio-draft-abc@nuncio.local"),
+            );
+            // Already synced once and now being re-APPENDed: its old Graph id
+            // is gone from the server, but that is expected.
+            insert_message(
+                conn,
+                "draft-resynced",
+                Some(synthetic_uid("draft-resynced")),
+                Some("graph-old-draft"),
+                true,
+                Some("nuncio-draft-def@nuncio.local"),
+            );
+            repo::pending_ops::enqueue(
+                conn,
+                nuncio_core::models::NewPendingOp::new(
+                    "acc",
+                    crate::ops::KIND_APPEND_DRAFT,
+                    serde_json::json!({
+                        "draftId": "def",
+                        "folderId": "fld",
+                        "rfc822Path": "/tmp/draft.eml"
+                    }),
+                    "Save draft to server",
+                ),
+            )?;
+
+            // The scan returned a different message; neither draft may be
+            // pruned.
+            let seen: HashSet<String> = ["graph-live".to_string()].into_iter().collect();
+            let removed = graph_prune_ids(conn, "acc", "fld", &seen, 0)?;
+            assert!(
+                removed.is_empty(),
+                "draft projections must survive a full scan: {removed:?}"
+            );
+            Ok(())
+        })
+        .expect("prune drafts");
+    }
+
+    #[test]
+    fn graph_prune_removes_imap_era_rows() {
+        let db = nuncio_core::db::Db::open_in_memory().expect("in-memory database");
+        db.migrate_core().expect("core migrations");
+
+        db.write_sync(|conn| {
+            seed_graph_folder(conn);
+            // A row synced over IMAP before the switch: real UID, no Graph id,
+            // so it can never appear in the Graph scan.
+            insert_message(
+                conn,
+                "imap-era",
+                Some(42),
+                None,
+                false,
+                Some("<old@example.com>"),
+            );
+
+            let seen: HashSet<String> = ["graph-live".to_string()].into_iter().collect();
+            let removed = graph_prune_ids(conn, "acc", "fld", &seen, 0)?;
+            assert_eq!(removed, vec!["imap-era".to_string()]);
+            Ok(())
+        })
+        .expect("prune imap era row");
+    }
+
+    #[test]
+    fn graph_prune_keeps_rows_the_scan_returned() {
+        let db = nuncio_core::db::Db::open_in_memory().expect("in-memory database");
+        db.migrate_core().expect("core migrations");
+
+        db.write_sync(|conn| {
+            seed_graph_folder(conn);
+            insert_message(
+                conn,
+                "graph-live",
+                Some(synthetic_uid("graph-live")),
+                Some("graph-live"),
+                false,
+                Some("<live@example.com>"),
+            );
+
+            let seen: HashSet<String> = ["graph-live".to_string()].into_iter().collect();
+            let removed = graph_prune_ids(conn, "acc", "fld", &seen, 0)?;
+            assert!(
+                removed.is_empty(),
+                "a message the scan returned must be kept: {removed:?}"
+            );
+            Ok(())
+        })
+        .expect("keep live graph row");
+    }
+
+    #[test]
+    fn graph_sync_reuses_the_row_with_the_same_message_id() {
+        let db = nuncio_core::db::Db::open_in_memory().expect("in-memory database");
+        db.migrate_core().expect("core migrations");
+
+        db.write_sync(|conn| {
+            seed_graph_folder(conn);
+            insert_message(
+                conn,
+                "draft-local",
+                None,
+                None,
+                true,
+                Some("nuncio-draft-abc@nuncio.local"),
+            );
+
+            assert_eq!(
+                local_id_for_message_id(conn, "acc", "fld", "nuncio-draft-abc@nuncio.local")?,
+                Some("draft-local".to_string()),
+                "the APPEND echo must update the composer's projection row"
+            );
+            assert_eq!(
+                local_id_for_message_id(conn, "acc", "fld", "<unknown@example.com>")?,
+                None
+            );
+            Ok(())
+        })
+        .expect("reuse message id");
+    }
+
+    /// The Graph mapper must hand the reuse lookup a bare Message-ID.
+    ///
+    /// Graph returns `internetMessageId` wrapped in angle brackets while the
+    /// composer's projection row is written with
+    /// `nuncio-draft-<uuid>@nuncio.local`. The lookup is
+    /// `WHERE message_id_header = ?`, an exact string comparison, so a
+    /// bracketed value from `map_message` never matches: the APPEND echo would
+    /// be inserted as a second row for the same draft. This drives the real
+    /// mapper with a Graph-shaped payload and asserts the reuse actually fires.
+    #[test]
+    fn graph_echo_with_bracketed_message_id_reuses_the_draft_projection() {
+        let db = nuncio_core::db::Db::open_in_memory().expect("in-memory database");
+        db.migrate_core().expect("core migrations");
+
+        db.write_sync(|conn| {
+            seed_graph_folder(conn);
+            // The projection `compose_save` writes before queuing the APPEND.
+            insert_message(
+                conn,
+                "draft-local",
+                None,
+                None,
+                true,
+                Some("nuncio-draft-abc@nuncio.local"),
+            );
+
+            // The server copy of that draft, as Graph reports it.
+            let echoed = crate::graph::messages::map_graph_json(
+                serde_json::json!({
+                    "id": "AAMkAD-draft-server-id",
+                    "subject": "Draft subject",
+                    "isDraft": true,
+                    "receivedDateTime": "2026-11-16T08:00:00Z",
+                    "internetMessageId": "<nuncio-draft-abc@nuncio.local>",
+                }),
+                "acc",
+                "fld",
+            )
+            .expect("mapped");
+
+            let header = echoed
+                .message_id_header
+                .as_deref()
+                .expect("a draft always carries a Message-ID");
+            assert_eq!(header, "nuncio-draft-abc@nuncio.local");
+            // The second line of defence: recovering the local draft id from
+            // the header only works on the bare form.
+            assert_eq!(crate::util::draft_id_from_header(header), Some("abc"));
+
+            let reused = local_id_for_message_id(conn, "acc", "fld", header)?
+                .expect("the APPEND echo must match the projection row");
+            assert_eq!(reused, "draft-local");
+
+            // Apply the same id swap the sync performs and check no second row
+            // appears.
+            let mut adopted = echoed;
+            adopted.summary.id = reused;
+            adopted.uid = Some(synthetic_uid(&adopted.summary.id));
+            repo::messages::upsert(conn, &adopted)?;
+            let rows: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM message WHERE message_id_header = ?1",
+                rusqlite::params!["nuncio-draft-abc@nuncio.local"],
+                |row| row.get(0),
+            )?;
+            assert_eq!(rows, 1, "one draft must stay one row");
+
+            // Ordinary (non-draft) messages are normalized the same way, so a
+            // re-sync after a Graph id change also lands on the existing row.
+            insert_message(
+                conn,
+                "mail-local",
+                None,
+                None,
+                false,
+                Some("abc@example.com"),
+            );
+            let mailed = crate::graph::messages::map_graph_json(
+                serde_json::json!({
+                    "id": "AAMkAD-mail-server-id",
+                    "receivedDateTime": "2026-11-16T08:00:00Z",
+                    "internetMessageId": "<abc@example.com>",
+                }),
+                "acc",
+                "fld",
+            )
+            .expect("mapped");
+            assert_eq!(
+                local_id_for_message_id(
+                    conn,
+                    "acc",
+                    "fld",
+                    mailed.message_id_header.as_deref().expect("header"),
+                )?,
+                Some("mail-local".to_string())
+            );
+            Ok(())
+        })
+        .expect("reuse the bracketed graph message id");
     }
 }

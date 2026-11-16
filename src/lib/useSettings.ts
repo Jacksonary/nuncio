@@ -1,10 +1,11 @@
 /**
  * Settings query + optimistic updates + theme/accent/language application.
  *
- * `useSettingsSync()` is mounted once by the shell. It also mirrors the native
- * window theme so mail iframes and OS chrome follow the app theme.
+ * `useSettingsSync()` is mounted once by the shell and applies accent and
+ * language. `useThemeSync()` is mounted by `App` so that every window — the
+ * shell plus the message / compose windows — follows the theme.
  */
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import {
   useMutation,
   useQuery,
@@ -12,13 +13,14 @@ import {
   type UseMutationResult,
 } from "@tanstack/react-query";
 import { app, settings } from "@/ipc/api";
-import type { AppSettings, SettingsPatch } from "@/ipc/types";
+import type { AppSettings, SettingsPatch, ThemeMode } from "@/ipc/types";
 import { queryKeys } from "@/lib/queryKeys";
 import { setLanguage } from "@/lib/i18n";
 import { setPlatform } from "@/lib/platform";
 import {
   applyAccent,
   applyTheme,
+  resolveNativeSystemTheme,
   syncNativeTheme,
   watchSystemTheme,
 } from "@/lib/theme";
@@ -168,7 +170,63 @@ export function useUpdateSettings(): UseMutationResult<
 }
 
 /**
- * Apply the current settings to the document and native window.
+ * Theme part of the settings sync: applies the palette, mirrors the mode into
+ * the native window and, for "system", keeps following the OS.
+ *
+ * Mounted once at the app root (see `App`), not only by the Shell: secondary
+ * message/compose windows have their own webview and would otherwise only get
+ * the theme from the one-shot `bootstrapTheme()` cache read, so a settings
+ * change or an OS flip while they are open would leave them stale.
+ *
+ * `mode === undefined` means "no authoritative value yet" (settings still
+ * loading), so the cached bootstrap theme is left alone.
+ */
+export function useThemeSync(mode: ThemeMode | undefined): void {
+  // Bumped on every apply so a slower, older async chain cannot overwrite a
+  // newer result (e.g. the user flips system -> dark while un-pinning runs).
+  const generation = useRef(0);
+
+  useEffect(() => {
+    if (mode === undefined) return;
+
+    // "Find the real OS theme, then repaint": we must not read matchMedia
+    // while the webview is still pinned to a forced scheme, or we compute the
+    // theme from a stale value and get one wrong repaint.
+    if (mode === "system") {
+      const ticket = ++generation.current;
+      void syncNativeTheme("system")
+        .then(() => resolveNativeSystemTheme())
+        .then((resolved) => {
+          // A newer apply superseded this one; drop the result.
+          if (ticket !== generation.current) return;
+          // The native value wins over matchMedia because the webview may
+          // still report the scheme it was pinned to. No timer or artificial
+          // delay is needed: `setTheme` resolving means the un-pin is done.
+          applyTheme("system", resolved);
+        });
+      return;
+    }
+
+    // Fixed light/dark: no un-pinning involved, so the synchronous apply is
+    // already correct and the native call can follow in the background.
+    generation.current += 1;
+    applyTheme(mode);
+    void syncNativeTheme(mode);
+  }, [mode]);
+
+  useEffect(() => {
+    if (mode !== "system") return;
+    return watchSystemTheme((resolved) => {
+      // The native event payload is the new OS theme. The matchMedia fallback
+      // passes undefined, which makes applyTheme resolve it from the webview.
+      applyTheme("system", resolved);
+    });
+  }, [mode]);
+}
+
+/**
+ * Apply the accent color, language and platform of the current settings.
+ * Theme lives in `useThemeSync` so it can be mounted by every window.
  * Mount once (Shell). Returns the query for loading/error handling.
  */
 export function useSettingsSync() {
@@ -179,19 +237,9 @@ export function useSettingsSync() {
     // Before the first successful load, keep the bootstrap values cached from
     // the previous run instead of overwriting them with defaults.
     if (!data) return;
-    applyTheme(data.theme);
     applyAccent(data.accentColor);
     setLanguage(data.language);
-    void syncNativeTheme(data.theme);
   }, [data]);
-
-  useEffect(() => {
-    if ((data?.theme ?? "system") !== "system") return;
-    return watchSystemTheme(() => {
-      applyTheme("system");
-      void syncNativeTheme("system");
-    });
-  }, [data?.theme]);
 
   useEffect(() => {
     let cancelled = false;
@@ -223,8 +271,9 @@ export interface UseSettingsResult {
 
 /**
  * Convenience hook for module settings pages: current settings plus optimistic
- * update helpers. `useSettingsSync` (mounted by the shell) applies theme,
- * accent and language whenever the cached value changes.
+ * update helpers. `useSettingsSync` (mounted by the shell) applies accent and
+ * language; `useThemeSync` (mounted by `App`) applies the theme in every
+ * window.
  */
 export function useSettings(): UseSettingsResult {
   const settingsValue = useAppSettings();

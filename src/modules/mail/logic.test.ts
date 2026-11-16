@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { MessageSummary } from "@/ipc/types";
 import {
   EMPTY_SELECTION,
+  aggregateUnread,
   buildFolderTree,
   buildMessageRows,
   dateGroupKey,
@@ -12,7 +13,9 @@ import {
   nextAfterRemoval,
   parseUnifiedFolderId,
   selectionReducer,
+  splitAccountFolders,
   unifiedFolderId,
+  type FolderNode,
   type SelectionState,
 } from "./logic";
 
@@ -200,7 +203,7 @@ describe("folder tree display normalisation", () => {
     expect(roles.filter((role) => role === "junk")).toHaveLength(1);
   });
 
-  it("never repeats a primary folder under More", () => {
+  it("keeps only inbox and drafts on top and never repeats them under More", () => {
     const tree = buildFolderTree([
       folder({ id: "inbox", role: "inbox" }),
       folder({ id: "trash", role: "trash" }),
@@ -213,8 +216,125 @@ describe("folder tree display normalisation", () => {
     const secondary = secondaryNodes(shown, primary);
     const primaryIds = primary.map((node) => node.folder.id);
     const secondaryIds = secondary.map((node) => node.folder.id);
-    expect(primaryIds).toEqual(expect.arrayContaining(["inbox", "trash", "sent"]));
+    expect(primaryIds).toEqual(["inbox"]);
+    expect(secondaryIds).toEqual(expect.arrayContaining(["trash", "sent", "custom"]));
     for (const id of primaryIds) expect(secondaryIds).not.toContain(id);
-    expect(secondaryIds).toContain("custom");
+  });
+});
+
+describe("aggregateUnread", () => {
+  const node = (id: string, unreadCount: number, children: FolderNode[] = []): FolderNode => ({
+    folder: {
+      id,
+      accountId: "acct-1",
+      parentId: null,
+      remotePath: id,
+      name: id,
+      role: "other",
+      unreadCount,
+      totalCount: 0,
+      isFavorite: false,
+      syncEnabled: true,
+      isSelectable: true,
+      sortOrder: 0,
+      lastSyncAt: null,
+    },
+    children,
+  });
+
+  it("sums the nodes themselves and every descendant", () => {
+    const tree = [
+      node("a", 2, [node("a1", 3), node("a2", 0, [node("a2x", 4)])]),
+      node("b", 1),
+    ];
+    expect(aggregateUnread(tree)).toBe(2 + 3 + 4 + 1);
+  });
+
+  it("returns 0 for an empty section", () => {
+    expect(aggregateUnread([])).toBe(0);
+  });
+
+  it("adds each nested row's own count, not only the roots", () => {
+    const tree = [node("parent", 5, [node("child", 5)])];
+    expect(aggregateUnread(tree)).toBe(10);
+  });
+});
+
+describe("splitAccountFolders", () => {
+  const folder = (over: Partial<import("@/ipc/types").Folder> & { id: string }): import("@/ipc/types").Folder => ({
+    accountId: "acct-1",
+    parentId: null,
+    remotePath: over.remotePath ?? over.id,
+    name: over.name ?? over.id,
+    role: over.role ?? "other",
+    unreadCount: 0,
+    totalCount: 0,
+    isFavorite: false,
+    syncEnabled: true,
+    isSelectable: true,
+    sortOrder: 0,
+    lastSyncAt: null,
+    ...over,
+  });
+
+  it("folds sent, trash and custom folders behind More", () => {
+    const tree = displayFolderTree(
+      buildFolderTree([
+        folder({ id: "inbox", role: "inbox" }),
+        folder({ id: "drafts", role: "drafts" }),
+        folder({ id: "sent", role: "sent" }),
+        folder({ id: "trash", role: "trash" }),
+        folder({ id: "custom" }),
+      ]),
+    );
+    const { primary, secondary } = splitAccountFolders(tree);
+    expect(primary.map((entry) => entry.folder.id)).toEqual(["inbox", "drafts"]);
+    expect(secondary.map((entry) => entry.folder.id)).toEqual(["sent", "trash", "custom"]);
+  });
+
+  it("promotes a non-empty outbox to the end of the primary section", () => {
+    const tree = displayFolderTree(
+      buildFolderTree([
+        folder({ id: "inbox", role: "inbox" }),
+        folder({ id: "sent", role: "sent" }),
+        folder({ id: "outbox", role: "outbox", totalCount: 2 }),
+      ]),
+    );
+    const { primary, secondary } = splitAccountFolders(tree);
+    expect(primary.map((entry) => entry.folder.id)).toEqual(["inbox", "outbox"]);
+    expect(secondary.map((entry) => entry.folder.id)).toEqual(["sent"]);
+  });
+
+  it("folds an empty outbox behind More", () => {
+    const tree = displayFolderTree(
+      buildFolderTree([
+        folder({ id: "inbox", role: "inbox" }),
+        folder({ id: "outbox", role: "outbox", totalCount: 0 }),
+      ]),
+    );
+    const { primary, secondary } = splitAccountFolders(tree);
+    expect(primary.map((entry) => entry.folder.id)).toEqual(["inbox"]);
+    expect(secondary.map((entry) => entry.folder.id)).toEqual(["outbox"]);
+  });
+
+  it("keeps favourites on top next to inbox and drafts", () => {
+    const tree = displayFolderTree(
+      buildFolderTree([
+        folder({ id: "inbox", role: "inbox" }),
+        folder({ id: "sent", role: "sent" }),
+        folder({ id: "starred", name: "Starred", isFavorite: true }),
+      ]),
+    );
+    const { primary, secondary } = splitAccountFolders(tree);
+    expect(primary.map((entry) => entry.folder.id)).toEqual(["inbox", "starred"]);
+    expect(secondary.map((entry) => entry.folder.id)).toEqual(["sent"]);
+  });
+
+  it("leaves no More row for a POP3 account with a single inbox", () => {
+    const tree = displayFolderTree(buildFolderTree([folder({ id: "inbox", role: "inbox" })]));
+    const { primary, secondary } = splitAccountFolders(tree);
+    expect(primary.map((entry) => entry.folder.id)).toEqual(["inbox"]);
+    expect(secondary).toEqual([]);
+    expect(primary).toHaveLength(1);
   });
 });

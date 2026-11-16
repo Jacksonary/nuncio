@@ -12,9 +12,12 @@ use std::time::Duration;
 use chrono::Utc;
 use futures::TryStreamExt;
 use nuncio_core::models::{Account, Folder, FolderRole, PendingOp, PendingOpState};
+use nuncio_core::traits::TokenResource;
 use nuncio_core::{events, repo, AppError, CoreContext, Result};
+use rusqlite::OptionalExtension;
 use tracing::{debug, info};
 
+use crate::graph::{ops as graph_ops, GraphMailClient};
 use crate::imap::conn::{ImapConnection, COMMAND_TIMEOUT};
 use crate::ops::{
     AppendDraftOp, AppendToSentOp, ArchiveOp, DeleteOp, DeleteRemoteDraftOp, FolderCreateOp,
@@ -147,7 +150,15 @@ pub async fn run_due(
                 Err(error) => {
                     for (op, _) in &batch {
                         outcome.resync_folders.extend(op_folders(op));
-                        handle_failure(ctx, account, op, &error, &mut outcome).await?;
+                        handle_failure(
+                            ctx,
+                            account,
+                            op,
+                            &error,
+                            TokenResource::Mail,
+                            &mut outcome,
+                        )
+                        .await?;
                     }
                 }
             }
@@ -186,7 +197,15 @@ pub async fn run_due(
             }
             Err(error) => {
                 outcome.resync_folders.extend(op_folders(&op));
-                handle_failure(ctx, account, &op, &error, &mut outcome).await?;
+                handle_failure(
+                    ctx,
+                    account,
+                    &op,
+                    &error,
+                    TokenResource::Mail,
+                    &mut outcome,
+                )
+                .await?;
             }
         }
         index += 1;
@@ -208,6 +227,11 @@ async fn execute_one(
     selected: &mut Option<String>,
     op: &PendingOp,
 ) -> Result<()> {
+    // Clear early dispatch: Microsoft accounts execute the same queued
+    // operations through Graph.  The IMAP implementation below is untouched.
+    if crate::graph::uses_graph(account) {
+        return execute_graph_op(ctx, account, op).await;
+    }
     if account.imap.is_none() {
         return apply_local_only(ctx, op).await;
     }
@@ -300,6 +324,648 @@ async fn execute_one(
         other => Err(AppError::unsupported(format!(
             "unknown pending operation kind: {other}"
         ))),
+    }
+}
+
+/* ───────────────────────── Graph operations ───────────────────────── */
+
+/// Execute one queued operation through Microsoft Graph.
+///
+/// The queued payloads are provider-neutral, but Graph's data model differs
+/// (no IMAP UIDs, new message ids after a move, `sendMail` files Sent copies
+/// itself), so each kind is translated here.  Every call reads or writes the
+/// same local rows the IMAP executor uses, which is what lets undo, resync and
+/// failure rollback stay shared.
+async fn execute_graph_op(ctx: &CoreContext, account: &Account, op: &PendingOp) -> Result<()> {
+    let client = GraphMailClient::new();
+    match op.kind.as_str() {
+        KIND_SET_FLAGS => {
+            let payload: SetFlagsOp = repo::pending_ops::payload(op)?;
+            if payload.uids.is_empty() {
+                return Ok(());
+            }
+            // Graph has no \Answered or $Forwarded message flag; an operation
+            // that only touches those has nothing to send and completes.
+            if payload.seen.is_none() && payload.flagged.is_none() {
+                return Ok(());
+            }
+            for uid in &payload.uids {
+                let remote = graph_remote_id(ctx, &account.id, &payload.folder_id, *uid).await?;
+                graph_ops::set_flags(
+                    &client,
+                    ctx,
+                    &account.id,
+                    &remote,
+                    payload.seen,
+                    payload.flagged,
+                )
+                .await?;
+            }
+            Ok(())
+        }
+        KIND_MOVE => {
+            let payload: MoveOp = repo::pending_ops::payload(op)?;
+            let target = folder_by_id(ctx, &payload.target_folder_id).await?;
+            graph_move_messages(
+                ctx,
+                account,
+                &client,
+                &payload.folder_id,
+                &target,
+                &payload.uids,
+            )
+            .await
+        }
+        KIND_DELETE => {
+            let payload: DeleteOp = repo::pending_ops::payload(op)?;
+            if !payload.permanent {
+                let target = match payload.target_folder_id.as_deref() {
+                    Some(id) => Some(folder_by_id(ctx, id).await?),
+                    None => role_folder(ctx, &account.id, FolderRole::Trash).await?,
+                };
+                if let Some(target) = target {
+                    let source = folder_by_id(ctx, &payload.folder_id).await?;
+                    if source.id != target.id {
+                        graph_move_messages(
+                            ctx,
+                            account,
+                            &client,
+                            &payload.folder_id,
+                            &target,
+                            &payload.uids,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                }
+            }
+            for uid in &payload.uids {
+                let remote = graph_remote_id(ctx, &account.id, &payload.folder_id, *uid).await?;
+                graph_ops::permanent_delete_message(&client, ctx, &account.id, &remote).await?;
+            }
+            let ids = local_message_ids(ctx, &payload.folder_id, &payload.uids).await?;
+            if !ids.is_empty() {
+                ctx.db
+                    .write(move |db| repo::messages::delete_local(db, &ids, true))
+                    .await?;
+            }
+            Ok(())
+        }
+        KIND_ARCHIVE => {
+            let payload: ArchiveOp = repo::pending_ops::payload(op)?;
+            let source = folder_by_id(ctx, &payload.folder_id).await?;
+            if matches!(source.role, FolderRole::All | FolderRole::Archive) {
+                return Ok(());
+            }
+            let target = match payload.target_folder_id.as_deref() {
+                Some(id) => Some(folder_by_id(ctx, id).await?),
+                None => role_folder(ctx, &account.id, FolderRole::Archive).await?,
+            };
+            let target = match target {
+                Some(target) => target,
+                None => {
+                    // Graph exposes Archive as a normal folder on most
+                    // mailboxes; create it when the account has none, exactly
+                    // like the IMAP archive path.
+                    graph_ops::create_folder(&client, ctx, &account.id, "Archive", None).await?;
+                    crate::sync::folders::sync_graph(ctx, account).await?;
+                    role_folder(ctx, &account.id, FolderRole::Archive)
+                        .await?
+                        .ok_or_else(|| {
+                            AppError::protocol("Graph Archive folder could not be created")
+                        })?
+                }
+            };
+            graph_move_messages(
+                ctx,
+                account,
+                &client,
+                &payload.folder_id,
+                &target,
+                &payload.uids,
+            )
+            .await
+        }
+        KIND_MARK_JUNK => {
+            let payload: MarkJunkOp = repo::pending_ops::payload(op)?;
+            let role = if payload.value {
+                FolderRole::Junk
+            } else {
+                FolderRole::Inbox
+            };
+            let target = match payload.target_folder_id.as_deref() {
+                Some(id) => Some(folder_by_id(ctx, id).await?),
+                None => role_folder(ctx, &account.id, role).await?,
+            };
+            let Some(target) = target else {
+                return Err(AppError::unsupported(format!(
+                    "account has no {} folder",
+                    role.as_str()
+                )));
+            };
+            graph_move_messages(
+                ctx,
+                account,
+                &client,
+                &payload.folder_id,
+                &target,
+                &payload.uids,
+            )
+            .await
+        }
+        KIND_APPEND_DRAFT => {
+            let payload: AppendDraftOp = repo::pending_ops::payload(op)?;
+            let bytes = read_staged_message(&payload.rfc822_path).await?;
+            // Graph's MIME create endpoint files the draft in Drafts itself.
+            graph_ops::append_draft(&client, ctx, &account.id, &bytes).await?;
+            Ok(())
+        }
+        KIND_APPEND_TO_SENT => {
+            // Graph saves the Sent copy as part of sendMail; appending again
+            // would create a duplicate.
+            Ok(())
+        }
+        KIND_DELETE_REMOTE_DRAFT => {
+            let payload: DeleteRemoteDraftOp = repo::pending_ops::payload(op)?;
+            match graph_remote_id_opt(ctx, &account.id, &payload.folder_id, payload.uid).await? {
+                Some(remote) => graph_ops::delete_message(&client, ctx, &account.id, &remote).await,
+                None => {
+                    // The local draft row may already be gone (the composer
+                    // removes it when the send supersedes the draft).  The
+                    // deletion is idempotent, so treat a missing mapping as
+                    // already deleted.
+                    debug!(
+                        folder = %payload.folder_id,
+                        uid = payload.uid,
+                        "no local row for the remote draft; nothing to delete"
+                    );
+                    Ok(())
+                }
+            }
+        }
+        KIND_FOLDER_CREATE => {
+            let payload: FolderCreateOp = repo::pending_ops::payload(op)?;
+            let parent_id = match payload.parent_id.as_deref() {
+                Some(id) => {
+                    let parent = folder_by_id(ctx, id).await?;
+                    Some(graph_folder_remote_id(ctx, &account.id, &parent).await?)
+                }
+                None => None,
+            };
+            graph_ops::create_folder(
+                &client,
+                ctx,
+                &account.id,
+                &payload.name,
+                parent_id.as_deref(),
+            )
+            .await?;
+            crate::sync::folders::sync_graph(ctx, account).await?;
+            Ok(())
+        }
+        KIND_FOLDER_RENAME => {
+            let payload: FolderRenameOp = repo::pending_ops::payload(op)?;
+            let folder = folder_by_id(ctx, &payload.folder_id).await?;
+            // The server id does not change, but the local identity is the
+            // readable path, so the rename must move that path too.  Otherwise
+            // the next reconciliation would see a new path and replace the
+            // folder (losing its local ids and flags).
+            let folder_remote = graph_folder_remote_id(ctx, &account.id, &folder).await?;
+            graph_ops::rename_folder(&client, ctx, &account.id, &folder_remote, &payload.new_name)
+                .await?;
+            let folder_id = folder.id.clone();
+            let old_path = folder.remote_path.clone();
+            let new_path = graph_renamed_path(&old_path, &payload.new_name);
+            let name = payload.new_name;
+            let mapping_account = account.id.clone();
+            let old_prefix = format!("{old_path}/");
+            let new_prefix = format!("{new_path}/");
+            let account_for_query = account.id.clone();
+            ctx.db
+                .write(move |db| {
+                    // Descendant folders are identified by their path prefix,
+                    // so they must follow the renamed parent or the next
+                    // reconciliation would recreate them under new ids.
+                    let descendants: Vec<(String, String)> = {
+                        let mut statement =
+                            db.prepare("SELECT id, remote_path FROM folder WHERE account_id = ?1")?;
+                        let rows = statement.query_map(
+                            rusqlite::params![account_for_query],
+                            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                        )?;
+                        rows.collect::<rusqlite::Result<Vec<_>>>()?
+                    };
+                    let now = nuncio_core::repo::now_string();
+                    for (id, path) in descendants {
+                        let updated = if id == folder_id {
+                            Some(new_path.clone())
+                        } else {
+                            path.strip_prefix(&old_prefix)
+                                .map(|rest| format!("{new_prefix}{rest}"))
+                        };
+                        let Some(updated) = updated else { continue };
+                        if id == folder_id {
+                            db.execute(
+                                "UPDATE folder SET remote_path = ?2, name = ?3, updated_at = ?4 WHERE id = ?1",
+                                rusqlite::params![id, updated, name, now],
+                            )?;
+                        } else {
+                            db.execute(
+                                "UPDATE folder SET remote_path = ?2, updated_at = ?3 WHERE id = ?1",
+                                rusqlite::params![id, updated, now],
+                            )?;
+                        }
+                        // Move the provider-id mapping with the path.
+                        let old_key = format!("graph_folder:{path}");
+                        if let Some(provider_id) = repo::sync_state::get(
+                            db,
+                            &mapping_account,
+                            "mail",
+                            &old_key,
+                        )? {
+                            let new_key = format!("graph_folder:{updated}");
+                            repo::sync_state::set(
+                                db,
+                                &mapping_account,
+                                "mail",
+                                &new_key,
+                                &provider_id,
+                            )?;
+                            repo::sync_state::delete_key(db, &mapping_account, "mail", &old_key)?;
+                        }
+                    }
+                    Ok(())
+                })
+                .await?;
+            crate::sync::folders::sync_graph(ctx, account).await?;
+            Ok(())
+        }
+        KIND_FOLDER_DELETE => {
+            let payload: FolderDeleteOp = repo::pending_ops::payload(op)?;
+            let folder = folder_by_id(ctx, &payload.folder_id).await?;
+            let folder_remote = graph_folder_remote_id(ctx, &account.id, &folder).await?;
+            graph_ops::delete_folder(&client, ctx, &account.id, &folder_remote).await?;
+            let folder_id = folder.id.clone();
+            ctx.db
+                .write(move |db| repo::folders::delete(db, &folder_id))
+                .await?;
+            crate::sync::folders::sync_graph(ctx, account).await?;
+            Ok(())
+        }
+        KIND_FOLDER_SUBSCRIBE => {
+            // Graph folders have no subscription concept; completing the op is
+            // the only meaningful outcome.
+            Ok(())
+        }
+        KIND_FOLDER_MARK_READ => {
+            let payload: FolderMarkReadOp = repo::pending_ops::payload(op)?;
+            let folder = folder_by_id(ctx, &payload.folder_id).await?;
+            let folder_remote = graph_folder_remote_id(ctx, &account.id, &folder).await?;
+            graph_ops::mark_folder_read(&client, ctx, &account.id, &folder_remote).await?;
+            let folder_id = folder.id.clone();
+            ctx.db
+                .write(move |db| {
+                    repo::messages::mark_all_read(db, &folder_id)?;
+                    Ok(())
+                })
+                .await
+        }
+        KIND_SEND => Err(AppError::unsupported(
+            "queued sends are sent directly through Graph for Microsoft accounts",
+        )),
+        other => Err(AppError::unsupported(format!(
+            "unknown pending operation kind: {other}"
+        ))),
+    }
+}
+
+/// Resolve the Graph message id behind a queued `(folder_id, uid)` pair.
+async fn graph_remote_id(
+    ctx: &CoreContext,
+    account_id: &str,
+    folder_id: &str,
+    uid: i64,
+) -> Result<String> {
+    graph_remote_id_opt(ctx, account_id, folder_id, uid)
+        .await?
+        .ok_or_else(|| {
+            AppError::not_found(format!("message uid {uid} not found in folder {folder_id}"))
+        })
+}
+
+/// Look up the Graph id recorded when the message was synced.
+///
+/// The mapping is stored separately from the message row because a permanent
+/// delete removes the row before the queued operation executes, and an
+/// optimistic move changes the row's `folder_id`.  `sync_folder_graph` writes
+/// `graph_remote:{folder_id}:{uid}` for every message, and a successful move
+/// rewrites it under the destination folder.  When the requested folder has no
+/// entry, the newest mapping for the uid wins before the row is consulted; the
+/// row lookup only covers messages synced by a version that predates mappings.
+async fn graph_remote_id_opt(
+    ctx: &CoreContext,
+    account_id: &str,
+    folder_id: &str,
+    uid: i64,
+) -> Result<Option<String>> {
+    let key = format!("graph_remote:{folder_id}:{uid}");
+    let mapped_account = account_id.to_string();
+    let mapped = {
+        let key = key.clone();
+        ctx.db
+            .read(move |db| repo::sync_state::get(db, &mapped_account, "mail", &key))
+            .await?
+    };
+    if let Some(remote) = mapped.filter(|value| !value.trim().is_empty()) {
+        return Ok(Some(remote));
+    }
+
+    // A move rewrites the live mapping under the destination folder, so an
+    // operation queued against the old folder can miss the exact key.  Prefer
+    // the most recently written mapping for this uid over the row below: the
+    // row can still carry the pre-move `gm_msgid`, and sending that id to
+    // Graph answers 404 and rolls the operation back.  Synthetic uids are
+    // derived from one Graph id, so a uid identifies one message account-wide.
+    let pattern = format!("graph_remote:%:{uid}");
+    let mapped_account = account_id.to_string();
+    let freshest = ctx
+        .db
+        .read(move |db| {
+            Ok(db
+                .query_row(
+                    "SELECT value FROM sync_state
+                     WHERE account_id = ?1 AND module = 'mail' AND key LIKE ?2
+                       AND value <> ''
+                     ORDER BY updated_at DESC LIMIT 1",
+                    rusqlite::params![mapped_account, pattern],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?)
+        })
+        .await?;
+    if let Some(remote) = freshest {
+        return Ok(Some(remote));
+    }
+
+    // Fallback: the optimistic action may have moved the row to another
+    // folder, so search the whole account rather than the source folder.
+    let account_id = account_id.to_string();
+    ctx.db
+        .read(move |db| {
+            let row = db
+                .query_row(
+                    "SELECT gm_msgid, id FROM message
+                     WHERE account_id = ?1 AND uid = ?2 LIMIT 1",
+                    rusqlite::params![account_id, uid],
+                    |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            Ok(row.map(|(gm_msgid, id)| {
+                gm_msgid
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or(id)
+            }))
+        })
+        .await
+}
+
+/// Resolve the opaque Graph folder id recorded for a local folder row.
+async fn graph_folder_remote_id(
+    ctx: &CoreContext,
+    account_id: &str,
+    folder: &Folder,
+) -> Result<String> {
+    crate::sync::folders::graph_folder_id(ctx, account_id, &folder.remote_path)
+        .await?
+        .ok_or_else(|| {
+            AppError::protocol(format!(
+                "no Graph folder id is recorded for {}; refresh folders first",
+                folder.remote_path
+            ))
+        })
+}
+
+/// New local remote path after renaming a Graph folder.
+///
+/// Mirrors `graph::folders::escape_segment`: `/` is the local hierarchy
+/// separator, so it and `%` must be escaped to keep the path injective.
+fn graph_renamed_path(old_path: &str, new_name: &str) -> String {
+    let segment = new_name.replace('%', "%25").replace('/', "%2F");
+    match old_path.rsplit_once('/') {
+        Some((parent, _)) if !parent.is_empty() => format!("{parent}/{segment}"),
+        _ => segment,
+    }
+}
+
+/// Move every UID of `source_folder_id` into `target` and drop the local source
+/// rows; a later folder resync repopulates the destination from Graph.
+///
+/// Graph assigns a new id per moved message, so the uid -> Graph id mapping is
+/// rewritten under the destination folder as part of the same local write.
+/// Without that, a later mark-read/delete queued against the destination folder
+/// finds no mapping, falls back to the optimistic row (which still carries the
+/// pre-move id) and sends Graph a 404, failing and rolling back an operation
+/// the server would otherwise accept.
+async fn graph_move_messages(
+    ctx: &CoreContext,
+    account: &Account,
+    client: &GraphMailClient,
+    source_folder_id: &str,
+    target: &Folder,
+    uids: &[i64],
+) -> Result<()> {
+    if uids.is_empty() {
+        return Ok(());
+    }
+    // Mirror the IMAP executor: a move into the folder the message already
+    // lives in is a no-op.  It also keeps the remap below from deleting the
+    // mapping it just wrote when source and destination are the same folder.
+    if target.id == source_folder_id {
+        return Ok(());
+    }
+    let target_id = graph_folder_remote_id(ctx, &account.id, target).await?;
+    let mut moved: Vec<(i64, String)> = Vec::with_capacity(uids.len());
+    for uid in uids {
+        let remote = graph_remote_id(ctx, &account.id, source_folder_id, *uid).await?;
+        let new_id =
+            graph_ops::move_message(client, ctx, &account.id, &remote, &target_id).await?;
+        moved.push((*uid, new_id));
+    }
+
+    // Resolve the source rows before the write: after an optimistic move they
+    // already live in the target folder and this is empty, but operations
+    // queued by background paths still expect their source rows dropped.
+    let source_ids = local_message_ids(ctx, source_folder_id, uids).await?;
+    let account_id = account.id.clone();
+    let source = source_folder_id.to_string();
+    let destination = target.id.clone();
+    ctx.db
+        .write(move |db| {
+            remap_moved_ids(db, &account_id, &source, &destination, &moved)?;
+            if !source_ids.is_empty() {
+                repo::messages::delete_local(db, &source_ids, true)?;
+            }
+            Ok(())
+        })
+        .await
+}
+
+/// Point the queued-operation id mapping at the ids Graph assigned to a move.
+///
+/// The destination entry is the one later operations resolve through, so it is
+/// written with the new id.  The source entry is removed: the message is no
+/// longer in that folder, and leaving it behind would make a lookup retry a
+/// message id Graph has already retired.
+fn remap_moved_ids(
+    db: &rusqlite::Connection,
+    account_id: &str,
+    source_folder_id: &str,
+    target_folder_id: &str,
+    moved: &[(i64, String)],
+) -> Result<()> {
+    for (uid, new_id) in moved {
+        let destination_key = format!("graph_remote:{target_folder_id}:{uid}");
+        repo::sync_state::set(db, account_id, "mail", &destination_key, new_id)?;
+        // Same-folder moves never reach here (the caller returns early), but
+        // deleting an identical key would erase the mapping just written.
+        if source_folder_id != target_folder_id {
+            let source_key = format!("graph_remote:{source_folder_id}:{uid}");
+            repo::sync_state::delete_key(db, account_id, "mail", &source_key)?;
+        }
+    }
+    Ok(())
+}
+
+/// Read a staged outgoing message, enforcing the same 100 MB cap as IMAP.
+async fn read_staged_message(path: &str) -> Result<Vec<u8>> {
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .map_err(|error| AppError::io(format!("cannot read staged message: {error}")))?;
+    if metadata.len() > 100 * 1024 * 1024 {
+        return Err(AppError::invalid_input("staged message exceeds 100 MB"));
+    }
+    tokio::fs::read(path)
+        .await
+        .map_err(|error| AppError::io(format!("cannot read staged message: {error}")))
+}
+
+/// Execute due Graph operations for one account.
+///
+/// This is the Graph counterpart of [`run_due`]: same ordering, retry and
+/// rollback semantics, but no IMAP connection.  The account actor calls it
+/// from the Graph loop.
+pub async fn run_due_graph(ctx: &CoreContext, account: &Account) -> Result<ExecOutcome> {
+    recover_in_progress(ctx, &account.id).await?;
+    let account_id = account.id.clone();
+    let now = Utc::now();
+    let ops = ctx
+        .db
+        .read({
+            let account_id = account_id.clone();
+            move |db| repo::pending_ops::list(db, Some(&account_id))
+        })
+        .await?;
+    let due: Vec<PendingOp> = ops
+        .into_iter()
+        .filter(|op| {
+            op.state == PendingOpState::Pending
+                && op.next_retry_at.map(|at| at <= now).unwrap_or(true)
+        })
+        .take(MAX_OPS_PER_PASS)
+        .collect();
+    if due.is_empty() {
+        return Ok(ExecOutcome::default());
+    }
+
+    let mut outcome = ExecOutcome::default();
+    for op in due {
+        mark_in_progress(ctx, std::slice::from_ref(&op.id)).await?;
+        match execute_graph_op(ctx, account, &op).await {
+            Ok(()) => {
+                mark_done(ctx, std::slice::from_ref(&op.id)).await?;
+                outcome.done += 1;
+                if op.kind == KIND_APPEND_TO_SENT {
+                    if let Ok(payload) = repo::pending_ops::payload::<AppendToSentOp>(&op) {
+                        let _ = tokio::fs::remove_file(&payload.rfc822_path).await;
+                    }
+                }
+                if op.kind == KIND_APPEND_DRAFT {
+                    if let Ok(payload) = repo::pending_ops::payload::<AppendDraftOp>(&op) {
+                        outcome.resync_folders.insert(payload.folder_id);
+                    }
+                }
+                if matches!(op.kind.as_str(), KIND_MOVE | KIND_ARCHIVE | KIND_MARK_JUNK) {
+                    if let Ok(payload) = repo::pending_ops::payload::<MoveOp>(&op) {
+                        // Resync the source as well: the old local row was
+                        // moved optimistically and only the source delta
+                        // reports it as removed.
+                        outcome.resync_folders.insert(payload.folder_id.clone());
+                        outcome.resync_folders.insert(payload.target_folder_id);
+                    }
+                    if let Ok(payload) = repo::pending_ops::payload::<ArchiveOp>(&op) {
+                        outcome.resync_folders.insert(payload.folder_id.clone());
+                    }
+                    if let Ok(payload) = repo::pending_ops::payload::<MarkJunkOp>(&op) {
+                        outcome.resync_folders.insert(payload.folder_id.clone());
+                    }
+                }
+                if op.kind == KIND_DELETE {
+                    if let Ok(payload) = repo::pending_ops::payload::<DeleteOp>(&op) {
+                        outcome.resync_folders.insert(payload.folder_id.clone());
+                        if let Some(target) = payload.target_folder_id {
+                            outcome.resync_folders.insert(target);
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                outcome.resync_folders.extend(op_folders(&op));
+                // Report against MicrosoftGraph, not Mail: sharing the IMAP
+                // resource would invalidate the Outlook IMAP token and can mark
+                // an otherwise healthy account as needing re-authentication.
+                handle_failure(
+                    ctx,
+                    account,
+                    &op,
+                    &error,
+                    TokenResource::MicrosoftGraph,
+                    &mut outcome,
+                )
+                .await?;
+            }
+        }
+    }
+    Ok(outcome)
+}
+
+/// Execute one freshly queued operation through Graph and settle it now.
+///
+/// Used by the Graph command loop for folder create/rename/delete, which need
+/// a synchronous result for the command layer.
+///
+/// Every error goes through [`handle_failure`], exactly like the queue pass:
+/// retryable failures (network, auth, transient protocol) leave the row
+/// `pending` with backoff, everything else is rolled back and marked failed.
+/// Returning early without settling the row would leave it `inProgress` until
+/// the ten-minute recovery sweep, so a user retry in between could run a
+/// non-idempotent operation (folder create) twice.
+pub async fn run_one_graph_now(ctx: &CoreContext, account: &Account, op: &PendingOp) -> Result<()> {
+    mark_in_progress(ctx, std::slice::from_ref(&op.id)).await?;
+    match execute_graph_op(ctx, account, op).await {
+        Ok(()) => mark_done(ctx, std::slice::from_ref(&op.id)).await,
+        Err(error) => {
+            let mut outcome = ExecOutcome::default();
+            handle_failure(
+                ctx,
+                account,
+                op,
+                &error,
+                TokenResource::MicrosoftGraph,
+                &mut outcome,
+            )
+            .await?;
+            Err(error)
+        }
     }
 }
 
@@ -901,13 +1567,24 @@ fn op_folders(op: &PendingOp) -> Vec<String> {
     }
 }
 
+/// Settle a failed operation: retry with backoff when the error is transient,
+/// otherwise roll the optimistic change back and fail the row.
+///
+/// `token` is the credential resource the operation actually used.  It must be
+/// supplied by the caller: a Graph operation reported under `Mail` would
+/// invalidate the Outlook IMAP token and can wrongly mark the account as
+/// needing re-authentication, even though the Graph token is fine.
 async fn handle_failure(
     ctx: &CoreContext,
     account: &Account,
     op: &PendingOp,
     error: &AppError,
+    token: TokenResource,
     outcome: &mut ExecOutcome,
 ) -> Result<()> {
+    // Graph policy denials arrive as `Unsupported` (see
+    // `GraphMailClient::failure`), so they fall through to the terminal path:
+    // refreshing a valid token cannot grant a permission.
     let retryable = matches!(
         error,
         AppError::Network(_) | AppError::Auth(_) | AppError::Db(_) | AppError::Io(_)
@@ -916,9 +1593,7 @@ async fn handle_failure(
         AppError::Protocol(_) if op.attempts < 2
     );
     if error.code() == "auth" {
-        ctx.creds
-            .report_auth_failure(&account.id, nuncio_core::traits::TokenResource::Mail)
-            .await;
+        ctx.creds.report_auth_failure(&account.id, token).await;
     }
     if retryable && op.attempts + 1 < MAX_ATTEMPTS {
         let op_id = op.id.clone();
@@ -1393,6 +2068,46 @@ mod tests {
             description: "test".into(),
             last_error: None,
         }
+    }
+
+    #[test]
+    fn graph_renamed_path_keeps_parent_and_escapes_separators() {
+        assert_eq!(graph_renamed_path("Projects/2026", "Q1"), "Projects/Q1");
+        assert_eq!(graph_renamed_path("Projects", "Q1"), "Q1");
+        assert_eq!(graph_renamed_path("Projects/2026", "A/B"), "Projects/A%2FB");
+        assert_eq!(
+            graph_renamed_path("Projects/2026", "100%"),
+            "Projects/100%25"
+        );
+    }
+
+    #[test]
+    fn move_remap_writes_the_destination_mapping() {
+        let db = setup();
+        db.write_sync(|conn| {
+            repo::sync_state::set(
+                conn,
+                "acc",
+                "mail",
+                "graph_remote:src:5",
+                "old-id",
+            )?;
+            remap_moved_ids(conn, "acc", "src", "dst", &[(5, "new-id".to_string())])?;
+            // Later operations queued against the destination folder resolve
+            // through this key, so it must carry the id Graph returned.
+            assert_eq!(
+                repo::sync_state::get(conn, "acc", "mail", "graph_remote:dst:5")?,
+                Some("new-id".to_string())
+            );
+            // The source key pointed at the retired id; leaving it behind would
+            // let a lookup 404 against the old folder.
+            assert_eq!(
+                repo::sync_state::get(conn, "acc", "mail", "graph_remote:src:5")?,
+                None
+            );
+            Ok(())
+        })
+        .expect("remap");
     }
 
     #[test]
