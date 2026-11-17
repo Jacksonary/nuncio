@@ -319,6 +319,12 @@ export function AddAccountDialog({ open, onClose, onCreated }: AddAccountDialogP
       const result = await accounts.discover(email);
       setDiscovery(result);
       applyDiscovery(result);
+      if (!result.imap && !result.smtp && !result.pop3) {
+        // Providers such as Tuta offer no IMAP/SMTP. There is nothing to
+        // prefill, so open the manual server fields and let validation block
+        // "Create" until the user either supplies them or turns mail off.
+        setAdvancedOpen(true);
+      }
       if (result.authKind === "oauth" && result.oauthProvider) {
         const oauthTile = tileForOAuth(result.oauthProvider);
         setTileId(oauthTile.id);
@@ -424,6 +430,24 @@ export function AddAccountDialog({ open, onClose, onCreated }: AddAccountDialogP
         setAdvancedOpen(true);
       }
       setFormError(t("settings.addAccount.fixFields"));
+      return false;
+    }
+    // Discovery found no mail servers (e.g. Tuta) and the user supplied none:
+    // there is nothing this account could sync. Filling a host or a DAV URL
+    // below is the way out, so the manual path stays open.
+    if (
+      discovery &&
+      !discovery.imap &&
+      !discovery.smtp &&
+      !discovery.pop3 &&
+      !form.imap.host.trim() &&
+      !form.smtp.host.trim() &&
+      !form.pop3.host.trim() &&
+      !form.caldavUrl.trim() &&
+      !form.carddavUrl.trim()
+    ) {
+      setAdvancedOpen(true);
+      setFormError(t("settings.addAccount.noServers"));
       return false;
     }
     setFormError(null);

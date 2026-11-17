@@ -149,7 +149,7 @@ export function GeneralPage({ onBack }: { onBack: () => void }) {
               onClick={() => void checkForUpdates()}
               disabled={phase === "checking" || phase === "downloading"}
             >
-              {phase === "checking" ? t("settings.general.checking") : t("settings.general.checkNowButton")}
+              {t("settings.general.checkNowButton")}
             </button>
           </SettingRow>
         </Card>
@@ -198,7 +198,8 @@ export function GeneralPage({ onBack }: { onBack: () => void }) {
 
         {phase === "downloading" ? (
           <div className={styles.rowStack}>
-            <span className={styles.progressLabel}>{t("settings.general.downloading")}</span>
+            {/* `ProgressBar` renders `label` as its own visible heading, so a
+                sibling label would render the same text twice. */}
             <ProgressBar indeterminate label={t("settings.general.downloading")} />
           </div>
         ) : null}

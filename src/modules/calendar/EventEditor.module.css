@@ -29,12 +29,6 @@
   font-size: var(--font-caption);
 }
 
-.caption {
-  margin: -4px 0 0;
-  color: var(--text-tertiary);
-  font-size: var(--font-caption);
-}
-
 .hint {
   color: var(--text-tertiary);
   font-size: var(--font-caption);

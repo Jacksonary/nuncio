@@ -29,7 +29,6 @@ export interface MonthViewProps {
   month: Date;
   days: Date[];
   events: EventInstance[];
-  weekStartsOn: number;
   showWeekNumbers: boolean;
   selectedKey: string | null;
   onSelectEvent: (event: EventInstance, anchor: HTMLElement | null) => void;
@@ -46,7 +45,6 @@ export function MonthView({
   month,
   days,
   events,
-  weekStartsOn,
   showWeekNumbers,
   selectedKey,
   onSelectEvent,

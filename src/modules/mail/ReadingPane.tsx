@@ -21,9 +21,7 @@ import {
   Delete24Regular,
   DocumentEdit16Regular,
   Flag24Regular,
-  Important16Regular,
   Mail16Regular,
-  MailRead16Regular,
   MailUnread16Regular,
   MoreHorizontal20Regular,
   Open16Regular,
@@ -40,7 +38,6 @@ import {
   IconButton,
   MenuButton,
   Spinner,
-  Tooltip,
   confirm,
   toast,
   type MenuEntry,
@@ -72,7 +69,6 @@ import { useShellStore } from "@/lib/store";
 import {
   isPermanentDelete,
   messageActionToast,
-  undoLastMessageAction,
   useMessageActions,
 } from "./actions";
 import { onMailCommand } from "./commands";
@@ -96,7 +92,6 @@ import {
 import {
   useAccountsQuery,
   useAllFolders,
-  useMailAccounts,
   useMailSettings,
   type FolderChoice,
 } from "./queries";
@@ -738,7 +733,7 @@ function MessageCard({
     try {
       const path = await saveDialog({
         defaultPath: `${safeFilename(summary.subject, tt("common.untitled"))}.eml`,
-        filters: [{ name: "E-mail", extensions: ["eml"] }],
+        filters: [{ name: tt("mail.action.saveAsFilter"), extensions: ["eml"] }],
       });
       if (!path) return;
       await messagesApi.saveEml(summary.id, path);

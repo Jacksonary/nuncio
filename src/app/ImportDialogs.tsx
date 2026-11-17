@@ -93,7 +93,7 @@ function IcsImportDialog({ path }: { path: string }) {
       ) : list.length === 0 ? (
         <EmptyState
           compact
-          title={t("shell.importIcs.title")}
+          title={t("shell.importIcs.noCalendarsTitle")}
           description={t("shell.importIcs.noCalendars")}
         />
       ) : (
@@ -188,7 +188,7 @@ function VcfImportDialog({ path }: { path: string }) {
       ) : books.length === 0 ? (
         <EmptyState
           compact
-          title={t("shell.importVcf.title")}
+          title={t("shell.importVcf.noAddressBooksTitle")}
           description={t("shell.importVcf.noAddressBooks")}
         />
       ) : (

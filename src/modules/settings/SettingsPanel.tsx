@@ -146,7 +146,6 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
     return (
       <div className={styles.root}>
         <div className={styles.homeIntro}>
-          <div className={styles.homeTitle}>{t("settings.home.title")}</div>
           <div className={styles.homeSubtitle}>{t("settings.home.subtitle")}</div>
         </div>
         <nav className={styles.homeList} aria-label={t("settings.home.nav")}>

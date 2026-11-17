@@ -1,4 +1,4 @@
-import { useId, useRef, useState, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { Checkmark16Regular } from "@fluentui/react-icons";
 import { cn } from "@/lib/cn";
 import { useT } from "@/lib/i18n";
@@ -58,13 +58,31 @@ export function ColorPicker({
   const generatedId = useId();
   const id = idProp ?? generatedId;
   const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const gridRef = useRef<HTMLDivElement | null>(null);
   const [open, setOpen] = useState(false);
+  const wasOpen = useRef(false);
   const normalized = normalizeHexColor(value);
+
+  // The popover is portalled, so keyboard users lose their place unless focus
+  // is handed to the first swatch and given back to the trigger on close.
+  useEffect(() => {
+    if (open) {
+      const frame = window.requestAnimationFrame(() => {
+        gridRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
+      });
+      wasOpen.current = true;
+      return () => window.cancelAnimationFrame(frame);
+    }
+    if (wasOpen.current) {
+      wasOpen.current = false;
+      triggerRef.current?.focus();
+    }
+    return undefined;
+  }, [open]);
 
   const choose = (color: string | null) => {
     onChange(color);
     setOpen(false);
-    window.requestAnimationFrame(() => triggerRef.current?.focus());
   };
 
   return (
@@ -81,7 +99,7 @@ export function ColorPicker({
         className={cn(styles.trigger, disabled && styles.disabled)}
         aria-haspopup="dialog"
         aria-expanded={open}
-        aria-label={ariaLabel ?? t("common.chooseColor")}
+        aria-label={ariaLabel ?? (label ? undefined : t("common.chooseColor"))}
         disabled={disabled}
         onClick={() => setOpen((value) => !value)}
       >
@@ -104,7 +122,7 @@ export function ColorPicker({
         ariaLabel={t("common.chooseColor")}
         className={styles.picker}
       >
-        <div className={styles.grid}>
+        <div className={styles.grid} ref={gridRef}>
           {allowNull ? (
             <button
               type="button"

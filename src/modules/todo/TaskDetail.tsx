@@ -586,7 +586,7 @@ export function TaskDetail({ taskId, seedTask, lists, accounts, today, onDeleted
           }
           selected={task.importance === "high"}
           disabled={readOnly}
-          title={support.importance ? undefined : t("todo.detail.localOnly")}
+          tooltip={support.importance ? undefined : t("todo.detail.localOnly")}
           onClick={() =>
             void setTaskImportance(task, task.importance === "high" ? "normal" : "high")
           }

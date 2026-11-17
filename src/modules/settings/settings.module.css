@@ -13,12 +13,6 @@
   padding: var(--sp-5) var(--sp-5) var(--sp-2);
 }
 
-.homeTitle {
-  font-size: var(--font-subtitle);
-  line-height: var(--line-subtitle);
-  font-weight: var(--weight-semibold);
-}
-
 .homeSubtitle {
   margin-top: var(--sp-1);
   color: var(--text-secondary);
@@ -185,11 +179,6 @@
   letter-spacing: 0.02em;
   text-transform: uppercase;
   color: var(--text-secondary);
-}
-
-.sectionHint {
-  color: var(--text-tertiary);
-  font-size: var(--font-caption);
 }
 
 .card {
@@ -1070,11 +1059,6 @@
   flex-direction: column;
   gap: var(--sp-3);
   padding: var(--sp-1) 0 0;
-}
-
-.progressLabel {
-  color: var(--text-secondary);
-  font-size: var(--font-caption);
 }
 
 .checkList {

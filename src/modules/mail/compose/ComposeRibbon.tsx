@@ -3,7 +3,7 @@
  * Windows Mail compose ribbon. Uses the shared Tabs, Select, Menu, Popover,
  * Switch and IconButton primitives.
  */
-import { useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import type { Editor } from "@tiptap/core";
 import {
   ArrowRedo16Regular,
@@ -110,7 +110,27 @@ function SwatchPopover({
   onClear,
 }: SwatchPopoverProps) {
   const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const gridRef = useRef<HTMLDivElement | null>(null);
+  const wasOpen = useRef(false);
   const [open, setOpen] = useState(false);
+
+  // The trigger advertises a dialog, so focus enters the swatch grid and
+  // returns to the trigger on every close path (pick, Escape, outside click).
+  useEffect(() => {
+    if (open) {
+      const frame = window.requestAnimationFrame(() => {
+        gridRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
+      });
+      wasOpen.current = true;
+      return () => window.cancelAnimationFrame(frame);
+    }
+    if (wasOpen.current) {
+      wasOpen.current = false;
+      triggerRef.current?.focus();
+    }
+    return undefined;
+  }, [open]);
+
   return (
     <>
       <IconButton
@@ -127,10 +147,11 @@ function SwatchPopover({
         onClose={() => setOpen(false)}
         anchor={triggerRef.current}
         placement="bottom-start"
+        role="dialog"
         ariaLabel={label}
         minWidth={188}
       >
-        <div className={styles.swatches} role="group" aria-label={label}>
+        <div ref={gridRef} className={styles.swatches} role="group" aria-label={label}>
           {colors.map((color) => (
             <button
               key={color}
@@ -168,8 +189,27 @@ interface TablePickerProps {
 function TablePicker({ onInsert }: TablePickerProps) {
   const t = useT();
   const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const gridRef = useRef<HTMLDivElement | null>(null);
+  const wasOpen = useRef(false);
   const [open, setOpen] = useState(false);
   const [hover, setHover] = useState({ rows: 3, cols: 3 });
+
+  // Same contract as SwatchPopover: the trigger promises a dialog, so focus
+  // the first cell on open and restore the trigger afterwards.
+  useEffect(() => {
+    if (open) {
+      const frame = window.requestAnimationFrame(() => {
+        gridRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
+      });
+      wasOpen.current = true;
+      return () => window.cancelAnimationFrame(frame);
+    }
+    if (wasOpen.current) {
+      wasOpen.current = false;
+      triggerRef.current?.focus();
+    }
+    return undefined;
+  }, [open]);
 
   return (
     <>
@@ -189,6 +229,7 @@ function TablePicker({ onInsert }: TablePickerProps) {
         onClose={() => setOpen(false)}
         anchor={triggerRef.current}
         placement="bottom-start"
+        role="dialog"
         ariaLabel={t("compose.insert.tableTitle")}
         minWidth={240}
       >
@@ -197,6 +238,7 @@ function TablePicker({ onInsert }: TablePickerProps) {
             {t("compose.insert.tableSize", { rows: hover.rows, cols: hover.cols })}
           </div>
           <div
+            ref={gridRef}
             className={styles.tableGrid}
             role="grid"
             aria-label={t("compose.insert.tableHint")}

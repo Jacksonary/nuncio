@@ -3,6 +3,7 @@
  * called inside the desktop runtime so the UI still renders in a plain browser.
  */
 import { isTauri } from "@tauri-apps/api/core";
+import { t } from "@/lib/i18n";
 
 export function isDesktop(): boolean {
   return isTauri();
@@ -38,8 +39,8 @@ export async function pickSavePath(defaultPath: string, title: string): Promise<
     title,
     defaultPath,
     filters: [
-      { name: "Nuncio Backup", extensions: ["nuncio-backup", "zip", "json"] },
-      { name: "All files", extensions: ["*"] },
+      { name: t("settings.data.backupFilter"), extensions: ["nuncio-backup", "zip", "json"] },
+      { name: t("settings.data.allFilesFilter"), extensions: ["*"] },
     ],
   });
   return path ?? null;
@@ -53,8 +54,8 @@ export async function pickOpenPath(title: string): Promise<string | null> {
     multiple: false,
     directory: false,
     filters: [
-      { name: "Nuncio Backup", extensions: ["nuncio-backup", "zip", "json"] },
-      { name: "All files", extensions: ["*"] },
+      { name: t("settings.data.backupFilter"), extensions: ["nuncio-backup", "zip", "json"] },
+      { name: t("settings.data.allFilesFilter"), extensions: ["*"] },
     ],
   });
   return typeof selected === "string" ? selected : null;

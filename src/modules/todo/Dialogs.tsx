@@ -157,7 +157,6 @@ export function CreateListDialog({
           value={accountId}
           onChange={setAccountId}
           options={accountOptions}
-          placeholder={t("todo.newList.account")}
           disabled={busy || accountOptions.length === 0}
         />
         <div className={styles.colorSection}>

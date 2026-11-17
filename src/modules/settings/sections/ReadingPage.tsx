@@ -3,7 +3,6 @@ import { Input, Select, Switch } from "@/components";
 import { useT } from "@/lib/i18n";
 import { useSettings } from "@/lib/useSettings";
 import { SettingRow, Section, Card, SettingsPage, StackRow } from "../components/SettingsUI";
-import styles from "../settings.module.css";
 
 export function ReadingPage({ onBack }: { onBack: () => void }) {
   const t = useT();

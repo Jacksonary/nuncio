@@ -53,11 +53,18 @@ export const settings = {
 export const accounts = {
   list: () => call<T.Account[]>("account_list"),
   discover: (email: string) => call<T.DiscoveryResult>("account_discover", { email }),
+  /** Verified provider-directory facts; null when the domain is not listed. */
+  providerInfo: (email: string) => call<T.ProviderInfo | null>("account_provider_info", { email }),
   test: (input: T.NewAccountInput) => call<T.ConnectionTestResult>("account_test", { input }),
   create: (input: T.NewAccountInput) => call<T.Account>("account_create", { input }),
   update: (id: T.Id, patch: T.AccountPatch) => call<T.Account>("account_update", { id, patch }),
   /** Replace stored password / app password and retry. */
   updatePassword: (id: T.Id, password: string) => call<void>("account_update_password", { id, password }),
+  /** Store or clear (null) the optional per-service CalDAV/CardDAV password. */
+  setDavPassword: (id: T.Id, service: T.DavService, password: string | null) =>
+    call<void>("account_set_dav_password", { id, service, password }),
+  /** Whether a dedicated CalDAV/CardDAV password is stored. */
+  davPasswordStatus: (id: T.Id) => call<T.DavPasswordStatus>("account_dav_password_status", { id }),
   /** Re-run OAuth for an account in needsReauth. */
   reauth: (id: T.Id) => call<T.Account>("account_reauth", { id }),
   delete: (id: T.Id) => call<void>("account_delete", { id }),

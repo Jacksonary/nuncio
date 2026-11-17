@@ -7,7 +7,6 @@ export const common = {
     "common.ok": "确定",
     "common.cancel": "取消",
     "common.save": "保存",
-    "common.saveAs": "另存为",
     "common.delete": "删除",
     "common.close": "关闭",
     "common.add": "添加",
@@ -98,12 +97,19 @@ export const common = {
       "未能自动获取服务器设置，以下参数是根据邮箱域名推测的，请确认后再继续",
     "discovery.note.enterprise":
       "这是企业或自定义域名邮箱，服务器地址可能由管理员配置；如果自动发现失败，请向管理员获取 IMAP/SMTP 信息",
+    "discovery.note.authCodeEnable":
+      "需先在网页邮箱「设置」中开启 IMAP/SMTP 服务（如需同步日历、联系人，还要开启 CalDAV/CardDAV），并使用生成的授权码而非登录密码。",
+    "discovery.note.appPasswordYandex":
+      "需在 Yandex ID 中为「邮件」「日历」「联系人」分别创建应用密码；新密码可能要 2–3 小时后才生效。",
+    "discovery.note.enableImap":
+      "需先在网页邮箱设置中开启 IMAP 访问，否则第三方客户端无法登录。",
+    "discovery.note.noImap":
+      "该服务不提供 IMAP/SMTP，无法在第三方邮件客户端中使用。",
   },
   "en-US": {
     "common.ok": "OK",
     "common.cancel": "Cancel",
     "common.save": "Save",
-    "common.saveAs": "Save as",
     "common.delete": "Delete",
     "common.close": "Close",
     "common.add": "Add",
@@ -194,5 +200,13 @@ export const common = {
       "The server settings could not be discovered automatically. The values below are guessed from the email domain — review them before continuing",
     "discovery.note.enterprise":
       "This looks like a company or custom-domain mailbox. Server addresses may be managed by your administrator; if discovery fails, ask them for the IMAP/SMTP settings",
+    "discovery.note.authCodeEnable":
+      "Turn on IMAP/SMTP in the webmail settings first (and CalDAV/CardDAV if you want calendars and contacts), then sign in with the generated authorization code, not your login password.",
+    "discovery.note.appPasswordYandex":
+      "Create an app password in Yandex ID (separate ones for Mail, Calendar and Contacts). A new app password can take 2–3 hours to start working.",
+    "discovery.note.enableImap":
+      "Turn on IMAP access in the webmail settings first, otherwise third-party clients cannot sign in.",
+    "discovery.note.noImap":
+      "This provider does not offer IMAP/SMTP, so it cannot be used in a third-party mail client.",
   },
 } as const;

@@ -2,7 +2,7 @@
  * Mail module entry: split list/reading pane, module-level shortcuts, inline
  * composer host and the "new message" action used by the shell.
  */
-import { useCallback, useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { isTauri } from "@tauri-apps/api/core";
 import { on } from "@/ipc/api";
 import { Mail24Regular } from "@fluentui/react-icons";

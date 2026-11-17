@@ -295,39 +295,40 @@ export function Shell() {
           </div>
 
           <div className={styles.navFooter}>
-            <button
-              type="button"
-              className={styles.syncRow}
-              onClick={() => void syncNow()}
-              title={syncTooltip}
-              aria-label={`${t("shell.syncStatus")}: ${syncLabel}`}
-            >
-              <span
-                className={`${styles.syncIcon} ${
-                  syncTone === "error"
-                    ? styles.syncIconError
-                    : syncTone === "warning"
-                      ? styles.syncIconWarning
-                      : syncTone === "success"
-                        ? styles.syncIconSuccess
-                        : ""
-                }`}
-                aria-hidden="true"
+            <Tooltip content={syncTooltip}>
+              <button
+                type="button"
+                className={styles.syncRow}
+                onClick={() => void syncNow()}
+                aria-label={`${t("shell.syncStatus")}: ${syncLabel}`}
               >
-                {syncing.length > 0 ? (
-                  <Spinner size="tiny" />
-                ) : syncTone === "error" || syncTone === "warning" ? (
-                  syncTone === "error" ? (
-                    <Warning16Regular />
+                <span
+                  className={`${styles.syncIcon} ${
+                    syncTone === "error"
+                      ? styles.syncIconError
+                      : syncTone === "warning"
+                        ? styles.syncIconWarning
+                        : syncTone === "success"
+                          ? styles.syncIconSuccess
+                          : ""
+                  }`}
+                  aria-hidden="true"
+                >
+                  {syncing.length > 0 ? (
+                    <Spinner size="tiny" />
+                  ) : syncTone === "error" || syncTone === "warning" ? (
+                    syncTone === "error" ? (
+                      <Warning16Regular />
+                    ) : (
+                      <WifiOff20Regular />
+                    )
                   ) : (
-                    <WifiOff20Regular />
-                  )
-                ) : (
-                  <CheckmarkCircle16Regular />
-                )}
-              </span>
-              <span className={styles.syncText}>{syncLabel}</span>
-            </button>
+                    <CheckmarkCircle16Regular />
+                  )}
+                </span>
+                <span className={styles.syncText}>{syncLabel}</span>
+              </button>
+            </Tooltip>
 
             <div className={styles.switcher}>
               {moduleOrder.map((moduleId) => {

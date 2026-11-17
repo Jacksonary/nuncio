@@ -145,6 +145,37 @@ export function useUpdateAccountPassword(): UseMutationResult<
   });
 }
 
+export function useDavPasswordStatus(accountId: string, enabled = true) {
+  return useQuery({
+    queryKey: ["davPasswordStatus", accountId] as const,
+    queryFn: () => accounts.davPasswordStatus(accountId),
+    enabled,
+  });
+}
+
+export function useSetDavPassword(): UseMutationResult<
+  void,
+  unknown,
+  { id: string; service: "calendar" | "contacts"; password: string | null }
+> {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      id,
+      service,
+      password,
+    }: {
+      id: string;
+      service: "calendar" | "contacts";
+      password: string | null;
+    }) => accounts.setDavPassword(id, service, password),
+    onSuccess: (_result, { id }) => {
+      void client.invalidateQueries({ queryKey: ["davPasswordStatus", id] });
+      void client.invalidateQueries({ queryKey: queryKeyPrefixes.syncStatus });
+    },
+  });
+}
+
 export function useReauthAccount(): UseMutationResult<Account, unknown, string> {
   const client = useQueryClient();
   const invalidate = useAccountInvalidation();

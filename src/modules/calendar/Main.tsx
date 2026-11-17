@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import { isTauri } from "@tauri-apps/api/core";
 import {
   CalendarLtr24Regular,
@@ -454,7 +454,6 @@ export function CalendarMain() {
           month={anchor}
           days={range.days}
           events={eventList}
-          weekStartsOn={settings.firstDayOfWeek}
           showWeekNumbers={settings.showWeekNumbers}
           selectedKey={selectedKey}
           onSelectEvent={openPeek}

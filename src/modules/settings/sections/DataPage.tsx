@@ -26,7 +26,7 @@ import { queryKeyPrefixes } from "@/lib/queryKeys";
 import { describeError } from "../lib/errors";
 import { isDesktop, pickOpenPath, pickSavePath, relaunchApp } from "../lib/desktop";
 import { useInvalidateAllData, useStorageUsage } from "../lib/hooks";
-import { Banner, Card, Section, SettingsPage, StackRow, SettingRow } from "../components/SettingsUI";
+import { Banner, Card, Section, SettingsPage, SettingRow } from "../components/SettingsUI";
 import styles from "../settings.module.css";
 
 type BackupMode = "export" | "import";
@@ -127,7 +127,7 @@ export function DataPage({
               description={t("settings.data.clearCacheDesc")}
             >
               <Button appearance="subtle" icon={<HardDrive24Regular />} onClick={() => void clearCache()}>
-                {t("settings.data.clearCache")}
+                {t("settings.data.clearCacheAction")}
               </Button>
             </SettingRow>
           </>
@@ -146,12 +146,12 @@ export function DataPage({
               icon={<ArrowDownload24Regular />}
               onClick={() => setBackupMode("export")}
             >
-              {t("settings.data.export")}
+              {t("settings.data.exportAction")}
             </Button>
           </SettingRow>
           <SettingRow label={t("settings.data.import")} description={t("settings.data.importDesc")}>
             <Button icon={<ArrowUpload24Regular />} onClick={() => setBackupMode("import")}>
-              {t("settings.data.import")}
+              {t("settings.data.importAction")}
             </Button>
           </SettingRow>
         </Card>

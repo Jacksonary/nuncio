@@ -47,7 +47,6 @@ export const todo: {
     "todo.add.disabledSmart": "此视图不支持直接添加任务",
 
     "todo.count.tasks": "{count} 个任务",
-    "todo.count.incomplete": "{count} 个未完成",
     "todo.count.completed": "{count} 个已完成",
 
     "todo.empty.noLists.title": "还没有任务列表",
@@ -292,7 +291,6 @@ export const todo: {
     "todo.add.disabledSmart": "This view does not support adding tasks",
 
     "todo.count.tasks": "{count} tasks",
-    "todo.count.incomplete": "{count} to do",
     "todo.count.completed": "{count} completed",
 
     "todo.empty.noLists.title": "No task lists yet",

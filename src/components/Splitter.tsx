@@ -15,6 +15,10 @@ import { useT } from "@/lib/i18n";
 import styles from "./Splitter.module.css";
 
 const STORAGE_PREFIX = "nuncio.split.";
+/** Width/height of the drag handle; keep in sync with .handle in Splitter.module.css. */
+const HANDLE_SIZE = 7;
+/** Room the secondary pane always keeps, so the handle never gets pushed out of view. */
+const SECONDARY_MIN = 200;
 
 function readStoredSize(storageKey: string, fallback: number): number {
   try {
@@ -62,6 +66,9 @@ export function Splitter({
   const horizontal = direction === "horizontal";
   const [size, setSize] = useState(() => readStoredSize(storageKey, defaultSize));
   const sizeRef = useRef(size);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const [containerSize, setContainerSize] = useState<number | null>(null);
+  const containerSizeRef = useRef<number | null>(null);
   const [dragging, setDragging] = useState(false);
   const dragRef = useRef(false);
   const startRef = useRef({ position: 0, size: 0 });
@@ -70,7 +77,29 @@ export function Splitter({
     sizeRef.current = size;
   }, [size]);
 
+  // The container can shrink without a window resize (side panels, module
+  // switches), so observe the root itself rather than listening to the window.
+  useEffect(() => {
+    const element = rootRef.current;
+    if (!element || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver((entries) => {
+      const rect = entries[0]?.contentRect;
+      if (!rect) return;
+      const next = horizontal ? rect.width : rect.height;
+      containerSizeRef.current = next;
+      // Re-clamping mid-drag would pull the pane out from under the pointer;
+      // the new limit is published when the drag ends instead.
+      if (!dragRef.current) setContainerSize(next);
+    });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [horizontal]);
+
   const clamp = (value: number) => Math.min(max, Math.max(min, value));
+
+  /** Largest primary size that still fits next to the handle and a usable secondary pane. */
+  const limitFor = (measured: number | null) =>
+    measured == null ? max : Math.min(max, Math.max(0, measured - HANDLE_SIZE - SECONDARY_MIN));
 
   const persist = () => {
     try {
@@ -81,7 +110,9 @@ export function Splitter({
   };
 
   const updateSize = (next: number) => {
-    const clamped = clamp(next);
+    // Clamp before persisting: a size chosen while the window is small should
+    // not be restored later as an overflow on the next launch.
+    const clamped = Math.min(clamp(next), limitFor(containerSizeRef.current));
     sizeRef.current = clamped;
     setSize(clamped);
   };
@@ -92,7 +123,9 @@ export function Splitter({
     dragRef.current = true;
     startRef.current = {
       position: horizontal ? event.clientX : event.clientY,
-      size: sizeRef.current,
+      // Start from what is actually on screen so a clamped stored size does
+      // not leave a dead zone before the handle begins to move.
+      size: Math.min(sizeRef.current, limitFor(containerSizeRef.current)),
     };
     setDragging(true);
     event.currentTarget.setPointerCapture(event.pointerId);
@@ -111,13 +144,18 @@ export function Splitter({
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
+    // Publish any resize observed while dragging was suppressed above.
+    setContainerSize(containerSizeRef.current);
     persist();
   };
 
-  const primaryStyle: CSSProperties = horizontal ? { width: size } : { height: size };
+  const appliedSize = Math.min(size, limitFor(containerSize));
+  const primaryStyle: CSSProperties = horizontal
+    ? { width: appliedSize }
+    : { height: appliedSize };
 
   return (
-    <div className={cn(styles.splitter, !horizontal && styles.vertical, className)}>
+    <div ref={rootRef} className={cn(styles.splitter, !horizontal && styles.vertical, className)}>
       <div className={cn(styles.primary, primaryClassName)} style={primaryStyle}>
         {primary}
       </div>

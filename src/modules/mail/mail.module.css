@@ -1049,6 +1049,9 @@
 .messageToolbar {
   flex: none;
   display: flex;
+  /* The pane is splitter-bounded, so let a narrow reader wrap the trailing
+     actions onto a second row instead of clipping them. */
+  flex-wrap: wrap;
   align-items: center;
   gap: 2px;
   padding: var(--sp-1) var(--sp-3);
@@ -1465,10 +1468,6 @@
   border-radius: var(--radius-m);
   background: var(--surface);
   overflow: hidden;
-}
-
-.threadCardMessage {
-  flex: none;
 }
 
 .threadCardLabel {

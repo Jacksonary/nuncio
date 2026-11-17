@@ -229,7 +229,7 @@ export function shiftView(
   view: CalendarView,
   anchor: Date,
   direction: 1 | -1,
-  settings: CalendarSettings,
+  _settings: CalendarSettings,
 ): Date {
   switch (view) {
     case "day":

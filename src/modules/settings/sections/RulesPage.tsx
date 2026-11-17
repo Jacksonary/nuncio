@@ -550,7 +550,6 @@ function RunRuleDialog({ rule, accounts, folders, onClose }: RunRuleDialogProps)
         value={folderId}
         onChange={setFolderId}
         options={options}
-        placeholder={t("settings.rules.targetFolder")}
       />
       {options.length === 0 ? <p className={styles.hint}>{t("settings.rules.noFolders")}</p> : null}
     </Dialog>

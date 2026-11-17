@@ -49,8 +49,3 @@
   padding: 0 5px;
   font-variant-numeric: tabular-nums;
 }
-
-.countNeutral {
-  background: var(--surface-selected);
-  color: var(--text-secondary);
-}

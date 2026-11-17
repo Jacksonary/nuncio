@@ -1,3 +1,4 @@
+import { useCallback, useEffect, useRef } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   CalendarLtr20Regular,
@@ -47,6 +48,9 @@ const STATUS_KEYS: Record<AttendeeStatus, string> = {
   delegated: "calendar.attendeeStatus.delegated",
 };
 
+const FOCUSABLE =
+  'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
 function attendeeName(attendee: Attendee): string {
   return attendee.name?.trim() || attendee.email;
 }
@@ -72,6 +76,23 @@ export function EventPeek({
   const t = useT();
   const locale = useLanguage();
   const queryClient = useQueryClient();
+  const surfaceRef = useRef<HTMLDivElement | null>(null);
+  const previousFocus = useRef<HTMLElement | null>(null);
+  // A stable callback ref keeps the last mounted branch (loading/error/content)
+  // as the focus scope without an extra wrapper element.
+  const setSurfaceRef = useCallback((node: HTMLDivElement | null) => {
+    if (node) surfaceRef.current = node;
+  }, []);
+
+  useEffect(() => {
+    previousFocus.current =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    return () => {
+      previousFocus.current?.focus?.();
+      previousFocus.current = null;
+    };
+  }, []);
+
   const query = useQuery({
     queryKey: queryKeys.event(eventId, instanceStart),
     queryFn: () => events.get(eventId, instanceStart),
@@ -101,6 +122,20 @@ export function EventPeek({
       )
     : [];
 
+  // Focus the surface on open (and again once the event arrives) so its
+  // actions are reachable; do not steal focus once it is already inside.
+  useEffect(() => {
+    const surface = surfaceRef.current;
+    if (!surface) return;
+    const active = document.activeElement;
+    if (surface.contains(active) && active !== surface) return;
+    const frame = window.requestAnimationFrame(() => {
+      const target = surface.querySelector<HTMLElement>(FOCUSABLE) ?? surface;
+      target.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [event, query.isLoading, query.isError]);
+
   return (
     <Popover
       open
@@ -115,18 +150,18 @@ export function EventPeek({
       className={styles.popover}
     >
       {query.isLoading ? (
-        <div className={styles.loading}>
+        <div ref={setSurfaceRef} tabIndex={-1} className={styles.loading}>
           <Spinner size="small" label={t("common.loading")} />
         </div>
       ) : query.isError || !event ? (
-        <div className={styles.error}>
+        <div ref={setSurfaceRef} tabIndex={-1} className={styles.error}>
           <p>{t("calendar.error.load")}</p>
           <Button size="small" onClick={() => void query.refetch()}>
             {t("calendar.error.retry")}
           </Button>
         </div>
       ) : (
-        <div className={styles.content}>
+        <div ref={setSurfaceRef} tabIndex={-1} className={styles.content}>
           <div className={styles.colorBar} style={{ background: color }} aria-hidden="true" />
           <div className={styles.header}>
             <div className={styles.titleRow}>

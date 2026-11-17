@@ -26,6 +26,8 @@ export type AuthKind = "oauth" | "password";
 export type OAuthProvider = "google" | "microsoft";
 export type Security = "tls" | "starttls" | "none";
 export type AccountState = "ok" | "syncing" | "needsReauth" | "error" | "offline" | "disabled";
+/** Who files a copy of outgoing mail into Sent. */
+export type SentCopyMode = "server" | "client";
 
 export interface ServerConfig {
   host: string;
@@ -69,6 +71,8 @@ export interface Account {
   pop3: ServerConfig | null;
   caldavUrl: string | null;
   carddavUrl: string | null;
+  /** null = automatic: the provider directory decides. */
+  sentCopy: SentCopyMode | null;
   /** Mail download window in days; 0 = everything. */
   syncWindowDays: number;
   mailEnabled: boolean;
@@ -101,6 +105,22 @@ export interface DiscoveryResult {
    * "discovery.note.authCode") that the frontend translates, or plain text.
    */
   note: string | null;
+}
+
+/**
+ * Verified provider-directory facts for an e-mail domain.
+ * `null` from the backend means the domain is not in the directory.
+ */
+export interface ProviderInfo {
+  id: string;
+  name: string;
+  caldavUrl: string | null;
+  carddavUrl: string | null;
+  /** "configurable": the provider has a web switch that defaults to off. */
+  sentCopy: SentCopyMode | "configurable";
+  /** i18n key (e.g. "discovery.note.authCode") or plain text. */
+  note: string | null;
+  oauth: OAuthProvider | null;
 }
 
 export interface OAuthResult {
@@ -140,6 +160,8 @@ export interface AccountPatch {
   pop3?: ServerConfig | null;
   caldavUrl?: string | null;
   carddavUrl?: string | null;
+  /** null = back to automatic. */
+  sentCopy?: SentCopyMode | null;
   syncWindowDays?: number;
   mailEnabled?: boolean;
   calendarEnabled?: boolean;
@@ -147,6 +169,12 @@ export interface AccountPatch {
   tasksEnabled?: boolean;
   notificationsEnabled?: boolean;
   includeInUnified?: boolean;
+}
+
+/** Which DAV services have a dedicated password stored (never the secret). */
+export interface DavPasswordStatus {
+  calendar: boolean;
+  contacts: boolean;
 }
 
 export interface ConnectionTestResult {
@@ -776,6 +804,9 @@ export type SettingsPatch = {
 /* ─────────────────────────── Sync / app state ─────────────────────── */
 
 export type SyncModule = "mail" | "calendar" | "contacts" | "tasks";
+
+/** DAV services that can carry a dedicated app password. */
+export type DavService = "calendar" | "contacts";
 export type SyncState = "idle" | "syncing" | "error" | "offline" | "needsReauth";
 
 export interface SyncStatus {

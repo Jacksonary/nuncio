@@ -396,6 +396,7 @@ describe("provider feature support", () => {
     pop3: null,
     caldavUrl: null,
     carddavUrl: null,
+    sentCopy: null,
     syncWindowDays: 90,
     mailEnabled: true,
     calendarEnabled: true,

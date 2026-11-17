@@ -108,16 +108,3 @@
   background: var(--accent-subtle);
   color: var(--accent);
 }
-
-.list {
-  display: flex;
-  align-items: center;
-  gap: inherit;
-  min-width: 0;
-  overflow-x: auto;
-  scrollbar-width: none;
-}
-
-.list::-webkit-scrollbar {
-  display: none;
-}

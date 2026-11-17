@@ -31,7 +31,6 @@ import {
   IconButton,
   Popover,
   Spinner,
-  Tooltip,
   confirm,
   toast,
 } from "@/components";
@@ -537,15 +536,13 @@ export function AttachmentStrip({ messageId, attachments }: AttachmentStripProps
               <span className={styles.attachmentName}>{attachment.filename}</span>
               <span className={styles.attachmentSize}>{formatFileSize(attachment.size)}</span>
             </button>
-            <Tooltip content={tt("mail.attachment.save")} placement="top">
-              <IconButton
-                icon={<ArrowDownload16Regular />}
-                label={tt("mail.attachment.save")}
-                size="small"
-                appearance="transparent"
-                onClick={() => void saveAttachment(attachment)}
-              />
-            </Tooltip>
+            <IconButton
+              icon={<ArrowDownload16Regular />}
+              label={tt("mail.attachment.save")}
+              size="small"
+              appearance="transparent"
+              onClick={() => void saveAttachment(attachment)}
+            />
           </div>
         ))}
       </div>

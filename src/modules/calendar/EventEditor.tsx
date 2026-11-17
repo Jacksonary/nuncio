@@ -41,7 +41,6 @@ import { compose, events, isIpcError } from "@/ipc/api";
 import { queryKeys } from "@/lib/queryKeys";
 import { useLanguage, useT } from "@/lib/i18n";
 import { formatTimeOfDay, parseTimeOfDay } from "@/lib/format";
-import { cn } from "@/lib/cn";
 import {
   addDaysLocal,
   combineDateAndMinutes,

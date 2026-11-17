@@ -3,6 +3,7 @@
  * options, folder selection, aliases and deletion.
  */
 import { useEffect, useMemo, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import {
   Add24Regular,
   Delete24Regular,
@@ -23,14 +24,17 @@ import {
   toast,
 } from "@/components";
 import { useT } from "@/lib/i18n";
-import type { Account, AccountPatch, Folder, Identity, Security } from "@/ipc/types";
+import { accounts } from "@/ipc/api";
+import type { Account, AccountPatch, Folder, Identity, SentCopyMode } from "@/ipc/types";
 import { isValidEmail } from "@/lib/format";
 import {
+  useDavPasswordStatus,
   useDeleteAccount,
   useDeleteIdentity,
   useFolders,
   useIdentities,
   useReauthAccount,
+  useSetDavPassword,
   useSetFolderSync,
   useSignatures,
   useUpdateAccount,
@@ -250,6 +254,9 @@ export function AccountDetail({
                 aria-label={t("settings.account.mail")}
               />
             </SettingRow>
+            {account.oauthProvider !== "microsoft" ? (
+              <SentCopySetting account={account} patch={patchAccount} />
+            ) : null}
             <SettingRow label={t("settings.account.calendar")} description={t("settings.account.calendarDesc")}>
               <Switch
                 checked={account.calendarEnabled}
@@ -347,6 +354,73 @@ export function AccountDetail({
 
 /* ───────────────────────── Servers ───────────────────────── */
 
+/**
+ * Provider-directory facts for an address. The server card and the Sent-copy
+ * row both need them; react-query dedupes the calls by key.
+ */
+function useProviderInfo(email: string) {
+  return useQuery({
+    queryKey: ["accountProviderInfo", email],
+    queryFn: () => accounts.providerInfo(email),
+    staleTime: 5 * 60_000,
+  });
+}
+
+/**
+ * Who files the Sent copy. Hidden for Microsoft accounts: Graph sendMail
+ * always files the copy itself, so the setting would have no effect.
+ */
+function SentCopySetting({
+  account,
+  patch,
+}: {
+  account: Account;
+  patch: (patch: AccountPatch) => void;
+}) {
+  const t = useT();
+  const providerInfo = useProviderInfo(account.email).data ?? null;
+  const value = account.sentCopy ?? "auto";
+  // "configurable" behaves like "client" (Nuncio appends) but the provider's
+  // web switch can change that, so the user has to be told.
+  const configurableHint =
+    providerInfo?.sentCopy === "configurable"
+      ? t("settings.account.sentCopyConfigurableHint", { name: providerInfo.name })
+      : null;
+  const description =
+    value === "auto"
+      ? providerInfo?.sentCopy === "server"
+        ? t("settings.account.sentCopyAutoServer", { name: providerInfo.name })
+        : t("settings.account.sentCopyAutoClient")
+      : null;
+
+  return (
+    <SettingRow
+      label={t("settings.account.sentCopy")}
+      description={
+        description || configurableHint ? (
+          <>
+            {description ? <div>{description}</div> : null}
+            {configurableHint ? <div>{configurableHint}</div> : null}
+          </>
+        ) : undefined
+      }
+    >
+      <Select
+        ariaLabel={t("settings.account.sentCopy")}
+        value={value}
+        onChange={(next) =>
+          patch({ sentCopy: next === "auto" ? null : (next as SentCopyMode) })
+        }
+        options={[
+          { value: "auto", label: t("settings.account.sentCopyAuto") },
+          { value: "server", label: t("settings.account.sentCopyServer") },
+          { value: "client", label: t("settings.account.sentCopyClient") },
+        ]}
+      />
+    </SettingRow>
+  );
+}
+
 function ServerSettingsCard({ account }: { account: Account }) {
   const t = useT();
   const updateAccount = useUpdateAccount();
@@ -355,7 +429,16 @@ function ServerSettingsCard({ account }: { account: Account }) {
   const [pop3, setPop3] = useState<ServerDraft | null>(() => (account.pop3 ? serverDraftFromConfig(account.pop3) : null));
   const [caldavUrl, setCaldavUrl] = useState(account.caldavUrl ?? "");
   const [carddavUrl, setCarddavUrl] = useState(account.carddavUrl ?? "");
+  const [caldavPassword, setCaldavPassword] = useState("");
+  const [carddavPassword, setCarddavPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [detecting, setDetecting] = useState(false);
+  // Google/Microsoft accounts sync calendars and contacts through their APIs;
+  // the DAV fields would never be read, so they are replaced by a hint.
+  const isApiMail = account.oauthProvider === "google" || account.oauthProvider === "microsoft";
+  const providerInfo = useProviderInfo(account.email).data ?? null;
+  const davStatus = useDavPasswordStatus(account.id, !isApiMail);
+  const setDavPassword = useSetDavPassword();
 
   useEffect(() => {
     setImap(account.imap ? serverDraftFromConfig(account.imap) : null);
@@ -363,6 +446,9 @@ function ServerSettingsCard({ account }: { account: Account }) {
     setPop3(account.pop3 ? serverDraftFromConfig(account.pop3) : null);
     setCaldavUrl(account.caldavUrl ?? "");
     setCarddavUrl(account.carddavUrl ?? "");
+    // Password inputs are write-only: never prefill them from a secret.
+    setCaldavPassword("");
+    setCarddavPassword("");
     setError(null);
   }, [
     account.id,
@@ -392,27 +478,82 @@ function ServerSettingsCard({ account }: { account: Account }) {
         return;
       }
     }
-    for (const [label, value] of [
-      ["CalDAV", caldavUrl],
-      ["CardDAV", carddavUrl],
-    ] as const) {
-      if (value.trim() && !/^https?:\/\//i.test(value.trim())) {
-        setError(t("settings.account.davUrlInvalid", { server: label }));
-        return;
+    if (!isApiMail) {
+      for (const [label, value] of [
+        ["CalDAV", caldavUrl],
+        ["CardDAV", carddavUrl],
+      ] as const) {
+        if (value.trim() && !/^https?:\/\//i.test(value.trim())) {
+          setError(t("settings.account.davUrlInvalid", { server: label }));
+          return;
+        }
       }
     }
-    const patch = {
+    const patch: AccountPatch = {
       imap: imap ? serverFromDraft(imap, account.email) : null,
       smtp: smtp ? serverFromDraft(smtp, account.email) : null,
       pop3: pop3 ? serverFromDraft(pop3, account.email) : null,
-      caldavUrl: caldavUrl.trim() || null,
-      carddavUrl: carddavUrl.trim() || null,
+      // Leave the stored DAV values alone for API accounts: the fields are
+      // not rendered, so sending null here would silently wipe them.
+      ...(isApiMail
+        ? {}
+        : {
+            caldavUrl: caldavUrl.trim() || null,
+            carddavUrl: carddavUrl.trim() || null,
+          }),
     };
     try {
       await updateAccount.mutateAsync({ id: account.id, patch });
+      // Only fields the user actually typed into are sent; an untouched empty
+      // field must never clear a stored secret (the "clear" action does that).
+      for (const [service, password] of [
+        ["calendar", caldavPassword.trim()],
+        ["contacts", carddavPassword.trim()],
+      ] as const) {
+        if (password) {
+          await setDavPassword.mutateAsync({ id: account.id, service, password });
+        }
+      }
+      setCaldavPassword("");
+      setCarddavPassword("");
       toast.success(t("settings.account.serversSaved"));
     } catch (err) {
       setError(describeError(err, t));
+    }
+  };
+
+  const clearDavPassword = async (service: "calendar" | "contacts", label: string) => {
+    setError(null);
+    try {
+      await setDavPassword.mutateAsync({ id: account.id, service, password: null });
+      if (service === "calendar") setCaldavPassword("");
+      else setCarddavPassword("");
+      toast.success(t("settings.account.davPasswordCleared", { server: label }));
+    } catch (err) {
+      setError(describeError(err, t));
+    }
+  };
+
+  // Fills only blank fields so a detected endpoint never overwrites a URL the
+  // user entered by hand. Saving stays an explicit action.
+  const detectDav = async () => {
+    setDetecting(true);
+    try {
+      const result = await accounts.discover(account.email);
+      let filled = false;
+      if (!caldavUrl.trim() && result.caldavUrl) {
+        setCaldavUrl(result.caldavUrl);
+        filled = true;
+      }
+      if (!carddavUrl.trim() && result.carddavUrl) {
+        setCarddavUrl(result.carddavUrl);
+        filled = true;
+      }
+      if (!filled) toast.info(t("settings.account.davDetectNothing"));
+    } catch (err) {
+      toast.error(t("settings.account.davDetectFailed"), describeError(err, t));
+    } finally {
+      setDetecting(false);
     }
   };
 
@@ -426,24 +567,93 @@ function ServerSettingsCard({ account }: { account: Account }) {
             {pop3 ? <ServerFields label="POP3" draft={pop3} onChange={setPop3} /> : null}
           </>
         ) : null}
-        <StackRow>
-          <Input
-            label="CalDAV"
-            value={caldavUrl}
-            placeholder="https://example.com/caldav/"
-            spellCheck={false}
-            onChange={(event) => setCaldavUrl(event.target.value)}
-          />
-        </StackRow>
-        <StackRow>
-          <Input
-            label="CardDAV"
-            value={carddavUrl}
-            placeholder="https://example.com/carddav/"
-            spellCheck={false}
-            onChange={(event) => setCarddavUrl(event.target.value)}
-          />
-        </StackRow>
+        {isApiMail ? (
+          <Hint>{t("settings.account.davOauthHint")}</Hint>
+        ) : (
+          <>
+            <StackRow>
+              <Input
+                label="CalDAV"
+                value={caldavUrl}
+                placeholder={providerInfo?.caldavUrl ?? "https://example.com/caldav/"}
+                spellCheck={false}
+                onChange={(event) => setCaldavUrl(event.target.value)}
+              />
+            </StackRow>
+            <StackRow>
+              <div className={styles.inlineFields}>
+                <Input
+                  type="password"
+                  label={t("settings.account.davPasswordLabel", { server: "CalDAV" })}
+                  value={caldavPassword}
+                  autoComplete="new-password"
+                  placeholder={
+                    davStatus.data?.calendar
+                      ? t("settings.account.davPasswordStored")
+                      : t("settings.account.davPasswordFallback")
+                  }
+                  onChange={(event) => setCaldavPassword(event.target.value)}
+                />
+                {davStatus.data?.calendar ? (
+                  <Button
+                    size="small"
+                    disabled={setDavPassword.isPending}
+                    onClick={() => void clearDavPassword("calendar", "CalDAV")}
+                  >
+                    {t("settings.account.davPasswordClear")}
+                  </Button>
+                ) : null}
+              </div>
+            </StackRow>
+            <StackRow>
+              <Input
+                label="CardDAV"
+                value={carddavUrl}
+                placeholder={providerInfo?.carddavUrl ?? "https://example.com/carddav/"}
+                spellCheck={false}
+                onChange={(event) => setCarddavUrl(event.target.value)}
+              />
+            </StackRow>
+            <StackRow>
+              <div className={styles.inlineFields}>
+                <Input
+                  type="password"
+                  label={t("settings.account.davPasswordLabel", { server: "CardDAV" })}
+                  value={carddavPassword}
+                  autoComplete="new-password"
+                  placeholder={
+                    davStatus.data?.contacts
+                      ? t("settings.account.davPasswordStored")
+                      : t("settings.account.davPasswordFallback")
+                  }
+                  onChange={(event) => setCarddavPassword(event.target.value)}
+                />
+                {davStatus.data?.contacts ? (
+                  <Button
+                    size="small"
+                    disabled={setDavPassword.isPending}
+                    onClick={() => void clearDavPassword("contacts", "CardDAV")}
+                  >
+                    {t("settings.account.davPasswordClear")}
+                  </Button>
+                ) : null}
+              </div>
+            </StackRow>
+            <StackRow>
+              <p className={styles.hint}>{t("settings.account.davPasswordHint")}</p>
+              {providerInfo?.caldavUrl || providerInfo?.carddavUrl ? (
+                <p className={styles.hint}>
+                  {t("settings.account.davDefaultHint", { name: providerInfo.name })}
+                </p>
+              ) : null}
+              <div className={styles.actions}>
+                <Button size="small" loading={detecting} onClick={() => void detectDav()}>
+                  {t("settings.account.davDetect")}
+                </Button>
+              </div>
+            </StackRow>
+          </>
+        )}
         <StackRow>
           {error ? <p className={styles.errorText}>{error}</p> : null}
           <div className={styles.actions}>

@@ -10,6 +10,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type KeyboardEvent as ReactKeyboardEvent,
 } from "react";
 import {
   Add16Regular,
@@ -239,6 +240,7 @@ function EditorDialog({ request }: { request: ContactEditorRequest }) {
   const [photoBusy, setPhotoBusy] = useState(false);
   const [photoError, setPhotoError] = useState<string | null>(null);
   const [dragActive, setDragActive] = useState(false);
+  const photoInputRef = useRef<HTMLInputElement | null>(null);
   const baseline = useRef<string | null>(null);
   const editInitialized = useRef(false);
   const emailRadioName = useId();
@@ -635,11 +637,30 @@ function EditorDialog({ request }: { request: ContactEditorRequest }) {
         <div className={styles.editorSection}>
           <div className={styles.editorSectionHeader}>{translate("people.editor.photo")}</div>
           <div className={styles.photoRow}>
+            <input
+              ref={photoInputRef}
+              type="file"
+              accept="image/*"
+              style={{ display: "none" }}
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                if (file) void applyPhoto(file);
+                // Allow re-selecting the same file after a failed attempt.
+                event.target.value = "";
+              }}
+            />
             <div
               className={`${styles.photoDrop} ${dragActive ? styles.photoDropActive : ""}`}
               role="button"
               tabIndex={0}
               aria-label={translate("people.editor.photoDrop")}
+              onClick={() => photoInputRef.current?.click()}
+              onKeyDown={(event: ReactKeyboardEvent<HTMLDivElement>) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  photoInputRef.current?.click();
+                }
+              }}
               onDragOver={(event) => {
                 event.preventDefault();
                 setDragActive(true);

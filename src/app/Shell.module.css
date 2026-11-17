@@ -48,13 +48,6 @@
   min-width: var(--sp-4);
 }
 
-.titleActions {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-1);
-  flex: none;
-}
-
 .workArea {
   flex: 1;
   min-height: 0;

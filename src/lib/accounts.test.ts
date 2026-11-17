@@ -16,6 +16,7 @@ function account(provider: Account["provider"], id = provider): Account {
     pop3: null,
     caldavUrl: null,
     carddavUrl: null,
+    sentCopy: null,
     syncWindowDays: 0,
     mailEnabled: provider !== "local",
     calendarEnabled: true,

@@ -14,7 +14,7 @@ import {
   toast,
 } from "@/components";
 import { calendars as calendarApi, isIpcError } from "@/ipc/api";
-import { queryKeys, queryKeyPrefixes } from "@/lib/queryKeys";
+import { queryKeyPrefixes } from "@/lib/queryKeys";
 import { useT } from "@/lib/i18n";
 import styles from "./CalendarDialogs.module.css";
 

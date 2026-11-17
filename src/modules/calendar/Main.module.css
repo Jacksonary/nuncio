@@ -44,10 +44,6 @@
   flex: none;
 }
 
-.viewTabs {
-  flex: none;
-}
-
 .content {
   flex: 1;
   min-height: 0;

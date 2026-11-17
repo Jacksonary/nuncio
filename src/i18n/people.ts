@@ -9,7 +9,6 @@ export const people: {
   "zh-CN": {
     "people.sidebar.all": "所有联系人",
     "people.sidebar.favorites": "收藏",
-    "people.sidebar.addressBooks": "通讯录",
     "people.sidebar.groupsSection": "分组",
     "people.sidebar.newGroup": "新建分组",
     "people.sidebar.groupActions": "分组操作",
@@ -223,7 +222,6 @@ export const people: {
   "en-US": {
     "people.sidebar.all": "All contacts",
     "people.sidebar.favorites": "Favorites",
-    "people.sidebar.addressBooks": "Address books",
     "people.sidebar.groupsSection": "Groups",
     "people.sidebar.newGroup": "New group",
     "people.sidebar.groupActions": "Group actions",

@@ -21,6 +21,12 @@ export interface VirtualListProps<T> {
   onEndReached?: () => void;
   ariaLabel?: string;
   role?: string;
+  /**
+   * Role for the per-row wrapper. Defaults to "listitem"; a listbox owner must
+   * pass "option" (or "presentation" when its children carry the option role)
+   * because a listbox may not own listitems.
+   */
+  itemRole?: string;
 }
 
 export function VirtualList<T>({
@@ -35,6 +41,7 @@ export function VirtualList<T>({
   onEndReached,
   ariaLabel,
   role = "list",
+  itemRole = "listitem",
 }: VirtualListProps<T>) {
   const parentRef = useRef<HTMLDivElement | null>(null);
 
@@ -82,7 +89,7 @@ export function VirtualList<T>({
               data-index={virtualRow.index}
               className={cn(styles.row, itemClassName)}
               style={{ transform: `translateY(${virtualRow.start}px)` }}
-              role="listitem"
+              role={itemRole}
             >
               {renderItem(item, virtualRow.index)}
             </div>

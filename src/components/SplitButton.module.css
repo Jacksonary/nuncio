@@ -25,13 +25,6 @@
   width: var(--control-height-lg);
 }
 
-.chevron {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 14px;
-}
-
 .primary:focus-visible,
 .menuTrigger:focus-visible {
   position: relative;

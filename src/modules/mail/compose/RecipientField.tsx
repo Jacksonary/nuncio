@@ -128,7 +128,6 @@ export function RecipientField({
           onChange={onChange}
           suggestions={suggestions}
           ariaLabel={label}
-          placeholder={value.length === 0 ? label : undefined}
           autoFocus={autoFocus}
           showAvatars={false}
           renderToken={renderToken}

@@ -18,7 +18,6 @@ export const shell = {
 
     "shell.toggleRail": "折叠或展开导航",
     "shell.moduleSwitcher": "模块切换",
-    "shell.closeSettings": "关闭设置",
 
     "shell.syncStatus": "同步状态",
     "shell.syncProgress": "正在同步 {done}/{total}",
@@ -62,12 +61,14 @@ export const shell = {
     "shell.importConfirm": "导入",
     "shell.importIcs.title": "导入日历事件",
     "shell.importIcs.choose": "选择要导入到的日历",
+    "shell.importIcs.noCalendarsTitle": "先创建一个日历",
     "shell.importIcs.noCalendars": "没有可用的日历，请先创建一个日历。",
     "shell.importIcs.done": "已导入 {count} 个事件",
     "shell.importIcs.failed": "导入日历事件失败：{message}",
 
     "shell.importVcf.title": "导入联系人",
     "shell.importVcf.choose": "选择要导入到的通讯录",
+    "shell.importVcf.noAddressBooksTitle": "先创建一个通讯录",
     "shell.importVcf.noAddressBooks": "没有可用的通讯录。",
     "shell.importVcf.done": "已导入 {count} 个联系人",
     "shell.importVcf.failed": "导入联系人失败：{message}",
@@ -105,7 +106,6 @@ export const shell = {
 
     "shell.toggleRail": "Collapse or expand navigation",
     "shell.moduleSwitcher": "Modules",
-    "shell.closeSettings": "Close settings",
 
     "shell.syncStatus": "Sync status",
     "shell.syncProgress": "Syncing {done}/{total}",
@@ -153,12 +153,14 @@ export const shell = {
     "shell.importConfirm": "Import",
     "shell.importIcs.title": "Import calendar events",
     "shell.importIcs.choose": "Choose the calendar to import into",
+    "shell.importIcs.noCalendarsTitle": "Create a calendar first",
     "shell.importIcs.noCalendars": "There are no calendars yet. Create one first.",
     "shell.importIcs.done": "Imported {count} events",
     "shell.importIcs.failed": "Could not import calendar events: {message}",
 
     "shell.importVcf.title": "Import contacts",
     "shell.importVcf.choose": "Choose the address book to import into",
+    "shell.importVcf.noAddressBooksTitle": "Create an address book first",
     "shell.importVcf.noAddressBooks": "There are no address books.",
     "shell.importVcf.done": "Imported {count} contacts",
     "shell.importVcf.failed": "Could not import contacts: {message}",

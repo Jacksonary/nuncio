@@ -202,8 +202,14 @@ function ThreadMembers({ accountId, threadId, selectedId, onSelect, showAvatars 
             .join(" ")}
           role="option"
           aria-selected={member.id === selectedId}
-          tabIndex={-1}
+          tabIndex={0}
           onClick={(event) => {
+            event.stopPropagation();
+            onSelect(member);
+          }}
+          onKeyDown={(event) => {
+            if (event.key !== "Enter" && event.key !== " ") return;
+            event.preventDefault();
             event.stopPropagation();
             onSelect(member);
           }}
@@ -469,9 +475,19 @@ export function MessageList() {
     [apply],
   );
 
+  // Bulk actions are one-shot: a successful action puts the list back into its
+  // normal state (selection mode off, nothing ticked) so the user does not
+  // need a second click to leave selection mode. A failed action keeps the
+  // selection so it can be retried without re-ticking every row.
+  const runBulk = useCallback(async (action: () => Promise<boolean>) => {
+    if (!(await action())) return;
+    setSelectionMode(false);
+    dispatchSelection({ type: "clear" });
+  }, []);
+
   const deleteMessages = useCallback(
-    async (ids: string[]) => {
-      if (ids.length === 0) return;
+    async (ids: string[]): Promise<boolean> => {
+      if (ids.length === 0) return false;
       // Queued messages are not real rows: deleting one discards it from the
       // outbox (and is never undoable).
       if (ids.some(isOutboxMessageId)) {
@@ -484,7 +500,7 @@ export function MessageList() {
           confirmLabel: tt("mail.action.delete"),
           danger: true,
         });
-        if (!ok) return;
+        if (!ok) return false;
         try {
           for (const id of ids) {
             await messagesApi.act([id], { kind: "delete", permanent: true });
@@ -493,10 +509,11 @@ export function MessageList() {
           if (messageId && ids.includes(messageId)) setActive(null);
           toast.success(tt("mail.outbox.deleted"));
           invalidateOutbox();
+          return true;
         } catch (error) {
           toast.error(tt("mail.outbox.deleteFailed"), errorText(error));
+          return false;
         }
-        return;
       }
       const permanent = isPermanentDelete(folder?.role ?? unifiedRole);
       if (mailSettings.confirmDelete || permanent) {
@@ -513,15 +530,16 @@ export function MessageList() {
           confirmLabel: tt("common.delete"),
           danger: true,
         });
-        if (!ok) return;
+        if (!ok) return false;
       }
       const removed = new Set(ids);
       const next = nextAfterRemoval(orderedIds, removed, messageId, mailSettings.autoAdvance);
       const ok = await runAction(ids, { kind: "delete", permanent }, threadMetaFor(ids));
-      if (!ok) return;
+      if (!ok) return false;
       dispatchSelection({ type: "remove", ids });
       setActive(next);
       if (next) scrollToMessage(next);
+      return true;
     },
     [
       folder?.role,
@@ -540,35 +558,34 @@ export function MessageList() {
   );
 
   const archiveMessages = useCallback(
-    async (ids: string[]) => {
-      if (ids.length === 0 || ids.some(isOutboxMessageId)) return;
+    async (ids: string[]): Promise<boolean> => {
+      if (ids.length === 0 || ids.some(isOutboxMessageId)) return false;
       const removed = new Set(ids);
       const next = nextAfterRemoval(orderedIds, removed, messageId, mailSettings.autoAdvance);
       const ok = await runAction(ids, { kind: "archive" }, threadMetaFor(ids));
-      if (!ok) return;
+      if (!ok) return false;
       dispatchSelection({ type: "remove", ids });
       setActive(next);
+      return true;
     },
     [mailSettings.autoAdvance, messageId, orderedIds, runAction, setActive, threadMetaFor],
   );
 
   const setSeen = useCallback(
-    (ids: string[], value: boolean) => {
-      void runAction(ids, { kind: "setSeen", value }, threadMetaFor(ids));
-    },
+    (ids: string[], value: boolean): Promise<boolean> =>
+      runAction(ids, { kind: "setSeen", value }, threadMetaFor(ids)),
     [runAction, threadMetaFor],
   );
 
   const setFlagged = useCallback(
-    (ids: string[], value: boolean) => {
-      void runAction(ids, { kind: "setFlagged", value }, threadMetaFor(ids));
-    },
+    (ids: string[], value: boolean): Promise<boolean> =>
+      runAction(ids, { kind: "setFlagged", value }, threadMetaFor(ids)),
     [runAction, threadMetaFor],
   );
 
   const moveMessages = useCallback(
-    async (ids: string[], targetFolderId: string) => {
-      if (ids.length === 0 || ids.some(isOutboxMessageId)) return;
+    async (ids: string[], targetFolderId: string): Promise<boolean> => {
+      if (ids.length === 0 || ids.some(isOutboxMessageId)) return false;
       const removed = new Set(ids);
       const next = nextAfterRemoval(orderedIds, removed, messageId, mailSettings.autoAdvance);
       const ok = await runAction(
@@ -576,9 +593,10 @@ export function MessageList() {
         { kind: "move", folderId: targetFolderId },
         threadMetaFor(ids),
       );
-      if (!ok) return;
+      if (!ok) return false;
       dispatchSelection({ type: "remove", ids });
       if (next) setActive(next);
+      return true;
     },
     [mailSettings.autoAdvance, messageId, orderedIds, runAction, setActive, threadMetaFor],
   );
@@ -711,7 +729,7 @@ export function MessageList() {
       try {
         const path = await saveDialog({
           defaultPath: `${safeFilename(summary.subject, tt("common.untitled"))}.eml`,
-          filters: [{ name: "E-mail", extensions: ["eml"] }],
+          filters: [{ name: tt("mail.action.saveAsFilter"), extensions: ["eml"] }],
         });
         if (!path) return;
         await messagesApi.saveEml(summary.id, path);
@@ -857,11 +875,11 @@ export function MessageList() {
         id: `move-${choice.folder.id}`,
         label: `${" ".repeat(choice.depth * 2)}${choice.folder.name || tt(folderRoleKey(choice.folder.role))}`,
         icon: <Archive16Regular />,
-        onSelect: () => void moveMessages(targets, choice.folder.id),
+        onSelect: () => void runBulk(() => moveMessages(targets, choice.folder.id)),
       });
     }
     return entries;
-  }, [folderChoices, moveMessages, summaryById, targets, tt]);
+  }, [folderChoices, moveMessages, runBulk, summaryById, targets, tt]);
 
   const contextTargets = useMemo(() => {
     if (!contextMenu) return [];
@@ -1346,31 +1364,31 @@ export function MessageList() {
               icon={<Archive16Regular />}
               label={tt("mail.action.archive")}
               size="small"
-              onClick={() => void archiveMessages(selected.ids)}
+              onClick={() => void runBulk(() => archiveMessages(selected.ids))}
             />
             <IconButton
               icon={<Delete16Regular />}
               label={tt("mail.action.delete")}
               size="small"
-              onClick={() => void deleteMessages(selected.ids)}
+              onClick={() => void runBulk(() => deleteMessages(selected.ids))}
             />
             <IconButton
               icon={<MailRead16Regular />}
               label={tt("mail.action.markRead")}
               size="small"
-              onClick={() => setSeen(selected.ids, true)}
+              onClick={() => void runBulk(() => setSeen(selected.ids, true))}
             />
             <IconButton
               icon={<MailUnread16Regular />}
               label={tt("mail.action.markUnread")}
               size="small"
-              onClick={() => setSeen(selected.ids, false)}
+              onClick={() => void runBulk(() => setSeen(selected.ids, false))}
             />
             <IconButton
               icon={<Flag16Regular />}
               label={tt("mail.action.flag")}
               size="small"
-              onClick={() => setFlagged(selected.ids, true)}
+              onClick={() => void runBulk(() => setFlagged(selected.ids, true))}
             />
             <MenuButton
               label={tt("mail.action.move")}
@@ -1528,6 +1546,10 @@ export function MessageList() {
             emptyState={emptyState}
             ariaLabel={tt("mail.list.title")}
             role="listbox"
+            // The rows themselves are the options; a listitem wrapper between
+            // the listbox and its options is an invalid ARIA tree, so the
+            // wrapper is presentational (date headers carry no role either).
+            itemRole="presentation"
             renderItem={(row: MessageRow) => {
               if (row.kind === "header") {
                 return (
@@ -1543,6 +1565,9 @@ export function MessageList() {
               const account = accountById.get(summary.accountId);
               const showAccountStripe = unifiedRole !== null || (searchText && searchScope === "all");
               const expanded = expandedThreads.has(summary.threadId);
+              const threadToggleLabel = expanded
+                ? tt("mail.list.threadCollapse")
+                : tt("mail.list.threadExpand", { count: summary.threadCount });
               const hoverActions = hoverActionButtons(summary);
               const outboxItem = isOutboxMessageId(summary.id);
               const outboxStatus = outboxItem ? parseOutboxStatus(summary.preview) : null;
@@ -1689,34 +1714,32 @@ export function MessageList() {
                           </span>
                         ) : null}
                         {summary.threadCount > 1 ? (
-                          <button
-                            type="button"
-                            className={[
-                              styles.threadBadge,
-                              expanded ? styles.threadBadgeOpen : "",
-                              summary.threadUnread > 0 ? styles.threadBadgeUnread : "",
-                            ]
-                              .filter(Boolean)
-                              .join(" ")}
-                            title={
-                              expanded
-                                ? tt("mail.list.threadCollapse")
-                                : tt("mail.list.threadExpand", { count: summary.threadCount })
-                            }
-                            aria-expanded={expanded}
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              setExpandedThreads((previous) => {
-                                const next = new Set(previous);
-                                if (next.has(summary.threadId)) next.delete(summary.threadId);
-                                else next.add(summary.threadId);
-                                return next;
-                              });
-                            }}
-                          >
-                            <ChatMultiple16Regular />
-                            {summary.threadCount}
-                          </button>
+                          <Tooltip content={threadToggleLabel}>
+                            <button
+                              type="button"
+                              className={[
+                                styles.threadBadge,
+                                expanded ? styles.threadBadgeOpen : "",
+                                summary.threadUnread > 0 ? styles.threadBadgeUnread : "",
+                              ]
+                                .filter(Boolean)
+                                .join(" ")}
+                              aria-label={threadToggleLabel}
+                              aria-expanded={expanded}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                setExpandedThreads((previous) => {
+                                  const next = new Set(previous);
+                                  if (next.has(summary.threadId)) next.delete(summary.threadId);
+                                  else next.add(summary.threadId);
+                                  return next;
+                                });
+                              }}
+                            >
+                              <ChatMultiple16Regular />
+                              {summary.threadCount}
+                            </button>
+                          </Tooltip>
                         ) : null}
                         <span className={styles.rowSpacer} />
                         <span className={styles.rowDate}>{formatListDate(summary.date)}</span>
