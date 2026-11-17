@@ -986,9 +986,15 @@ async fn poll_loop_recovers_stale_connection_without_error_status() {
 
     let inbox = folder_id(&ctx, "acc", "INBOX").await;
     assert_eq!(message_count(&ctx, &inbox).await, 1);
+
+    // Wait for the mock to actually drop the idle socket (its timeout is
+    // 400ms) *before* sampling the connection count.  Sampling first made the
+    // assertion race with the drop: on a slower scheduler the poll could find
+    // the socket still open, sync over it, and never open a new connection.
+    tokio::time::sleep(Duration::from_millis(900)).await;
     let baseline = mock.state.connection_count();
 
-    // Let the worker's socket go stale and add a message the poll must find.
+    // The worker's socket is gone by now; add a message the poll must find.
     mock.state.add_message(
         "INBOX",
         &message_raw("b@example.com", "test@example.com", "Two", "two", "two@x"),

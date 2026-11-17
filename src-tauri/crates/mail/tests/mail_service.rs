@@ -200,7 +200,16 @@ async fn lists_searches_reads_and_renders_messages() {
     assert!(!detail.remote_content_allowed);
     assert!(!detail.html.contains(" src=\"https://remote.example"));
     assert!(detail.html.contains("data-src=\"https://remote.example"));
-    assert!(detail.html.contains("nuncio://localhost/cid/"));
+    // The reader iframe is served from a Tauri custom protocol whose URL
+    // shape is platform dependent: Windows only routes `http://<scheme>.localhost`,
+    // everywhere else `nuncio://localhost`.  `MailService::cid_base` mirrors
+    // that, so the expectation has to as well.
+    let cid_prefix = if cfg!(target_os = "windows") {
+        "http://nuncio.localhost/cid/"
+    } else {
+        "nuncio://localhost/cid/"
+    };
+    assert!(detail.html.contains(cid_prefix), "html: {}", detail.html);
     assert!(detail.invite.is_some());
     let invite = detail.invite.as_ref().expect("invite");
     assert_eq!(invite.method, "REQUEST");
