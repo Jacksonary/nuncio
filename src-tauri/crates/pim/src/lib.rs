@@ -18,6 +18,7 @@
 //! shapes ([`provider::EventDelta`] / [`provider::CalendarCursor`]), the DAV
 //! XML parser ([`dav::xml`]) and the pending-operation queue.
 
+mod backend;
 pub mod contacts;
 pub mod dav;
 pub mod error;

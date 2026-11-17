@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::models::{Account, MessageSummary, NavigateTarget};
+use crate::providers::DavService;
 use crate::Result;
 
 /// Sink for backend -> frontend events (`src/ipc/api.ts` `EventPayloads`).
@@ -75,8 +76,14 @@ pub trait CredentialProvider: Send + Sync {
     /// Microsoft Graph, ...).
     async fn api_token(&self, account_id: &str, resource: TokenResource) -> Result<String>;
 
-    /// Basic auth user/password for CalDAV/CardDAV.
-    async fn dav_auth(&self, account: &Account) -> Result<(String, String)>;
+    /// Basic auth user/password for one DAV service.
+    ///
+    /// Providers may require a separate app password per service (Yandex,
+    /// for example), so the service is part of the lookup key.
+    async fn dav_auth(&self, account: &Account, service: DavService) -> Result<(String, String)>;
+
+    /// Whether a dedicated, non-empty DAV password is stored for `service`.
+    async fn has_dav_password(&self, account_id: &str, service: DavService) -> bool;
 
     /// The server rejected the credential: refresh or mark `needsReauth`.
     async fn report_auth_failure(&self, account_id: &str, resource: TokenResource);
@@ -211,10 +218,18 @@ pub mod testing {
             ))
         }
 
-        async fn dav_auth(&self, _account: &Account) -> Result<(String, String)> {
+        async fn dav_auth(
+            &self,
+            _account: &Account,
+            _service: DavService,
+        ) -> Result<(String, String)> {
             Err(crate::AppError::unsupported(
                 "no credential provider configured",
             ))
+        }
+
+        async fn has_dav_password(&self, _account_id: &str, _service: DavService) -> bool {
+            false
         }
 
         async fn report_auth_failure(&self, _account_id: &str, _resource: TokenResource) {}
@@ -297,6 +312,7 @@ mod tests {
             pop3: None,
             caldav_url: None,
             carddav_url: None,
+            sent_copy: None,
             sync_window_days: 90,
             mail_enabled: true,
             calendar_enabled: false,

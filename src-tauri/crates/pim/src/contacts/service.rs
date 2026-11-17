@@ -12,14 +12,16 @@ use chrono::Utc;
 use nuncio_core::events::emit_contacts_changed;
 use nuncio_core::models::{
     new_id, Account, AddressBook, Contact, ContactGroup, ContactListQuery, ContactPage,
-    NewPendingOp, OAuthProvider, PendingOp, ProviderKind, SyncModule,
+    NewPendingOp, PendingOp, SyncModule,
 };
+use nuncio_core::providers::DavService;
 use nuncio_core::repo::{self, contacts as contacts_repo, sync_state};
 use nuncio_core::CoreContext;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
+use crate::backend::{backend_for, is_implicit_dav_auth_failure, Backend};
 use crate::contacts::dav::{parse_vcf, write_vcf, CardDavProvider};
 use crate::contacts::google::GoogleContactsProvider;
 use crate::contacts::graph::GraphContactsProvider;
@@ -103,25 +105,6 @@ fn charset_hint(bytes: &[u8]) -> Option<&'static encoding_rs::Encoding> {
     encoding_rs::Encoding::for_label(label.as_bytes())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Backend {
-    Google,
-    Graph,
-    Dav,
-    Local,
-    Unsupported,
-}
-
-fn backend_for(account: &Account) -> Backend {
-    match account.oauth_provider {
-        Some(OAuthProvider::Google) => Backend::Google,
-        Some(OAuthProvider::Microsoft) => Backend::Graph,
-        None if account.provider == ProviderKind::Local => Backend::Local,
-        None if account.carddav_url.is_some() => Backend::Dav,
-        _ => Backend::Unsupported,
-    }
-}
-
 /// Contact service handle shared by `PimService`.
 #[derive(Clone)]
 pub struct ContactsService {
@@ -194,7 +177,7 @@ impl ContactsService {
     }
 
     fn provider_for(&self, account: &Account) -> Option<Box<dyn ContactProvider>> {
-        match backend_for(account) {
+        match backend_for(account, DavService::Contacts) {
             Backend::Google => Some(Box::new(GoogleContactsProvider::new(self.http.clone()))),
             Backend::Graph => Some(Box::new(GraphContactsProvider::new(self.http.clone()))),
             Backend::Dav => Some(Box::new(CardDavProvider::new(self.http.clone()))),
@@ -203,7 +186,7 @@ impl ContactsService {
     }
 
     fn provider_name(&self, account: &Account) -> Option<&'static str> {
-        match backend_for(account) {
+        match backend_for(account, DavService::Contacts) {
             Backend::Google => Some("google"),
             Backend::Graph => Some("graph"),
             Backend::Dav => Some("carddav"),
@@ -250,6 +233,33 @@ impl ContactsService {
                 Ok(())
             }
             Err(error) => {
+                // CardDAV with a directory URL and no dedicated password is
+                // implicit: a rejected mail password is expected, not a
+                // sign-in problem.
+                if matches!(error, AppError::Auth(_))
+                    && backend_for(&account, DavService::Contacts) == Backend::Dav
+                {
+                    let dedicated = self
+                        .ctx
+                        .creds
+                        .has_dav_password(&account.id, DavService::Contacts)
+                        .await;
+                    if is_implicit_dav_auth_failure(
+                        &account,
+                        DavService::Contacts,
+                        dedicated,
+                        &error,
+                    ) {
+                        debug!(
+                            account_id = %account.id,
+                            "contacts needs its own password for this provider; set it in account settings"
+                        );
+                        self.ctx
+                            .sync_status
+                            .finish(&account.id, SyncModule::Contacts);
+                        return Ok(());
+                    }
+                }
                 match &error {
                     AppError::Auth(_) => self
                         .ctx
@@ -300,7 +310,7 @@ impl ContactsService {
             }
         }
         // Google's "other contacts" only feed recipient suggestions.
-        if backend_for(account) == Backend::Google {
+        if backend_for(account, DavService::Contacts) == Backend::Google {
             match provider.other_contacts(account).await {
                 Ok(addresses) if !addresses.is_empty() => {
                     let records = addresses;
@@ -666,7 +676,7 @@ impl ContactsService {
             })
             .await?;
         let account = self.load_account(&contact.account_id).await?;
-        if backend_for(&account) == Backend::Google {
+        if backend_for(&account, DavService::Contacts) == Backend::Google {
             let op = ContactOp::Favorite {
                 contact_id: contact.id.clone(),
                 value,
@@ -712,7 +722,7 @@ impl ContactsService {
         let account = self.load_account(&group.account_id).await?;
         // Category-based providers (Graph, CardDAV) only need local groups;
         // Google has real contact groups and must create them remotely.
-        if backend_for(&account) == Backend::Google {
+        if backend_for(&account, DavService::Contacts) == Backend::Google {
             let op = ContactOp::GroupCreate {
                 group_id: group.id.clone(),
             };
@@ -748,7 +758,7 @@ impl ContactsService {
             .await?;
         let account = self.load_account(&group.account_id).await?;
         if self.provider_name(&account).is_some() {
-            if backend_for(&account) == Backend::Google {
+            if backend_for(&account, DavService::Contacts) == Backend::Google {
                 let op = ContactOp::GroupRename {
                     group_id: group.id.clone(),
                     previous_name: previous.name.clone(),
@@ -903,7 +913,7 @@ impl ContactsService {
         let (contacts, book) = saved;
         let account = self.load_account(&book.account_id).await?;
         if self.provider_name(&account).is_some() {
-            if backend_for(&account) == Backend::Google {
+            if backend_for(&account, DavService::Contacts) == Backend::Google {
                 let mut group_ids: Vec<String> = contacts
                     .iter()
                     .flat_map(|contact| contact.group_ids.iter().cloned())

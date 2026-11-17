@@ -1288,6 +1288,29 @@ async fn graph_sync_account(ctx: &CoreContext, account_id: &str) -> Result<()> {
         None => {
             ctx.sync_status
                 .finish(&account.id, nuncio_core::models::SyncModule::Mail);
+            // A completed Graph sync proves the credential works, so clear any
+            // stale error left on the account row.  Without this, an IMAP
+            // failure recorded before the mailbox moved to Graph (or a single
+            // transient 401) kept the sidebar showing "sign-in expired"
+            // forever: only the IMAP worker ever reset the state, and a Graph
+            // account never runs one.
+            if account.state != AccountState::Ok {
+                let id = account.id.clone();
+                if let Err(error) = ctx
+                    .db
+                    .write(move |db| {
+                        repo::accounts::update_state(db, &id, AccountState::Ok, None)
+                    })
+                    .await
+                {
+                    debug!(%error, account = %account.id, "cannot clear the account state");
+                } else {
+                    events::emit_accounts_changed(
+                        ctx.events.as_ref(),
+                        vec![account.id.clone()],
+                    );
+                }
+            }
             info!(
                 account = %account.id,
                 folders = targets.len(),

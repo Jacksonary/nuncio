@@ -46,6 +46,8 @@ pub const SETTINGS_GOOGLE_SECRET_KEY: &str = "settings:google_client_secret";
 /// backups.
 pub const ACCOUNT_KEY_SUFFIXES: &[&str] = &[
     "password",
+    "caldav_password",
+    "carddav_password",
     "refresh_token",
     "refresh_token:outlook",
     "refresh_token:graph",
@@ -64,6 +66,27 @@ pub fn account_key(account_id: &str, suffix: &str) -> String {
 /// `account:<id>:password`
 pub fn password_key(account_id: &str) -> String {
     account_key(account_id, "password")
+}
+
+/// `account:<id>:caldav_password`
+pub fn caldav_password_key(account_id: &str) -> String {
+    account_key(account_id, "caldav_password")
+}
+
+/// `account:<id>:carddav_password`
+pub fn carddav_password_key(account_id: &str) -> String {
+    account_key(account_id, "carddav_password")
+}
+
+/// Dedicated password key for one DAV service.
+///
+/// Some providers issue one app password per purpose; a single mail app
+/// password is rejected by their CalDAV/CardDAV endpoints.
+pub fn dav_password_key(account_id: &str, service: nuncio_core::providers::DavService) -> String {
+    match service {
+        nuncio_core::providers::DavService::Calendar => caldav_password_key(account_id),
+        nuncio_core::providers::DavService::Contacts => carddav_password_key(account_id),
+    }
 }
 
 /// `account:<id>:refresh_token`
@@ -583,6 +606,16 @@ mod tests {
     #[test]
     fn account_key_helpers() {
         assert_eq!(password_key("x"), "account:x:password");
+        assert_eq!(caldav_password_key("x"), "account:x:caldav_password");
+        assert_eq!(carddav_password_key("x"), "account:x:carddav_password");
+        assert_eq!(
+            dav_password_key("x", nuncio_core::providers::DavService::Calendar),
+            "account:x:caldav_password"
+        );
+        assert_eq!(
+            dav_password_key("x", nuncio_core::providers::DavService::Contacts),
+            "account:x:carddav_password"
+        );
         assert_eq!(refresh_key("x"), "account:x:refresh_token");
         assert_eq!(
             account_key("x", "refresh_token:graph"),

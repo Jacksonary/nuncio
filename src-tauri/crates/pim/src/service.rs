@@ -13,9 +13,10 @@ use chrono::{Duration, Utc};
 use nuncio_core::events::{emit_calendar_changed, emit_op_failed};
 use nuncio_core::models::{
     new_id, Account, Address, Attendee, AttendeeRole, AttendeeStatus, Calendar, CalendarEvent,
-    EventInput, EventInstance, EventStatus, NewPendingOp, OAuthProvider, PendingOp, PendingOpState,
-    ProviderKind, RecurrenceEditScope, StoredEvent, SyncModule,
+    EventInput, EventInstance, EventStatus, NewPendingOp, PendingOp, PendingOpState,
+    RecurrenceEditScope, StoredEvent, SyncModule,
 };
+use nuncio_core::providers::DavService;
 use nuncio_core::repo::{self, events as events_repo, pending_ops, reminder_state};
 use nuncio_core::traits::MailSender;
 use nuncio_core::CoreContext;
@@ -23,6 +24,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+use crate::backend::{backend_for, is_implicit_dav_auth_failure, Backend};
 use crate::contacts::ContactsService;
 use crate::dav::{DavClient, DavKind, DavProvider};
 use crate::error::{invalid, unsupported, AppError, Result};
@@ -39,33 +41,6 @@ use crate::util::{
     MAX_OCCURRENCES_PER_SERIES,
 };
 use crate::webcal;
-
-/// Which provider backend an account uses for calendars.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Backend {
-    Google,
-    Graph,
-    Dav,
-    Local,
-    Unsupported,
-}
-
-fn backend_for(account: &Account) -> Backend {
-    match account.oauth_provider {
-        Some(OAuthProvider::Google) => Backend::Google,
-        Some(OAuthProvider::Microsoft) => Backend::Graph,
-        None if account.provider == ProviderKind::Local => Backend::Local,
-        None if account.caldav_url.is_some()
-            || matches!(
-                account.provider,
-                ProviderKind::Icloud | ProviderKind::Yahoo | ProviderKind::Imap
-            ) =>
-        {
-            Backend::Dav
-        }
-        _ => Backend::Unsupported,
-    }
-}
 
 struct Inner {
     ctx: CoreContext,
@@ -426,7 +401,13 @@ impl PimService {
                 break;
             }
             if let Err(error) = self.sync_calendar_account(&account_id, false).await {
-                debug!(account_id = %account_id, %error, "periodic calendar sync failed");
+                // An account whose backend cannot serve calendars at all (a
+                // plain IMAP mailbox with no CalDAV URL, for instance) would
+                // otherwise log the same "provider does not support this
+                // operation" every poll for the lifetime of the process.
+                if !matches!(error, AppError::Unsupported(_)) {
+                    debug!(account_id = %account_id, %error, "periodic calendar sync failed");
+                }
             }
             let minutes = self
                 .inner
@@ -596,7 +577,7 @@ impl PimService {
             .current()
             .calendar
             .default_reminder_minutes as i32;
-        match backend_for(account) {
+        match backend_for(account, DavService::Calendar) {
             Backend::Google => Some(Box::new(GoogleProvider::new(
                 self.inner.http.clone(),
                 default_reminder,
@@ -612,7 +593,7 @@ impl PimService {
 
     fn is_provider(&self, account: &Account) -> bool {
         matches!(
-            backend_for(account),
+            backend_for(account, DavService::Calendar),
             Backend::Google | Backend::Graph | Backend::Dav
         )
     }
@@ -671,7 +652,7 @@ impl PimService {
             .ctx
             .sync_status
             .begin(&account.id, SyncModule::Calendar, None);
-        let result = match backend_for(&account) {
+        let result = match backend_for(&account, DavService::Calendar) {
             Backend::Local => self.sync_webcal_calendars(&account, force_webcal).await,
             Backend::Unsupported => Ok(()),
             Backend::Google | Backend::Graph | Backend::Dav => {
@@ -688,6 +669,48 @@ impl PimService {
                 Ok(())
             }
             Err(error) => {
+                // "This account has no calendar backend" is not a sync failure.
+                // `backend_for` already returns Unsupported for most of these,
+                // but the DAV layer can still surface one (a provider without a
+                // directory URL, a server with no calendar collections).
+                // Reporting that as an error kept the sidebar on "sync error"
+                // forever for an account that will never have calendars.
+                if matches!(error, AppError::Unsupported(_)) {
+                    self.inner
+                        .ctx
+                        .sync_status
+                        .finish(&account.id, SyncModule::Calendar);
+                    return Ok(());
+                }
+                // An implicit DAV endpoint (directory URL + reused mail
+                // password) may reject that password; that is not a sign-in
+                // problem and must not turn the whole account red.
+                if matches!(error, AppError::Auth(_))
+                    && backend_for(&account, DavService::Calendar) == Backend::Dav
+                {
+                    let dedicated = self
+                        .inner
+                        .ctx
+                        .creds
+                        .has_dav_password(&account.id, DavService::Calendar)
+                        .await;
+                    if is_implicit_dav_auth_failure(
+                        &account,
+                        DavService::Calendar,
+                        dedicated,
+                        &error,
+                    ) {
+                        debug!(
+                            account_id = %account.id,
+                            "calendar needs its own password for this provider; set it in account settings"
+                        );
+                        self.inner
+                            .ctx
+                            .sync_status
+                            .finish(&account.id, SyncModule::Calendar);
+                        return Ok(());
+                    }
+                }
                 match &error {
                     AppError::Auth(_) | AppError::Network(_) => {
                         if matches!(error, AppError::Auth(_)) {
@@ -1216,13 +1239,13 @@ impl PimService {
             normalize_color(color).ok_or_else(|| invalid("invalid calendar color"))?
         };
         let account = self.load_account(account_id).await?;
-        if backend_for(&account) == Backend::Unsupported {
+        if backend_for(&account, DavService::Calendar) == Backend::Unsupported {
             return Err(unsupported("this account has no calendar provider"));
         }
         if !account.calendar_enabled {
             return Err(invalid("calendar is disabled for this account"));
         }
-        let is_local = backend_for(&account) == Backend::Local;
+        let is_local = backend_for(&account, DavService::Calendar) == Backend::Local;
         let account_id = account.id.clone();
         let calendar_name = name.to_string();
         let calendar_color = color.clone();
@@ -1500,7 +1523,7 @@ impl PimService {
         let count = written.len() as u32;
         if self.is_provider(&account) {
             let groups = group_imported_components(written);
-            let is_dav = backend_for(&account) == Backend::Dav;
+            let is_dav = backend_for(&account, DavService::Calendar) == Backend::Dav;
             for group in groups {
                 self.enqueue_import_group(&account, &group, is_dav).await?;
             }
@@ -1856,7 +1879,8 @@ impl PimService {
         let stored = self.load_event(event_id).await?;
         let (calendar, account) = self.validate_input(&input).await?;
         if calendar.id != stored.event.calendar_id
-            && (backend_for(&account) != Backend::Local || stored.event.recurrence.is_some())
+            && (backend_for(&account, DavService::Calendar) != Backend::Local
+                || stored.event.recurrence.is_some())
         {
             return Err(unsupported(
                 "moving events between calendars is only supported for non-recurring local events",
@@ -2550,7 +2574,10 @@ impl PimService {
         if stored.remote_id.is_none()
             && stored.href.is_none()
             && account.mail_enabled
-            && !matches!(backend_for(&account), Backend::Google | Backend::Graph)
+            && !matches!(
+                backend_for(&account, DavService::Calendar),
+                Backend::Google | Backend::Graph
+            )
             && stored.event.organizer.is_some()
         {
             let _ = self
@@ -2952,7 +2979,7 @@ impl PimService {
                 };
                 let remote = self.remote_for(&calendar, &mapping);
                 let mut created_series = false;
-                if backend_for(&account) == Backend::Dav {
+                if backend_for(&account, DavService::Calendar) == Backend::Dav {
                     let calendar_id = event.event.calendar_id.clone();
                     let uid = event.event.uid.clone();
                     let series = self
@@ -2977,7 +3004,8 @@ impl PimService {
                 // the new event without waiting for the next sync.
                 self.persist_created_remote_id(&account, &remote, &event)
                     .await;
-                if *notify_attendees && backend_for(&account) == Backend::Dav {
+                if *notify_attendees && backend_for(&account, DavService::Calendar) == Backend::Dav
+                {
                     self.send_itip_request(&account, &event.event, false).await;
                 }
             }
@@ -3031,7 +3059,8 @@ impl PimService {
                         *notify_attendees,
                     )
                     .await?;
-                if *notify_attendees && backend_for(&account) == Backend::Dav {
+                if *notify_attendees && backend_for(&account, DavService::Calendar) == Backend::Dav
+                {
                     // CalDAV providers do not send iTIP themselves; deliver
                     // REQUEST/UPDATE to attendees over the account's mail.
                     if *scope == RecurrenceEditScope::This {
@@ -3066,7 +3095,8 @@ impl PimService {
                         *notify_attendees,
                     )
                     .await?;
-                if *notify_attendees && backend_for(&account) == Backend::Dav {
+                if *notify_attendees && backend_for(&account, DavService::Calendar) == Backend::Dav
+                {
                     self.send_itip_cancel(&account, &current.event).await;
                 }
             }
@@ -3080,7 +3110,9 @@ impl PimService {
                 let (current, series, calendar) = self
                     .load_series_context_or_snapshot(event_id, snapshot)
                     .await?;
-                if current.remote_id.is_none() && backend_for(&account) != Backend::Dav {
+                if current.remote_id.is_none()
+                    && backend_for(&account, DavService::Calendar) != Backend::Dav
+                {
                     return Err(AppError::conflict("event is not synced yet"));
                 }
                 if current.remote_id.is_none() && current.href.is_none() {
@@ -3103,7 +3135,10 @@ impl PimService {
                     .await?;
                 if *send_reply
                     && account.mail_enabled
-                    && !matches!(backend_for(&account), Backend::Google | Backend::Graph)
+                    && !matches!(
+                        backend_for(&account, DavService::Calendar),
+                        Backend::Google | Backend::Graph
+                    )
                     && current.event.organizer.is_some()
                 {
                     self.send_itip_reply(&account, &current, *response, comment.as_deref())
@@ -3414,7 +3449,7 @@ impl PimService {
         if !account.calendar_enabled {
             return Err(invalid("calendar is disabled for this account"));
         }
-        if backend_for(&account) == Backend::Unsupported {
+        if backend_for(&account, DavService::Calendar) == Backend::Unsupported {
             return Err(unsupported("this account has no calendar provider"));
         }
         if input.all_day {
@@ -3482,7 +3517,7 @@ impl PimService {
         uid: &str,
         calendar: &mut Calendar,
     ) -> Result<Option<(Option<String>, Option<String>)>> {
-        match backend_for(account) {
+        match backend_for(account, DavService::Calendar) {
             Backend::Google => {
                 let client = crate::google::GoogleClient::new(self.inner.http.clone());
                 let mappings = self.mappings_for_account(&account.id).await?;
@@ -3542,7 +3577,7 @@ impl PimService {
         calendar: &RemoteCalendar,
         stored: &StoredEvent,
     ) {
-        let found = match backend_for(account) {
+        let found = match backend_for(account, DavService::Calendar) {
             Backend::Google => {
                 let client = crate::google::GoogleClient::new(self.inner.http.clone());
                 match client
@@ -3705,7 +3740,11 @@ impl PimService {
             tested = true;
         }
         if account.carddav_url.is_some() {
-            let client = DavClient::new(self.inner.http.clone(), account.clone());
+            let client = DavClient::for_service(
+                self.inner.http.clone(),
+                account.clone(),
+                DavService::Contacts,
+            );
             client.discover_home(DavKind::AddressBook).await?;
             tested = true;
         }
@@ -3717,7 +3756,11 @@ impl PimService {
         if account.carddav_url.is_none() {
             return Ok(false);
         }
-        let client = DavClient::new(self.inner.http.clone(), account.clone());
+        let client = DavClient::for_service(
+            self.inner.http.clone(),
+            account.clone(),
+            DavService::Contacts,
+        );
         client
             .discover_home(DavKind::AddressBook)
             .await

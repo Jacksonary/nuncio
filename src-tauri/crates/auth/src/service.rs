@@ -15,6 +15,7 @@ use nuncio_core::models::{
     Account, AccountState, AdvancedSettingsPatch, AppSettings, AuthKind, DiscoveryResult,
     NewAccountInput, OAuthProvider, OAuthResult, ProviderKind, SettingsPatch,
 };
+use nuncio_core::providers::DavService;
 use nuncio_core::repo;
 use nuncio_core::traits::{CredentialProvider, EventSink, MailAuth, TokenResource};
 use nuncio_core::{Db, Paths, Result, SettingsService};
@@ -971,6 +972,31 @@ impl AuthService {
             .set(&secrets::password_key(account_id), password)
     }
 
+    /// Store or clear the dedicated password for one DAV service.
+    ///
+    /// `None`, an empty string or whitespace clears it, which returns the
+    /// account to "reuse the mail password" behaviour.
+    pub fn set_dav_password(
+        &self,
+        account_id: &str,
+        service: DavService,
+        password: Option<&str>,
+    ) -> Result<()> {
+        let key = secrets::dav_password_key(account_id, service);
+        match password.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(password) => self.secrets.set(&key, password),
+            None => self.secrets.delete(&key),
+        }
+    }
+
+    /// Whether a dedicated DAV password is stored for `service`.
+    pub fn dav_password_stored(&self, account_id: &str, service: DavService) -> bool {
+        matches!(
+            self.secrets.get(&secrets::dav_password_key(account_id, service)),
+            Ok(Some(value)) if !value.trim().is_empty()
+        )
+    }
+
     /// Remove every secret belonging to an account and drop cached tokens.
     pub fn delete_account_secrets(&self, account_id: &str) -> Result<()> {
         self.secrets.delete_prefix(account_id)?;
@@ -1192,9 +1218,22 @@ impl CredentialProvider for AuthService {
         Ok(token.value)
     }
 
-    async fn dav_auth(&self, account: &Account) -> Result<(String, String)> {
-        match self.secrets.get(&secrets::password_key(&account.id))? {
-            Some(password) if !password.is_empty() => Ok((username_for(account), password)),
+    async fn dav_auth(&self, account: &Account, service: DavService) -> Result<(String, String)> {
+        // A dedicated per-service app password always wins; many providers
+        // issue one password per purpose (mail / calendar / contacts).
+        let dedicated = self
+            .secrets
+            .get(&secrets::dav_password_key(&account.id, service))?
+            .filter(|password| !password.trim().is_empty());
+        let password = match dedicated {
+            Some(password) => Some(password),
+            None => self
+                .secrets
+                .get(&secrets::password_key(&account.id))?
+                .filter(|password| !password.is_empty()),
+        };
+        match password {
+            Some(password) => Ok((username_for(account), password)),
             _ if account.auth_kind == AuthKind::Oauth => Err(AppError::unsupported(
                 "CalDAV/CardDAV basic auth is not available for OAuth accounts",
             )),
@@ -1205,6 +1244,10 @@ impl CredentialProvider for AuthService {
         }
     }
 
+    async fn has_dav_password(&self, account_id: &str, service: DavService) -> bool {
+        self.dav_password_stored(account_id, service)
+    }
+
     async fn report_auth_failure(&self, account_id: &str, resource: TokenResource) {
         let account = match self.load_account(account_id).await {
             Ok(account) => account,
@@ -1213,6 +1256,21 @@ impl CredentialProvider for AuthService {
                 return;
             }
         };
+
+        // DAV credentials are per service and may legitimately differ from the
+        // mail credential (Yandex app passwords).  A rejected DAV password must
+        // not flag the whole account as needing re-authentication or throw away
+        // a working mail token; PIM decides how to surface it.
+        if resource == TokenResource::Dav {
+            if let Some(provider) = account.oauth_provider {
+                self.tokens.invalidate(account_id, provider, resource);
+            }
+            tracing::debug!(
+                account_id,
+                "DAV credential rejected; account state and mail credentials left unchanged"
+            );
+            return;
+        }
 
         let provider = account.oauth_provider;
         match provider {
@@ -1304,6 +1362,7 @@ mod tests {
             pop3: None,
             caldav_url: None,
             carddav_url: None,
+            sent_copy: None,
             sync_window_days: 90,
             mail_enabled: true,
             calendar_enabled: true,
@@ -1405,7 +1464,10 @@ mod tests {
             other => panic!("unexpected auth: {other:?}"),
         }
 
-        let (username, password) = service.dav_auth(&account).await.expect("dav auth");
+        let (username, password) = service
+            .dav_auth(&account, DavService::Calendar)
+            .await
+            .expect("dav auth");
         assert_eq!(username, "pw@example.com");
         assert_eq!(password, "s3cret");
 
@@ -1413,7 +1475,69 @@ mod tests {
             .delete_account_secrets("pw")
             .expect("delete secrets");
         assert!(service.mail_auth(&account).await.is_err());
-        assert!(service.dav_auth(&account).await.is_err());
+        assert!(service
+            .dav_auth(&account, DavService::Calendar)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn dav_auth_prefers_the_dedicated_password_per_service() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (service, _) = service(dir.path());
+        let account = test_account("dav", AuthKind::Password, None);
+        insert_account(&service, &account).await;
+        service
+            .set_password("dav", "mail-pw")
+            .expect("set password");
+        service
+            .set_dav_password("dav", DavService::Calendar, Some("calendar-pw"))
+            .expect("set caldav password");
+        service
+            .set_dav_password("dav", DavService::Contacts, Some("contacts-pw"))
+            .expect("set carddav password");
+
+        assert_eq!(
+            service
+                .dav_auth(&account, DavService::Calendar)
+                .await
+                .expect("caldav auth")
+                .1,
+            "calendar-pw"
+        );
+        assert_eq!(
+            service
+                .dav_auth(&account, DavService::Contacts)
+                .await
+                .expect("carddav auth")
+                .1,
+            "contacts-pw"
+        );
+        assert!(service.has_dav_password("dav", DavService::Calendar).await);
+        assert!(service.has_dav_password("dav", DavService::Contacts).await);
+
+        // Clearing one service falls back to the mail password and leaves the
+        // other service's dedicated password alone.
+        service
+            .set_dav_password("dav", DavService::Calendar, Some("  "))
+            .expect("clear caldav password");
+        assert!(!service.has_dav_password("dav", DavService::Calendar).await);
+        assert_eq!(
+            service
+                .dav_auth(&account, DavService::Calendar)
+                .await
+                .expect("caldav fallback")
+                .1,
+            "mail-pw"
+        );
+        assert_eq!(
+            service
+                .dav_auth(&account, DavService::Contacts)
+                .await
+                .expect("carddav stays")
+                .1,
+            "contacts-pw"
+        );
     }
 
     #[tokio::test]
@@ -1562,6 +1686,68 @@ mod tests {
 
     fn events_name() -> &'static str {
         nuncio_core::events::ACCOUNTS_CHANGED
+    }
+
+    #[tokio::test]
+    async fn report_auth_failure_dav_leaves_a_password_account_untouched() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (service, events) = service(dir.path());
+        let account = test_account("dav-bad", AuthKind::Password, None);
+        insert_account(&service, &account).await;
+        service
+            .set_password("dav-bad", "mail-pw")
+            .expect("set password");
+
+        service
+            .report_auth_failure("dav-bad", TokenResource::Dav)
+            .await;
+
+        let stored = service.load_account("dav-bad").await.expect("account");
+        assert_eq!(stored.state, AccountState::Ok);
+        assert_eq!(stored.state_message, None);
+        assert!(events.is_empty());
+        // The mail credential still works; only the DAV service failed.
+        assert!(service.mail_auth(&account).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn deleting_an_account_removes_both_dav_secrets() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (service, _) = service(dir.path());
+        let account = test_account("dav-del", AuthKind::Password, None);
+        insert_account(&service, &account).await;
+        service
+            .set_password("dav-del", "mail-pw")
+            .expect("password");
+        service
+            .set_dav_password("dav-del", DavService::Calendar, Some("cal-pw"))
+            .expect("caldav password");
+        service
+            .set_dav_password("dav-del", DavService::Contacts, Some("card-pw"))
+            .expect("carddav password");
+
+        service
+            .delete_account_secrets("dav-del")
+            .expect("delete secrets");
+
+        assert!(
+            !service
+                .has_dav_password("dav-del", DavService::Calendar)
+                .await
+        );
+        assert!(
+            !service
+                .has_dav_password("dav-del", DavService::Contacts)
+                .await
+        );
+        assert!(service
+            .dav_auth(&account, DavService::Calendar)
+            .await
+            .is_err());
+        assert!(service
+            .dav_auth(&account, DavService::Contacts)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

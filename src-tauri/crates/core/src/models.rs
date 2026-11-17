@@ -171,6 +171,40 @@ impl FromStr for AuthKind {
     }
 }
 
+/// Who is responsible for filing a copy of sent mail into the Sent folder.
+///
+/// This is the user-facing account setting; `None` on an account means
+/// "automatic" and is resolved by `providers::server_files_sent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SentCopyMode {
+    Server,
+    Client,
+}
+
+impl SentCopyMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Server => "server",
+            Self::Client => "client",
+        }
+    }
+}
+
+impl FromStr for SentCopyMode {
+    type Err = AppError;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "server" => Ok(Self::Server),
+            "client" => Ok(Self::Client),
+            other => Err(AppError::invalid_input(format!(
+                "unknown sent copy mode: {other}"
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum OAuthProvider {
@@ -440,6 +474,9 @@ pub struct Account {
     pub pop3: Option<ServerConfig>,
     pub caldav_url: Option<String>,
     pub carddav_url: Option<String>,
+    /// `None` means automatic (see `providers::server_files_sent`).
+    #[serde(default)]
+    pub sent_copy: Option<SentCopyMode>,
     pub sync_window_days: u32,
     pub mail_enabled: bool,
     pub calendar_enabled: bool,
@@ -575,6 +612,11 @@ pub struct AccountPatch {
         deserialize_with = "deserialize_double_option"
     )]
     pub carddav_url: Option<Option<String>>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_double_option"
+    )]
+    pub sent_copy: Option<Option<SentCopyMode>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync_window_days: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]

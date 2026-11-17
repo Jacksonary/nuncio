@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use nuncio_core::models::{
     new_id, Account, AuthKind, CalendarEvent, RecurrenceEditScope, StoredEvent,
 };
+use nuncio_core::providers::DavService;
 use nuncio_core::traits::{CredentialProvider, MailAuth, TokenResource};
 use nuncio_core::{AppError, CoreContext, Paths, Result};
 use nuncio_pim::dav::DavClient;
@@ -27,8 +28,12 @@ impl CredentialProvider for TestCreds {
         Err(AppError::unsupported("no oauth"))
     }
 
-    async fn dav_auth(&self, _account: &Account) -> Result<(String, String)> {
+    async fn dav_auth(&self, _account: &Account, _service: DavService) -> Result<(String, String)> {
         Ok(("user".into(), "password".into()))
+    }
+
+    async fn has_dav_password(&self, _account_id: &str, _service: DavService) -> bool {
+        false
     }
 
     async fn report_auth_failure(&self, _account_id: &str, _resource: TokenResource) {}

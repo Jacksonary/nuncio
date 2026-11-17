@@ -1372,6 +1372,79 @@ async fn server_search_hits_are_merged_with_the_local_index() {
 }
 
 #[tokio::test]
+async fn server_search_is_skipped_for_providers_with_broken_text_search() {
+    // QQ accepts UID SEARCH but always answers 0 hits. The mock here answers
+    // every UID, so the search term below is deliberately absent from the
+    // message: only a server query could surface it.
+    let imap = MockImap::start_with_folders(&["UIDPLUS"], &[("INBOX", &["\\Inbox"])]).await;
+    imap.state.add_message(
+        "INBOX",
+        &message_raw(
+            "Alice <alice@example.com>",
+            "test@qq.com",
+            "Greeting",
+            "hello world",
+            "qq@example.com",
+        ),
+    );
+    let ctx = context(
+        StaticCreds::password("test@qq.com", "secret"),
+        Arc::new(RecordingNotifier::default()),
+    )
+    .await;
+    let account = account(
+        "acc",
+        "test@qq.com",
+        Some(server(imap.addr.port())),
+        None,
+        None,
+    );
+    insert_account(&ctx, &account).await;
+    sync_once(&ctx, &account).await;
+    let service = MailService::new(ctx.clone());
+
+    let mut search = SearchQuery::text("zzznotpresent");
+    search.include_server = true;
+
+    // Control: the fixture would answer this criteria, so an empty page below
+    // means the provider gate skipped the account rather than a dead server.
+    let inbox_id = folder_id(&ctx, "acc", "INBOX").await;
+    let inbox = {
+        let id = inbox_id.clone();
+        ctx.db
+            .read(move |db| repo::folders::get(db, &id))
+            .await
+            .expect("folder")
+            .expect("inbox")
+    };
+    let criteria = nuncio_mail::sync::messages::imap_search_criteria(&search).expect("criteria");
+    let mut connection = connect(&account).await;
+    let direct = nuncio_mail::sync::messages::server_search(
+        &ctx,
+        &mut connection,
+        &account,
+        &inbox,
+        &criteria,
+    )
+    .await
+    .expect("direct server search");
+    assert_eq!(direct.len(), 1, "the mock answers UID SEARCH");
+
+    let page = service
+        .message_list(
+            &MessageListQuery::new(MailScope::search(search))
+                .with_conversation(false)
+                .with_limit(20),
+        )
+        .await
+        .expect("local search");
+    assert!(
+        page.items.is_empty(),
+        "account with broken server text search must fall back to the local index"
+    );
+}
+
+#[tokio::test]
 async fn outbox_cancel_returns_an_editable_draft() {
     let ctx = context(
         StaticCreds::password("test@example.com", "secret"),

@@ -11,7 +11,12 @@ pub struct DavUrls {
     pub carddav_url: Option<String>,
 }
 
-/// Return preset endpoints or probe `/.well-known/{caldav,carddav}`.
+/// Return directory/preset endpoints or probe `/.well-known/{caldav,carddav}`.
+///
+/// The preset lookup is directory-backed and also answers for known providers
+/// with no DAV service: `Some((None, None))` means "known, do not probe" (163
+/// has no CalDAV; `caldav.163.com` only answers 403). Probing is therefore
+/// limited to domains the directory does not know.
 ///
 /// Probes are best-effort: any network error simply leaves the field empty.
 pub async fn discover(http: &reqwest::Client, domain: &str) -> DavUrls {
@@ -102,6 +107,18 @@ mod tests {
         assert_eq!(
             urls.carddav_url.as_deref(),
             Some("https://contacts.icloud.com")
+        );
+    }
+
+    #[test]
+    fn known_provider_without_dav_does_not_probe() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let client = crate::http::http_client().expect("client");
+        let urls = runtime.block_on(discover(&client, "163.com"));
+        assert!(urls.caldav_url.is_none());
+        assert_eq!(
+            urls.carddav_url.as_deref(),
+            Some("https://contacts.163.com")
         );
     }
 

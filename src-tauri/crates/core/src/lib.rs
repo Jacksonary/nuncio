@@ -22,6 +22,7 @@ pub mod error;
 pub mod events;
 pub mod models;
 pub mod paths;
+pub mod providers;
 pub mod repo;
 pub mod settings;
 pub mod sync_status;

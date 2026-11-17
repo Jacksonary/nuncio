@@ -36,6 +36,7 @@ pub const CORE_MIGRATIONS: &[(u32, &str)] = &[
         4,
         include_str!("../migrations/0004_outbox_sending_lease.sql"),
     ),
+    (5, include_str!("../migrations/0005_account_sent_copy.sql")),
 ];
 
 const PRAGMAS: &str = "\

@@ -310,12 +310,23 @@ async fn remove_remote_draft(
     Ok(())
 }
 
+/// Whether this send must APPEND its own copy to Sent.
+///
+/// Reads the provider directory and the account's `sent_copy` override
+/// directly instead of the persisted `capabilities.auto_saves_sent`: that flag
+/// is only refreshed when the IMAP session reconnects, so using it here would
+/// make a settings change wait for the next connection (or silently keep
+/// duplicating Sent mail on a Yahoo/AOL account that stays connected).
+fn client_appends_sent(account: &nuncio_core::models::Account) -> bool {
+    !nuncio_core::providers::server_files_sent(account)
+}
+
 async fn append_to_sent(
     ctx: &CoreContext,
     account: &nuncio_core::models::Account,
     item: &OutboxItem,
 ) -> Result<()> {
-    if account.capabilities.auto_saves_sent {
+    if !client_appends_sent(account) {
         return Ok(());
     }
     let account_id = account.id.clone();
@@ -447,4 +458,74 @@ async fn recover_stuck(ctx: &CoreContext, account_id: &str) -> Result<()> {
             Ok(())
         })
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nuncio_core::models::{
+        Account, AccountState, AuthKind, ProviderCapabilities, ProviderKind, SentCopyMode,
+    };
+
+    fn account(email: &str) -> Account {
+        Account {
+            id: "acc".into(),
+            provider: ProviderKind::Imap,
+            email: email.into(),
+            display_name: "Test".into(),
+            color: "#000000".into(),
+            auth_kind: AuthKind::Password,
+            oauth_provider: None,
+            imap: None,
+            smtp: None,
+            pop3: None,
+            caldav_url: None,
+            carddav_url: None,
+            sent_copy: None,
+            sync_window_days: 0,
+            mail_enabled: true,
+            calendar_enabled: false,
+            contacts_enabled: false,
+            tasks_enabled: false,
+            notifications_enabled: true,
+            include_in_unified: true,
+            sort_order: 0,
+            state: AccountState::Ok,
+            state_message: None,
+            capabilities: ProviderCapabilities::defaults_for(ProviderKind::Imap),
+            created_at: nuncio_core::models::now(),
+        }
+    }
+
+    #[test]
+    fn sent_copy_decision_follows_the_directory_and_the_override() {
+        // Yahoo/AOL and Gmail file the sent copy themselves.
+        assert!(!client_appends_sent(&account("me@yahoo.com")));
+        assert!(!client_appends_sent(&account("me@aol.com")));
+        assert!(!client_appends_sent(&account("me@gmail.com")));
+        // Everyone else (including configurable ones like QQ) needs the client
+        // to APPEND.
+        assert!(client_appends_sent(&account("me@yandex.com")));
+        assert!(client_appends_sent(&account("me@qq.com")));
+
+        // The per-account choice is honoured on the next send, without waiting
+        // for a reconnect to refresh `capabilities.auto_saves_sent`.
+        let mut yahoo = account("me@yahoo.com");
+        yahoo.sent_copy = Some(SentCopyMode::Client);
+        assert!(client_appends_sent(&yahoo));
+
+        let mut yandex = account("me@yandex.com");
+        yandex.sent_copy = Some(SentCopyMode::Server);
+        assert!(!client_appends_sent(&yandex));
+    }
+
+    #[test]
+    fn gmail_capability_probe_skips_the_append_too() {
+        let mut unknown = account("me@unknown.example");
+        assert!(client_appends_sent(&unknown));
+        // A live X-GM-EXT-1 probe is positive evidence even when the domain
+        // is not in the directory.
+        unknown.capabilities.gmail_extensions = true;
+        assert!(!client_appends_sent(&unknown));
+    }
 }

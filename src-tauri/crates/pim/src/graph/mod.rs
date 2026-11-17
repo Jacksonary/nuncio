@@ -247,10 +247,7 @@ impl GraphClient {
                                 // the page size are both `Prefer` directives.
                                 // Delta endpoints refuse `$top` — this is the
                                 // supported way to influence page size.
-                                .header(
-                                    "Prefer",
-                                    "outlook.timezone=\"UTC\", odata.maxpagesize=100",
-                                )
+                                .header("Prefer", "outlook.timezone=\"UTC\", odata.maxpagesize=100")
                         },
                     )
                     .await?;

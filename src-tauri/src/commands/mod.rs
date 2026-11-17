@@ -43,10 +43,13 @@ macro_rules! nuncio_commands {
             // accounts
             $crate::commands::accounts::account_list,
             $crate::commands::accounts::account_discover,
+            $crate::commands::accounts::account_provider_info,
             $crate::commands::accounts::account_test,
             $crate::commands::accounts::account_create,
             $crate::commands::accounts::account_update,
             $crate::commands::accounts::account_update_password,
+            $crate::commands::accounts::account_set_dav_password,
+            $crate::commands::accounts::account_dav_password_status,
             $crate::commands::accounts::account_reauth,
             $crate::commands::accounts::account_delete,
             $crate::commands::accounts::account_reorder,

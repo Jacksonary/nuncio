@@ -167,9 +167,8 @@ pub fn next_occurrence(task: &Task, today: &str) -> Option<TaskInput> {
     // the series as finished.
     let occurrences = loop {
         let from = Utc.from_utc_datetime(&start_from.and_hms_opt(0, 0, 0)?);
-        let to = Utc.from_utc_datetime(
-            &(start_from + Duration::days(horizon_days)).and_hms_opt(0, 0, 0)?,
-        );
+        let to = Utc
+            .from_utc_datetime(&(start_from + Duration::days(horizon_days)).and_hms_opt(0, 0, 0)?);
         let found = nuncio_ical::recurrence::expand(&event, &[], from, to, limit);
         if found.len() >= limit || horizon_days >= MAX_HORIZON_DAYS {
             break found;

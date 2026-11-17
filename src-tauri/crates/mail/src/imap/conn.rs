@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use async_imap::types::Capabilities;
 use async_imap::{Authenticator, Client, Session};
 use futures::stream::{FuturesUnordered, StreamExt};
-use nuncio_core::models::{Account, ProviderCapabilities, ProviderKind, Security, ServerConfig};
+use nuncio_core::models::{Account, ProviderCapabilities, Security, ServerConfig};
 use nuncio_core::traits::MailAuth;
 use nuncio_core::{AppError, CoreContext, Result};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
@@ -195,10 +195,23 @@ impl ServerCapabilities {
         next.uidplus = self.uidplus;
         next.gmail_extensions = self.gmail;
         next.special_use = self.special_use;
-        next.server_search = true;
-        // Gmail always files sent mail automatically; APPENDing again would
-        // produce a duplicate in "[Gmail]/Sent Mail".
-        next.auto_saves_sent = self.gmail || account.provider == ProviderKind::Gmail;
+        // A successful CAPABILITY exchange says nothing about whether text
+        // SEARCH works: QQ and NetEase accept the command but return no hits,
+        // and 139 ignores the criteria (it returns every message). The
+        // directory is the only source for that, so never advertise search
+        // just because the server answered.
+        next.server_search = nuncio_core::providers::server_text_search(account);
+        // Yahoo and AOL file sent mail themselves too; APPENDing as well would
+        // put two copies in Sent. `server_files_sent` also honours the
+        // per-account `sent_copy` choice, so this must not overwrite it with a
+        // provider-only guess. Compute against the freshly probed flags: the
+        // X-GM-EXT-1 capability is live evidence, while the persisted account
+        // may predate this connection.
+        let probed = Account {
+            capabilities: next.clone(),
+            ..account.clone()
+        };
+        next.auto_saves_sent = nuncio_core::providers::server_files_sent(&probed);
         next
     }
 }
@@ -855,6 +868,103 @@ mod tests {
     fn oauth2_sasl_string_is_rfc_shaped() {
         let value = xoauth2_response("me@example.com", "token");
         assert_eq!(value, "user=me@example.com\u{1}auth=Bearer token\u{1}\u{1}");
+    }
+
+    use nuncio_core::models::{
+        AccountState, AuthKind, ProviderCapabilities, ProviderKind, SentCopyMode,
+    };
+
+    /// An account row as the merge sees it: e-mail domain, the user's
+    /// sent-copy choice and the persisted capability flags.
+    fn account(email: &str) -> Account {
+        Account {
+            id: "acc".into(),
+            provider: ProviderKind::Imap,
+            email: email.into(),
+            display_name: "Test".into(),
+            color: "#000000".into(),
+            auth_kind: AuthKind::Password,
+            oauth_provider: None,
+            imap: None,
+            smtp: None,
+            pop3: None,
+            caldav_url: None,
+            carddav_url: None,
+            sent_copy: None,
+            sync_window_days: 0,
+            mail_enabled: true,
+            calendar_enabled: false,
+            contacts_enabled: false,
+            tasks_enabled: false,
+            notifications_enabled: true,
+            include_in_unified: true,
+            sort_order: 0,
+            state: AccountState::Ok,
+            state_message: None,
+            capabilities: ProviderCapabilities::defaults_for(ProviderKind::Imap),
+            created_at: nuncio_core::models::now(),
+        }
+    }
+
+    /// `merge_into` only needs a non-empty `raw` (evidence that a CAPABILITY
+    /// exchange happened) plus the protocol flags, so a synthetic snapshot is
+    /// enough.
+    fn probe() -> ServerCapabilities {
+        ServerCapabilities {
+            raw: vec!["IMAP4rev1".into()],
+            ..ServerCapabilities::default()
+        }
+    }
+
+    #[test]
+    fn merge_does_not_append_sent_for_presets_that_file_it() {
+        // Yahoo files sent mail itself; a client APPEND would duplicate it.
+        assert!(probe().merge_into(&account("me@yahoo.com")).auto_saves_sent);
+        assert!(probe().merge_into(&account("me@aol.com")).auto_saves_sent);
+        assert!(
+            !probe()
+                .merge_into(&account("me@yandex.com"))
+                .auto_saves_sent
+        );
+
+        // An explicit per-account choice survives the next connection instead
+        // of being overwritten by the provider default.
+        let mut yandex = account("me@yandex.com");
+        yandex.sent_copy = Some(SentCopyMode::Server);
+        assert!(probe().merge_into(&yandex).auto_saves_sent);
+
+        let mut yahoo = account("me@yahoo.com");
+        yahoo.sent_copy = Some(SentCopyMode::Client);
+        assert!(!probe().merge_into(&yahoo).auto_saves_sent);
+    }
+
+    #[test]
+    fn merge_uses_the_fresh_gmail_probe_as_positive_evidence() {
+        // X-GM-EXT-1 is live evidence that the server files sent mail, even
+        // though the persisted `gmail_extensions` flag is still false.
+        let account = account("me@yandex.com");
+        assert!(!account.capabilities.gmail_extensions);
+        let probe = ServerCapabilities {
+            gmail: true,
+            ..probe()
+        };
+        assert!(probe.merge_into(&account).auto_saves_sent);
+    }
+
+    #[test]
+    fn merge_gates_server_search_on_the_provider_directory() {
+        // These servers accept UID SEARCH but the results are unusable: QQ and
+        // NetEase return no hits, 139 ignores the criteria.
+        assert!(!probe().merge_into(&account("me@qq.com")).server_search);
+        assert!(!probe().merge_into(&account("me@163.com")).server_search);
+        assert!(!probe().merge_into(&account("me@139.com")).server_search);
+        // A server that answered CAPABILITY and is not known-broken keeps it.
+        assert!(probe().merge_into(&account("me@gmail.com")).server_search);
+        assert!(
+            probe()
+                .merge_into(&account("me@unknown.example"))
+                .server_search
+        );
     }
 
     fn v4(last: u8) -> SocketAddr {

@@ -1,5 +1,6 @@
 //! Account, identity, signature and OAuth commands.
 
+use serde::Serialize;
 use tauri::State;
 use tracing::{debug, info, warn};
 
@@ -9,6 +10,7 @@ use nuncio_core::models::{
     Identity, NewAccountInput, OAuthProvider, OAuthResult, ProviderCapabilities, ProviderKind,
     Security, ServerConfig, Signature,
 };
+use nuncio_core::providers::DavService;
 use nuncio_core::{repo, AppError};
 use nuncio_mail::MailService;
 
@@ -27,6 +29,43 @@ pub async fn account_discover(
     email: String,
 ) -> nuncio_core::Result<DiscoveryResult> {
     state.auth.discover(email.trim()).await
+}
+
+/// Provider facts the account settings page needs on top of the stored row:
+/// DAV defaults, who files the Sent copy and the provider help note.
+///
+/// The enum values are flattened to strings so this stays a plain IPC shape;
+/// `None` means the domain is not in the verified directory (never a guess).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderInfoDto {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub caldav_url: Option<&'static str>,
+    pub carddav_url: Option<&'static str>,
+    /// "server" | "client" | "configurable".
+    pub sent_copy: &'static str,
+    pub note: Option<&'static str>,
+    pub oauth: Option<&'static str>,
+}
+
+#[tauri::command]
+pub fn account_provider_info(email: String) -> Option<ProviderInfoDto> {
+    let provider = nuncio_core::providers::by_email(email.trim())?;
+    let sent_copy = match provider.sent_copy {
+        nuncio_core::providers::SentCopy::Server => "server",
+        nuncio_core::providers::SentCopy::Client => "client",
+        nuncio_core::providers::SentCopy::Configurable => "configurable",
+    };
+    Some(ProviderInfoDto {
+        id: provider.id,
+        name: provider.name,
+        caldav_url: provider.caldav,
+        carddav_url: provider.carddav,
+        sent_copy,
+        note: provider.note,
+        oauth: provider.oauth_provider.map(|oauth| oauth.as_str()),
+    })
 }
 
 fn add_error(result: &mut ConnectionTestResult, message: String) {
@@ -132,6 +171,7 @@ fn probe_account(input: &NewAccountInput, id: &str) -> Account {
         pop3: input.pop3.clone(),
         caldav_url: input.caldav_url.clone(),
         carddav_url: input.carddav_url.clone(),
+        sent_copy: None,
         sync_window_days: input.sync_window_days,
         mail_enabled: input.mail_enabled,
         calendar_enabled: input.calendar_enabled,
@@ -304,6 +344,7 @@ pub async fn account_create(
         pop3: input.pop3.clone(),
         caldav_url: input.caldav_url.clone(),
         carddav_url: input.carddav_url.clone(),
+        sent_copy: None,
         sync_window_days: input.sync_window_days,
         mail_enabled: input.mail_enabled,
         calendar_enabled: input.calendar_enabled,
@@ -461,6 +502,72 @@ pub async fn account_update_password(
     state.pim.on_account_changed(&id).await;
     events::emit_accounts_changed(ctx.events.as_ref(), vec![id]);
     Ok(())
+}
+
+/// Which DAV services have a dedicated password stored.  Never exposes it.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DavPasswordStatus {
+    pub calendar: bool,
+    pub contacts: bool,
+}
+
+/// Store or clear the optional per-service CalDAV/CardDAV password.
+///
+/// `service` is `"calendar"` or `"contacts"`.  An empty or null password
+/// clears the secret and returns the account to using its mail password.
+#[tauri::command]
+pub async fn account_set_dav_password(
+    state: State<'_, AppState>,
+    id: String,
+    service: String,
+    password: Option<String>,
+) -> nuncio_core::Result<()> {
+    let service = DavService::parse(&service).ok_or_else(|| {
+        AppError::invalid_input("service must be either \"calendar\" or \"contacts\"")
+    })?;
+    let ctx = &state.ctx;
+    let account = ctx
+        .db
+        .read({
+            let id = id.clone();
+            move |conn| repo::accounts::get_required(conn, &id)
+        })
+        .await?;
+    if account.auth_kind == AuthKind::Oauth {
+        return Err(AppError::unsupported(
+            "this account signs in with OAuth; DAV uses its access token",
+        ));
+    }
+
+    state
+        .auth
+        .set_dav_password(&id, service, password.as_deref())?;
+    // A new credential invalidates a stale auth status and must reach the
+    // running sync loops.
+    ctx.sync_status.remove_account(&id);
+    state.pim.on_account_changed(&id).await;
+    Ok(())
+}
+
+/// Whether a dedicated CalDAV/CardDAV password is stored for this account.
+#[tauri::command]
+pub async fn account_dav_password_status(
+    state: State<'_, AppState>,
+    id: String,
+) -> nuncio_core::Result<DavPasswordStatus> {
+    state
+        .ctx
+        .db
+        .read({
+            let id = id.clone();
+            move |conn| repo::accounts::get_required(conn, &id)
+        })
+        .await?;
+    Ok(DavPasswordStatus {
+        calendar: state.auth.dav_password_stored(&id, DavService::Calendar),
+        contacts: state.auth.dav_password_stored(&id, DavService::Contacts),
+    })
 }
 
 #[tauri::command]

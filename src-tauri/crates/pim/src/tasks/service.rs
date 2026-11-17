@@ -6,17 +6,19 @@ use std::sync::{Arc, Mutex};
 
 use nuncio_core::events::{emit_mail_changed, emit_tasks_changed, MailChangeKind};
 use nuncio_core::models::{
-    new_id, Account, Importance, NewPendingOp, OAuthProvider, PendingOp, ProviderKind,
-    SmartListCounts, SyncModule, Task, TaskInput, TaskList, TaskQuery, TaskStatus, TaskStep,
+    new_id, Account, Importance, NewPendingOp, PendingOp, SmartListCounts, SyncModule, Task,
+    TaskInput, TaskList, TaskQuery, TaskStatus, TaskStep,
 };
+use nuncio_core::providers::DavService;
 use nuncio_core::repo::{
     self, messages as messages_repo, sync_state, task_lists, tasks as tasks_repo,
 };
 use nuncio_core::CoreContext;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-use tracing::warn;
+use tracing::{debug, warn};
 
+use crate::backend::{backend_for, is_implicit_dav_auth_failure, Backend};
 use crate::error::{invalid, unsupported, AppError, Result};
 use crate::http::HttpClient;
 use crate::op_worker::{self, PimOpExecutor};
@@ -33,25 +35,6 @@ use crate::tasks::provider::{
 
 /// `sync_state.module` used for task cursors.
 pub const SYNC_MODULE: &str = "tasks";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Backend {
-    Google,
-    Graph,
-    Dav,
-    Local,
-    Unsupported,
-}
-
-fn backend_for(account: &Account) -> Backend {
-    match account.oauth_provider {
-        Some(OAuthProvider::Google) => Backend::Google,
-        Some(OAuthProvider::Microsoft) => Backend::Graph,
-        None if account.provider == ProviderKind::Local => Backend::Local,
-        None if account.caldav_url.is_some() => Backend::Dav,
-        _ => Backend::Unsupported,
-    }
-}
 
 /// Task service handle shared by `PimService`.
 #[derive(Clone)]
@@ -124,7 +107,7 @@ impl TasksService {
     }
 
     fn provider_for(&self, account: &Account) -> Option<Box<dyn TaskProvider>> {
-        match backend_for(account) {
+        match backend_for(account, DavService::Calendar) {
             Backend::Google => Some(Box::new(GoogleTasksProvider::new(self.http.clone()))),
             Backend::Graph => Some(Box::new(GraphTasksProvider::new(self.http.clone()))),
             Backend::Dav => Some(Box::new(CalDavTaskProvider::new(self.http.clone()))),
@@ -134,7 +117,7 @@ impl TasksService {
 
     fn is_provider(&self, account: &Account) -> bool {
         matches!(
-            backend_for(account),
+            backend_for(account, DavService::Calendar),
             Backend::Google | Backend::Graph | Backend::Dav
         )
     }
@@ -173,6 +156,30 @@ impl TasksService {
                 Ok(())
             }
             Err(error) => {
+                // CalDAV task lists use the Calendar DAV service.  An implicit
+                // configuration rejecting the mail password is expected.
+                if matches!(error, AppError::Auth(_))
+                    && backend_for(&account, DavService::Calendar) == Backend::Dav
+                {
+                    let dedicated = self
+                        .ctx
+                        .creds
+                        .has_dav_password(&account.id, DavService::Calendar)
+                        .await;
+                    if is_implicit_dav_auth_failure(
+                        &account,
+                        DavService::Calendar,
+                        dedicated,
+                        &error,
+                    ) {
+                        debug!(
+                            account_id = %account.id,
+                            "tasks needs its own password for this provider; set it in account settings"
+                        );
+                        self.ctx.sync_status.finish(&account.id, SyncModule::Tasks);
+                        return Ok(());
+                    }
+                }
                 match &error {
                     AppError::Auth(_) => {
                         self.ctx
@@ -423,7 +430,7 @@ impl TasksService {
         }
         let color = normalize_color_or_default(color);
         let account = self.load_account(account_id).await?;
-        if backend_for(&account) == Backend::Unsupported {
+        if backend_for(&account, DavService::Calendar) == Backend::Unsupported {
             return Err(unsupported("this account has no task provider"));
         }
         let account_id = account.id.clone();

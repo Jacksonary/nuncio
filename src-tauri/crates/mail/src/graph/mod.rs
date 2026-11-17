@@ -284,6 +284,7 @@ mod tests {
             pop3: None,
             caldav_url: None,
             carddav_url: None,
+            sent_copy: None,
             sync_window_days: 90,
             mail_enabled,
             calendar_enabled: false,

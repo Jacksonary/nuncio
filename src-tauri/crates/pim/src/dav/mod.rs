@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use nuncio_core::models::{
     Account, AttendeeStatus, AuthKind, CalendarEvent, RecurrenceEditScope, StoredEvent,
 };
+use nuncio_core::providers::{self, DavService};
 use reqwest::{Method, Response, StatusCode};
 use tracing::{debug, warn};
 use url::Url;
@@ -41,13 +42,6 @@ pub enum DavKind {
 }
 
 impl DavKind {
-    fn well_known(self) -> &'static str {
-        match self {
-            Self::Calendar => ".well-known/caldav",
-            Self::AddressBook => ".well-known/carddav",
-        }
-    }
-
     fn home_kind(self) -> &'static str {
         match self {
             Self::Calendar => "calendar",
@@ -93,24 +87,38 @@ pub struct ResourceDelta {
     pub full_sync: bool,
 }
 
-/// CalDAV/CardDAV client bound to one account.
+/// CalDAV/CardDAV client bound to one account and one DAV service.
+///
+/// The service selects which optional password is used: providers such as
+/// Yandex issue a separate app password for calendar and contacts.
 #[derive(Clone)]
 pub struct DavClient {
     http: HttpClient,
     account: Account,
+    service: DavService,
 }
 
 impl std::fmt::Debug for DavClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DavClient")
             .field("account", &self.account.id)
+            .field("service", &self.service.as_str())
             .finish_non_exhaustive()
     }
 }
 
 impl DavClient {
+    /// Calendar-backed client (CalDAV events and VTODO task lists).
     pub fn new(http: HttpClient, account: Account) -> Self {
-        Self { http, account }
+        Self::for_service(http, account, DavService::Calendar)
+    }
+
+    pub fn for_service(http: HttpClient, account: Account, service: DavService) -> Self {
+        Self {
+            http,
+            account,
+            service,
+        }
     }
 
     pub fn account(&self) -> &Account {
@@ -126,7 +134,11 @@ impl DavClient {
                 .await?;
             return Ok(DavAuth::Bearer(token));
         }
-        let (user, password) = self.http.creds().dav_auth(&self.account).await?;
+        let (user, password) = self
+            .http
+            .creds()
+            .dav_auth(&self.account, self.service)
+            .await?;
         Ok(DavAuth::Basic { user, password })
     }
 
@@ -206,30 +218,7 @@ impl DavClient {
     /* ─────────────────────────── discovery ─────────────────────────── */
 
     fn fallback_home(&self, kind: DavKind) -> String {
-        if let Some(url) = match kind {
-            DavKind::Calendar => self.account.caldav_url.clone(),
-            DavKind::AddressBook => self.account.carddav_url.clone(),
-        } {
-            return ensure_trailing_slash(&url);
-        }
-        let domain = self
-            .account
-            .email
-            .split_once('@')
-            .map(|(_, domain)| domain.trim().to_string())
-            .filter(|domain| !domain.is_empty())
-            .or_else(|| {
-                self.account
-                    .caldav_url
-                    .as_deref()
-                    .and_then(|url| Url::parse(url).ok())
-                    .and_then(|url| url.host_str().map(str::to_string))
-            })
-            .unwrap_or_default();
-        if domain.is_empty() {
-            return String::new();
-        }
-        format!("https://{domain}/{}", kind.well_known())
+        home_url(&self.account, kind).unwrap_or_default()
     }
 
     /// Discover the calendar (or address-book) home collection URL.
@@ -1290,36 +1279,39 @@ impl DavClient {
         resolve_href(base, href, &self.allowed_origins())
     }
 
-    /// Origins the account is allowed to talk to: the configured calendar and
-    /// address-book URLs plus the e-mail domain used for `.well-known`.
+    /// Origins the account is allowed to talk to: the resolved calendar and
+    /// address-book URLs.
+    ///
+    /// The directory defaults count because [`home_url`] sends the first
+    /// PROPFIND to them for accounts with no user-entered URL.  The mail
+    /// domain is deliberately NOT an allowed origin: it was only needed by the
+    /// removed `.well-known` guess.
     fn allowed_origins(&self) -> Vec<Url> {
         let mut allowed: Vec<Url> = Vec::new();
-        for value in [
-            self.account.caldav_url.as_deref(),
-            self.account.carddav_url.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if let Ok(url) = Url::parse(value) {
-                allowed.push(url);
-            }
-        }
-        if let Some(domain) = self
-            .account
-            .email
-            .split_once('@')
-            .map(|(_, domain)| domain.trim())
-            .filter(|domain| !domain.is_empty())
-        {
-            for scheme in ["https", "http"] {
-                if let Ok(url) = Url::parse(&format!("{scheme}://{domain}/")) {
+        for service in [DavService::Calendar, DavService::Contacts] {
+            if let Some(value) = providers::dav_url(&self.account, service) {
+                if let Ok(url) = Url::parse(&value) {
                     allowed.push(url);
                 }
             }
         }
         allowed
     }
+}
+
+/// URL that [`DavClient::discover_home`] starts from.
+///
+/// It is the user's own value when set, otherwise the verified directory
+/// entry.  `None` means the account has no DAV service; we must never derive a
+/// host from the mail domain.  Yandex is the cautionary example: mail lives on
+/// `*.yandex.com` but the DAV servers are `*.yandex.ru`, and
+/// `https://yandex.com/.well-known/caldav` answers 405.
+fn home_url(account: &Account, kind: DavKind) -> Option<String> {
+    let service = match kind {
+        DavKind::Calendar => DavService::Calendar,
+        DavKind::AddressBook => DavService::Contacts,
+    };
+    providers::dav_url(account, service).map(|url| ensure_trailing_slash(&url))
 }
 
 /// Resolve a server-provided href against `base`, ignoring absolute hrefs that
@@ -1692,5 +1684,70 @@ pub fn scope_name(scope: RecurrenceEditScope) -> &'static str {
         RecurrenceEditScope::This => "this",
         RecurrenceEditScope::ThisAndFollowing => "thisAndFollowing",
         RecurrenceEditScope::All => "all",
+    }
+}
+
+#[cfg(test)]
+mod home_url_tests {
+    use super::*;
+    use nuncio_core::models::{AccountState, ProviderCapabilities, ProviderKind};
+
+    fn account(email: &str) -> Account {
+        Account {
+            id: "test".into(),
+            provider: ProviderKind::Imap,
+            email: email.into(),
+            display_name: "Test".into(),
+            color: "#000000".into(),
+            auth_kind: AuthKind::Password,
+            oauth_provider: None,
+            imap: None,
+            smtp: None,
+            pop3: None,
+            caldav_url: None,
+            carddav_url: None,
+            sent_copy: None,
+            sync_window_days: 90,
+            mail_enabled: true,
+            calendar_enabled: true,
+            contacts_enabled: true,
+            tasks_enabled: true,
+            notifications_enabled: true,
+            include_in_unified: true,
+            sort_order: 0,
+            state: AccountState::Ok,
+            state_message: None,
+            capabilities: ProviderCapabilities::default(),
+            created_at: nuncio_core::models::now(),
+        }
+    }
+
+    #[test]
+    fn yandex_without_a_stored_url_starts_at_the_ru_dav_host() {
+        let yandex = account("me@yandex.com");
+        let start = home_url(&yandex, DavKind::Calendar).expect("calendar URL");
+        assert_eq!(start, "https://caldav.yandex.ru/");
+        // The removed domain guess produced https://yandex.com/... (405).
+        assert!(!start.contains("yandex.com"));
+        assert_eq!(
+            home_url(&yandex, DavKind::AddressBook).as_deref(),
+            Some("https://carddav.yandex.ru/")
+        );
+    }
+
+    #[test]
+    fn user_url_wins_and_a_missing_url_yields_nothing() {
+        let mut custom = account("me@yandex.com");
+        custom.caldav_url = Some("https://dav.example.com/cal".into());
+        assert_eq!(
+            home_url(&custom, DavKind::Calendar).as_deref(),
+            Some("https://dav.example.com/cal/")
+        );
+
+        // An unknown domain with no URL has no DAV service at all; the client
+        // must report "account has no DAV server URL" rather than guess.
+        let unknown = account("me@unknown.example");
+        assert_eq!(home_url(&unknown, DavKind::Calendar), None);
+        assert_eq!(home_url(&unknown, DavKind::AddressBook), None);
     }
 }

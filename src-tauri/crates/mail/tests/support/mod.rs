@@ -12,6 +12,7 @@ use nuncio_core::models::{
     Account, AccountState, AuthKind, NavigateTarget, ProviderCapabilities, ProviderKind,
     ServerConfig,
 };
+use nuncio_core::providers::DavService;
 use nuncio_core::traits::{CredentialProvider, MailAuth, Notifier, TokenResource};
 use nuncio_core::{CoreContext, Db, Paths, Result};
 
@@ -42,8 +43,12 @@ impl CredentialProvider for StaticCreds {
         Ok("token".into())
     }
 
-    async fn dav_auth(&self, _account: &Account) -> Result<(String, String)> {
+    async fn dav_auth(&self, _account: &Account, _service: DavService) -> Result<(String, String)> {
         Ok(("user".into(), "pass".into()))
+    }
+
+    async fn has_dav_password(&self, _account_id: &str, _service: DavService) -> bool {
+        false
     }
 
     async fn report_auth_failure(&self, account_id: &str, _resource: TokenResource) {
@@ -126,6 +131,7 @@ pub fn account(
         pop3,
         caldav_url: None,
         carddav_url: None,
+        sent_copy: None,
         sync_window_days: 0,
         mail_enabled: true,
         calendar_enabled: false,

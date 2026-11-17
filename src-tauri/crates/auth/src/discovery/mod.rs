@@ -67,7 +67,11 @@ pub async fn discover_with_client(
     let (_, domain) = split_email(email)?;
     let email = email.trim();
 
-    // 1. Built-in presets.
+    // 1. Built-in presets. The directory already carries DAV endpoints, so we
+    // return as-is: for a known provider a missing DAV URL is authoritative
+    // ("163 has no CalDAV"), and probing would surface a 403 as a false hit.
+    // Entries with no IMAP/SMTP (Tuta) are final too; they must not fall
+    // through to the `imap.<domain>` guess.
     if let Some(preset) = presets::lookup(&domain) {
         tracing::debug!(%domain, "discovery matched a built-in preset");
         return Ok(preset.into_result(email));
@@ -110,7 +114,9 @@ pub async fn discover_with_client(
         }
     }
 
-    // 4. MX inference.
+    // 4. MX inference. The MX entry's directory DAV URLs win; `attach_dav`
+    // only probes the custom domain's well-known locations when the entry has
+    // none (or is missing one side).
     let mx_hosts = mx::lookup_mx(&domain).await;
     if let Some(preset) = presets::match_mx(&mx_hosts) {
         tracing::debug!(%domain, ?mx_hosts, "discovery matched an MX provider hint");
@@ -287,6 +293,35 @@ mod tests {
         assert_eq!(result.provider, ProviderKind::Gmail);
         assert_eq!(result.source, "preset");
         assert_eq!(result.auth_kind, AuthKind::Oauth);
+    }
+
+    #[tokio::test]
+    async fn preset_carries_directory_dav_without_probing() {
+        // allow_ispdb = false and a preset hit means no network at all; 163 has
+        // no CalDAV in the verified directory, and probing caldav.163.com only
+        // yields a 403, so the field must stay empty.
+        let client = crate::http::http_client().expect("client");
+        let result = discover_with_client(&client, "a@163.com", false)
+            .await
+            .expect("discover");
+        assert_eq!(result.source, "preset");
+        assert_eq!(result.caldav_url, None);
+        assert_eq!(
+            result.carddav_url.as_deref(),
+            Some("https://contacts.163.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn tuta_is_a_final_preset_without_mail_servers() {
+        let client = crate::http::http_client().expect("client");
+        let result = discover_with_client(&client, "a@tuta.com", false)
+            .await
+            .expect("discover");
+        assert_eq!(result.source, "preset");
+        assert!(result.imap.is_none());
+        assert!(result.smtp.is_none());
+        assert_eq!(result.note.as_deref(), Some(presets::NOTE_NO_IMAP));
     }
 
     #[tokio::test]

@@ -6,6 +6,7 @@
 
 use async_trait::async_trait;
 use nuncio_core::models::{Account, Contact};
+use nuncio_core::providers::DavService;
 use tracing::debug;
 
 use crate::contacts::map::sanitize_photo;
@@ -37,7 +38,7 @@ impl CardDavProvider {
     }
 
     fn client(&self, account: &Account) -> DavClient {
-        DavClient::new(self.http.clone(), account.clone())
+        DavClient::for_service(self.http.clone(), account.clone(), DavService::Contacts)
     }
 }
 

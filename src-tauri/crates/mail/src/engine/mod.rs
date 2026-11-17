@@ -691,7 +691,9 @@ impl Engine {
     ) -> Result<()> {
         let account = self.load_account(account_id).await?;
         smtp::send::send_account_message(&self.inner.ctx, &account, &rfc822, None).await?;
-        if save_to_sent && !account.capabilities.auto_saves_sent {
+        // Ask the directory (plus the account's override) rather than the
+        // persisted probe flag, so a settings change applies immediately.
+        if save_to_sent && !nuncio_core::providers::server_files_sent(&account) {
             self.stage_sent_copy(&account, &rfc822).await?;
         }
         Ok(())

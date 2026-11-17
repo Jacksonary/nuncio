@@ -184,10 +184,7 @@ impl GraphTasksClient {
                 debug!(%status, body_len = body.len(), "Graph To Do delta rejected $expand; retrying plainly");
                 drop(body);
                 include_expand = false;
-                next = Some(self.url(&format!(
-                    "/me/todo/lists/{}/tasks/delta",
-                    encode(list_id)
-                )));
+                next = Some(self.url(&format!("/me/todo/lists/{}/tasks/delta", encode(list_id))));
                 let _ = status;
                 continue;
             }

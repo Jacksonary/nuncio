@@ -7,7 +7,7 @@ use rusqlite::{params, Connection, Row};
 use crate::error::AppError;
 use crate::models::{
     Account, AccountPatch, AccountState, AuthKind, OAuthProvider, ProviderCapabilities,
-    ProviderKind, ServerConfig,
+    ProviderKind, SentCopyMode, ServerConfig,
 };
 use crate::repo::{
     conflict, dt_string, get_bool, get_dt, get_opt_string, get_string, json_opt, json_text,
@@ -17,7 +17,7 @@ use crate::Result;
 
 const COLUMNS: &str = "\
     id, provider, email, display_name, color, auth_kind, oauth_provider,\
-    imap_json, smtp_json, pop3_json, caldav_url, carddav_url,\
+    imap_json, smtp_json, pop3_json, caldav_url, carddav_url, sent_copy,\
     sync_window_days, mail_enabled, calendar_enabled, contacts_enabled, tasks_enabled,\
     notifications_enabled, include_in_unified, sort_order, state, state_message,\
     capabilities_json, created_at";
@@ -56,6 +56,10 @@ fn row_to_account(row: &Row<'_>) -> Result<Account> {
         pop3,
         caldav_url: get_opt_string(row, "caldav_url")?,
         carddav_url: get_opt_string(row, "carddav_url")?,
+        // A value written by a newer build (or a corrupt row) must not make the
+        // whole account unreadable; fall back to automatic.
+        sent_copy: get_opt_string(row, "sent_copy")?
+            .and_then(|value| value.parse::<SentCopyMode>().ok()),
         sync_window_days: row.get::<_, i64>("sync_window_days")?.max(0) as u32,
         mail_enabled: get_bool(row, "mail_enabled")?,
         calendar_enabled: get_bool(row, "calendar_enabled")?,
@@ -144,6 +148,10 @@ fn account_values(account: &Account) -> Result<Vec<Value>> {
             .clone()
             .map(Value::Text)
             .unwrap_or(Value::Null),
+        account
+            .sent_copy
+            .map(|mode| Value::Text(mode.as_str().to_string()))
+            .unwrap_or(Value::Null),
         Value::Integer(account.sync_window_days as i64),
         Value::Integer(account.mail_enabled as i64),
         Value::Integer(account.calendar_enabled as i64),
@@ -168,11 +176,11 @@ pub fn insert(conn: &Connection, account: &Account) -> Result<()> {
     let values = account_values(account)?;
     let sql = "INSERT INTO account (
         id, provider, email, display_name, color, auth_kind, oauth_provider,
-        imap_json, smtp_json, pop3_json, caldav_url, carddav_url,
+        imap_json, smtp_json, pop3_json, caldav_url, carddav_url, sent_copy,
         sync_window_days, mail_enabled, calendar_enabled, contacts_enabled, tasks_enabled,
         notifications_enabled, include_in_unified, sort_order, state, state_message,
         capabilities_json, created_at, updated_at
-    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)";
+    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)";
     let mut all = values;
     all.push(Value::Text(now_string()));
     let refs: Vec<&dyn rusqlite::ToSql> = all.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
@@ -192,11 +200,11 @@ pub fn upsert(conn: &Connection, account: &Account) -> Result<()> {
     let values = account_values(account)?;
     let sql = "INSERT INTO account (
         id, provider, email, display_name, color, auth_kind, oauth_provider,
-        imap_json, smtp_json, pop3_json, caldav_url, carddav_url,
+        imap_json, smtp_json, pop3_json, caldav_url, carddav_url, sent_copy,
         sync_window_days, mail_enabled, calendar_enabled, contacts_enabled, tasks_enabled,
         notifications_enabled, include_in_unified, sort_order, state, state_message,
         capabilities_json, created_at, updated_at
-    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
+    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
     ON CONFLICT(id) DO UPDATE SET
         provider = excluded.provider,
         email = excluded.email,
@@ -209,6 +217,7 @@ pub fn upsert(conn: &Connection, account: &Account) -> Result<()> {
         pop3_json = excluded.pop3_json,
         caldav_url = excluded.caldav_url,
         carddav_url = excluded.carddav_url,
+        sent_copy = excluded.sent_copy,
         sync_window_days = excluded.sync_window_days,
         mail_enabled = excluded.mail_enabled,
         calendar_enabled = excluded.calendar_enabled,
@@ -295,6 +304,9 @@ pub fn update_patch(conn: &Connection, id: &str, patch: &AccountPatch) -> Result
     }
     if let Some(value) = &patch.carddav_url {
         account.carddav_url = value.clone();
+    }
+    if let Some(value) = &patch.sent_copy {
+        account.sent_copy = *value;
     }
     if let Some(value) = patch.sync_window_days {
         account.sync_window_days = value;

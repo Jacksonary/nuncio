@@ -338,6 +338,17 @@ impl MailService {
             if account.imap.is_none() || is_local_only(account.provider) {
                 continue;
             }
+            // Some servers accept UID SEARCH but cannot answer it: QQ and
+            // NetEase return no hits, 139 ignores the criteria and returns
+            // every message. Leave those accounts to the local index rather
+            // than losing body matches or flooding the result set.
+            if !nuncio_core::providers::server_text_search(&account) {
+                debug!(
+                    account = %account.id,
+                    "provider text search is unreliable; using the local index"
+                );
+                continue;
+            }
             let folder = match query.folder_id.as_deref() {
                 Some(folder_id) => match self.folder(folder_id).await {
                     Ok(folder) if folder.account_id == account.id => Some(folder),

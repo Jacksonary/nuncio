@@ -161,8 +161,7 @@ pub fn parse_subscription(
     let mut masters_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for parsed in parsed_events {
         let recurrence_id = parsed.recurrence_id.clone();
-        let is_master =
-            recurrence_id.is_none() && masters_seen.insert(parsed.uid.clone());
+        let is_master = recurrence_id.is_none() && masters_seen.insert(parsed.uid.clone());
         let uid = parsed.uid.clone();
         let rrule = parsed.rrule.clone();
         let exdates = parsed.exdates.clone();

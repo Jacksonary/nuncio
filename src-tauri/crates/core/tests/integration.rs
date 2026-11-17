@@ -39,6 +39,7 @@ fn add_account(db: &Db, id: &str, email: &str, unified: bool) -> Account {
         pop3: None,
         caldav_url: None,
         carddav_url: None,
+        sent_copy: None,
         sync_window_days: 90,
         mail_enabled: true,
         calendar_enabled: true,
@@ -174,6 +175,34 @@ fn accounts_identity_signature_and_patch() {
         assert!(account.imap.is_none());
         // untouched field
         assert_eq!(account.smtp.as_ref().map(|s| s.port), Some(587));
+
+        // sent_copy round-trips through the column and serializes as camelCase.
+        let patch: AccountPatch =
+            serde_json::from_str(r#"{"sentCopy":"server"}"#).expect("sent copy patch");
+        let account = repo::accounts::update_patch(conn, "acc", &patch)?;
+        assert_eq!(account.sent_copy, Some(SentCopyMode::Server));
+        let persisted = repo::accounts::get_required(conn, "acc")?;
+        assert_eq!(persisted.sent_copy, Some(SentCopyMode::Server));
+
+        let mut value = serde_json::to_value(&persisted).expect("account json");
+        assert_eq!(value["sentCopy"], serde_json::json!("server"));
+        // An older payload without the field means "automatic".
+        value.as_object_mut().expect("object").remove("sentCopy");
+        let old: Account = serde_json::from_value(value).expect("account without sentCopy");
+        assert_eq!(old.sent_copy, None);
+
+        // A value written by a newer build must not break the row mapping.
+        conn.execute(
+            "UPDATE account SET sent_copy = 'bogus' WHERE id = 'acc'",
+            [],
+        )?;
+        assert_eq!(repo::accounts::get_required(conn, "acc")?.sent_copy, None);
+
+        // null resets the setting to automatic.
+        let patch: AccountPatch =
+            serde_json::from_str(r#"{"sentCopy":null}"#).expect("clear sent copy");
+        let account = repo::accounts::update_patch(conn, "acc", &patch)?;
+        assert_eq!(account.sent_copy, None);
 
         repo::accounts::reorder(conn, &["acc".to_string(), "local".to_string()])?;
         let accounts = repo::accounts::list(conn)?;

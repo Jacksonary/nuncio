@@ -1,12 +1,17 @@
-//! Built-in provider presets and MX-record based matching.
+//! Provider presets backed by the verified directory in `nuncio-core`.
 //!
 //! Presets give instant, offline discovery for the most common consumer
 //! providers (including the Chinese ones from the product plan) and are also
 //! used when an MX lookup identifies the provider behind a custom domain.
+//!
+//! This module deliberately carries no provider data of its own: hosts, DAV
+//! endpoints, notes and auth kinds all come from [`nuncio_core::providers`], so
+//! discovery and account creation cannot drift apart.
 
 use nuncio_core::models::{
     AuthKind, DiscoveryResult, OAuthProvider, ProviderKind, Security, ServerConfig,
 };
+use nuncio_core::providers::{self, ProviderInfo};
 
 /// One host/port/security triple before the username is known.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,12 +37,16 @@ impl ServerSpec {
 
 /// i18n keys for discovery hints (translated by the settings UI).
 pub const NOTE_AUTH_CODE: &str = "discovery.note.authCode";
+pub const NOTE_AUTH_CODE_ENABLE: &str = "discovery.note.authCodeEnable";
 pub const NOTE_APP_PASSWORD_APPLE: &str = "discovery.note.appPasswordApple";
 pub const NOTE_APP_PASSWORD_YAHOO: &str = "discovery.note.appPasswordYahoo";
+pub const NOTE_APP_PASSWORD_YANDEX: &str = "discovery.note.appPasswordYandex";
 pub const NOTE_APP_PASSWORD: &str = "discovery.note.appPassword";
 pub const NOTE_PROTON_BRIDGE: &str = "discovery.note.protonBridge";
 pub const NOTE_GUESSED: &str = "discovery.note.guessed";
 pub const NOTE_ENTERPRISE: &str = "discovery.note.enterprise";
+pub const NOTE_ENABLE_IMAP: &str = "discovery.note.enableImap";
+pub const NOTE_NO_IMAP: &str = "discovery.note.noImap";
 
 /// A provider preset before the account e-mail is applied.
 #[derive(Debug, Clone, PartialEq)]
@@ -76,281 +85,56 @@ impl Preset {
     }
 }
 
-fn server(host: impl Into<String>, port: u16, security: Security) -> Option<ServerSpec> {
-    Some(ServerSpec::new(host, port, security))
-}
-
-fn oauth_preset(
-    provider: ProviderKind,
-    oauth: OAuthProvider,
-    imap: Option<ServerSpec>,
-    smtp: Option<ServerSpec>,
-) -> Preset {
-    Preset {
-        provider,
-        auth_kind: AuthKind::Oauth,
-        oauth_provider: Some(oauth),
-        imap,
-        smtp,
-        pop3: None,
-        caldav_url: None,
-        carddav_url: None,
-        note: None,
-        source: "preset",
-    }
-}
-
-fn password_preset(
-    provider: ProviderKind,
-    imap: Option<ServerSpec>,
-    smtp: Option<ServerSpec>,
-    note: Option<&str>,
-) -> Preset {
-    Preset {
-        provider,
-        auth_kind: AuthKind::Password,
-        oauth_provider: None,
-        imap,
-        smtp,
-        pop3: None,
-        caldav_url: None,
-        carddav_url: None,
-        note: note.map(str::to_string),
-        source: "preset",
-    }
-}
-
-/// Gmail / Google Workspace (consumer domains).
-pub fn gmail_preset() -> Preset {
-    oauth_preset(
-        ProviderKind::Gmail,
-        OAuthProvider::Google,
-        server("imap.gmail.com", 993, Security::Tls),
-        server("smtp.gmail.com", 465, Security::Tls),
-    )
-}
-
-/// Outlook.com / Microsoft 365.
-pub fn outlook_preset() -> Preset {
-    oauth_preset(
-        ProviderKind::Outlook,
-        OAuthProvider::Microsoft,
-        server("outlook.office365.com", 993, Security::Tls),
-        server("smtp.office365.com", 587, Security::Starttls),
-    )
-}
-
-/// QQ / Foxmail consumer mail.
-pub fn qq_preset() -> Preset {
-    password_preset(
-        ProviderKind::Qq,
-        server("imap.qq.com", 993, Security::Tls),
-        server("smtp.qq.com", 465, Security::Tls),
-        Some(NOTE_AUTH_CODE),
-    )
-}
-
-/// Tencent Exmail (enterprise QQ mail), including custom domains via MX.
-pub fn exmail_preset() -> Preset {
-    password_preset(
-        ProviderKind::Qq,
-        server("imap.exmail.qq.com", 993, Security::Tls),
-        server("smtp.exmail.qq.com", 465, Security::Tls),
-        Some(NOTE_ENTERPRISE),
-    )
-}
-
-/// Netease 163 / 126 / yeah / vip / 188.
-pub fn netease_preset(domain: &str) -> Preset {
-    password_preset(
-        ProviderKind::Netease,
-        server(format!("imap.{domain}"), 993, Security::Tls),
-        server(format!("smtp.{domain}"), 465, Security::Tls),
-        Some(NOTE_AUTH_CODE),
-    )
-}
-
-/// Netease enterprise mail (`qiye.163.com`).
-pub fn netease_enterprise_preset() -> Preset {
-    password_preset(
-        ProviderKind::Netease,
-        server("imap.qiye.163.com", 993, Security::Tls),
-        server("smtp.qiye.163.com", 465, Security::Tls),
-        Some(NOTE_ENTERPRISE),
-    )
-}
-
-/// Alibaba enterprise mail.
-pub fn aliyun_enterprise_preset() -> Preset {
-    password_preset(
-        ProviderKind::Imap,
-        server("imap.qiye.aliyun.com", 993, Security::Tls),
-        server("smtp.qiye.aliyun.com", 465, Security::Tls),
-        Some(NOTE_ENTERPRISE),
-    )
-}
-
-/// Match an exact e-mail domain against the built-in table.
-pub fn lookup(domain: &str) -> Option<Preset> {
-    let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
-    let preset = match domain.as_str() {
-        "gmail.com" | "googlemail.com" => gmail_preset(),
-
-        "outlook.com" | "hotmail.com" | "live.com" | "msn.com" | "outlook.cn" => outlook_preset(),
-
-        "icloud.com" | "me.com" | "mac.com" => Preset {
-            provider: ProviderKind::Icloud,
-            auth_kind: AuthKind::Password,
-            oauth_provider: None,
-            imap: server("imap.mail.me.com", 993, Security::Tls),
-            smtp: server("smtp.mail.me.com", 587, Security::Starttls),
-            pop3: None,
-            caldav_url: Some("https://caldav.icloud.com".to_string()),
-            carddav_url: Some("https://contacts.icloud.com".to_string()),
-            note: Some(NOTE_APP_PASSWORD_APPLE.to_string()),
-            source: "preset",
-        },
-
-        "yahoo.com" | "ymail.com" => password_preset(
-            ProviderKind::Yahoo,
-            server("imap.mail.yahoo.com", 993, Security::Tls),
-            server("smtp.mail.yahoo.com", 465, Security::Tls),
-            Some(NOTE_APP_PASSWORD_YAHOO),
-        ),
-
-        "qq.com" | "foxmail.com" | "vip.qq.com" => qq_preset(),
-        "exmail.qq.com" => exmail_preset(),
-
-        "163.com" | "126.com" | "yeah.net" | "vip.163.com" | "188.com" => netease_preset(&domain),
-
-        "aliyun.com" => password_preset(
-            ProviderKind::Imap,
-            server("imap.aliyun.com", 993, Security::Tls),
-            server("smtp.aliyun.com", 465, Security::Tls),
-            Some(NOTE_AUTH_CODE),
-        ),
-
-        "139.com" => password_preset(
-            ProviderKind::Imap,
-            server("imap.139.com", 993, Security::Tls),
-            server("smtp.139.com", 465, Security::Tls),
-            Some(NOTE_AUTH_CODE),
-        ),
-
-        "sina.com" | "sina.cn" => password_preset(
-            ProviderKind::Imap,
-            server("imap.sina.com", 993, Security::Tls),
-            server("smtp.sina.com", 465, Security::Tls),
-            Some(NOTE_AUTH_CODE),
-        ),
-
-        "sohu.com" => password_preset(
-            ProviderKind::Imap,
-            server("imap.sohu.com", 993, Security::Tls),
-            server("smtp.sohu.com", 465, Security::Tls),
-            Some(NOTE_AUTH_CODE),
-        ),
-
-        "fastmail.com" => Preset {
-            caldav_url: Some("https://caldav.fastmail.com/dav/calendars".to_string()),
-            carddav_url: Some("https://carddav.fastmail.com/dav/addressbooks".to_string()),
-            ..password_preset(
-                ProviderKind::Imap,
-                server("imap.fastmail.com", 993, Security::Tls),
-                server("smtp.fastmail.com", 465, Security::Tls),
-                Some(NOTE_APP_PASSWORD),
-            )
-        },
-
-        "zoho.com" => password_preset(
-            ProviderKind::Imap,
-            server("imap.zoho.com", 993, Security::Tls),
-            server("smtp.zoho.com", 465, Security::Tls),
-            Some(NOTE_APP_PASSWORD),
-        ),
-
-        "yandex.com" | "yandex.ru" => password_preset(
-            ProviderKind::Imap,
-            server("imap.yandex.com", 993, Security::Tls),
-            server("smtp.yandex.com", 465, Security::Tls),
-            Some(NOTE_APP_PASSWORD),
-        ),
-
-        "gmx.com" | "gmx.net" => password_preset(
-            ProviderKind::Imap,
-            server("imap.gmx.com", 993, Security::Tls),
-            server("smtp.gmx.com", 587, Security::Starttls),
-            Some(NOTE_APP_PASSWORD),
-        ),
-
-        "aol.com" => password_preset(
-            ProviderKind::Imap,
-            server("imap.aol.com", 993, Security::Tls),
-            server("smtp.aol.com", 465, Security::Tls),
-            Some(NOTE_APP_PASSWORD),
-        ),
-
-        "mail.ru" => password_preset(
-            ProviderKind::Imap,
-            server("imap.mail.ru", 993, Security::Tls),
-            server("smtp.mail.ru", 465, Security::Tls),
-            Some(NOTE_APP_PASSWORD),
-        ),
-
-        "proton.me" | "protonmail.com" | "pm.me" => password_preset(
-            ProviderKind::Imap,
-            server("127.0.0.1", 1143, Security::Starttls),
-            server("127.0.0.1", 1025, Security::Starttls),
-            Some(NOTE_PROTON_BRIDGE),
-        ),
-
-        _ => return None,
+/// Build a preset from a directory row.
+///
+/// `domain` resolves `{domain}` host templates (NetEase brands). It must be the
+/// account's own domain: for an MX hit the provider is behind a custom domain,
+/// but no MX-reachable entry uses a template, so a placeholder is harmless.
+fn preset_from_info(info: &ProviderInfo, domain: &str) -> Preset {
+    let spec = |template: Option<nuncio_core::providers::ServerTemplate>| {
+        template.map(|template| {
+            ServerSpec::new(template.host_for(domain), template.port, template.security)
+        })
     };
-    Some(preset)
+    Preset {
+        provider: info.kind,
+        auth_kind: info.auth_kind,
+        oauth_provider: info.oauth_provider,
+        imap: spec(info.imap),
+        smtp: spec(info.smtp),
+        pop3: None,
+        caldav_url: info.caldav.map(str::to_string),
+        carddav_url: info.carddav.map(str::to_string),
+        note: info.note.map(str::to_string),
+        source: "preset",
+    }
+}
+
+/// Match an exact e-mail domain against the built-in directory.
+pub fn lookup(domain: &str) -> Option<Preset> {
+    let info = providers::by_domain(domain)?;
+    Some(preset_from_info(info, domain))
 }
 
 /// Match MX hosts (in preference order) to a provider preset.
 pub fn match_mx(hosts: &[String]) -> Option<Preset> {
-    for host in hosts {
-        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
-        if host.is_empty() {
-            continue;
-        }
-
-        if host.contains("google.com") || host.contains("googlemail.com") {
-            return Some(gmail_preset().with_source("mx"));
-        }
-        if host.contains("outlook.com") || host.contains("protection.outlook.com") {
-            return Some(outlook_preset().with_source("mx"));
-        }
-        if host.contains("mxhichina.com") || host.contains("qiye.aliyun.com") {
-            return Some(aliyun_enterprise_preset().with_source("mx"));
-        }
-        if host.contains("qiye.163.com") || host.contains("163.com") || host.contains("netease.com")
-        {
-            return Some(netease_enterprise_preset().with_source("mx"));
-        }
-        if host.contains("qq.com") {
-            return Some(exmail_preset().with_source("mx"));
-        }
-    }
-    None
+    let info = providers::by_mx(hosts)?;
+    // `match_mx` has no account domain; the directory's first domain is only
+    // used to fold host templates, which no MX-matched entry has today.
+    let domain = info.domains.first().copied().unwrap_or_default();
+    Some(preset_from_info(info, domain).with_source("mx"))
 }
 
-/// Preset CalDAV/CardDAV endpoints for a domain, if known.
+/// Preset CalDAV/CardDAV endpoints for a domain, if the provider is known.
+///
+/// `Some((None, None))` is meaningful: the provider is in the directory and has
+/// no DAV service (e.g. 163), so callers must not probe well-known either.
 pub fn preset_dav(domain: &str) -> Option<(Option<String>, Option<String>)> {
-    let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
-    match domain.as_str() {
-        "icloud.com" | "me.com" | "mac.com" => Some((
-            Some("https://caldav.icloud.com".to_string()),
-            Some("https://contacts.icloud.com".to_string()),
-        )),
-        "fastmail.com" => Some((
-            Some("https://caldav.fastmail.com/dav/calendars".to_string()),
-            Some("https://carddav.fastmail.com/dav/addressbooks".to_string()),
-        )),
-        _ => None,
-    }
+    let info = providers::by_domain(domain)?;
+    Some((
+        info.caldav.map(str::to_string),
+        info.carddav.map(str::to_string),
+    ))
 }
 
 #[cfg(test)]
@@ -358,7 +142,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gmail_preset_uses_oauth_and_tls() {
+    fn gmail_lookup_uses_oauth_and_tls() {
         let preset = lookup("gmail.com").expect("gmail");
         let result = preset.into_result("User@Gmail.com");
         assert_eq!(result.provider, ProviderKind::Gmail);
@@ -374,43 +158,46 @@ mod tests {
     }
 
     #[test]
-    fn outlook_preset_uses_starttls_smtp() {
+    fn outlook_lookup_uses_starttls_smtp() {
         let result = lookup("hotmail.com")
             .expect("outlook")
             .into_result("a@hotmail.com");
         assert_eq!(result.provider, ProviderKind::Outlook);
         assert_eq!(result.oauth_provider, Some(OAuthProvider::Microsoft));
         let smtp = result.smtp.expect("smtp");
-        assert_eq!(smtp.host, "smtp.office365.com");
+        assert_eq!(smtp.host, "smtp-mail.outlook.com");
         assert_eq!(smtp.port, 587);
         assert_eq!(smtp.security, Security::Starttls);
     }
 
     #[test]
+    fn outlook_cn_is_not_a_consumer_domain() {
+        assert!(lookup("outlook.cn").is_none());
+    }
+
+    #[test]
     fn chinese_providers_have_notes() {
-        for (domain, provider) in [
-            ("qq.com", ProviderKind::Qq),
-            ("163.com", ProviderKind::Netease),
-            ("126.com", ProviderKind::Netease),
-            ("aliyun.com", ProviderKind::Imap),
+        for (domain, provider, note) in [
+            ("qq.com", ProviderKind::Qq, NOTE_AUTH_CODE_ENABLE),
+            ("163.com", ProviderKind::Netease, NOTE_AUTH_CODE),
+            ("126.com", ProviderKind::Netease, NOTE_AUTH_CODE),
+            ("aliyun.com", ProviderKind::Imap, NOTE_AUTH_CODE),
         ] {
             let result = lookup(domain)
                 .expect(domain)
                 .into_result(&format!("a@{domain}"));
             assert_eq!(result.provider, provider);
             assert_eq!(result.auth_kind, AuthKind::Password);
-            assert_eq!(
-                result.note.as_deref(),
-                Some(NOTE_AUTH_CODE),
-                "{domain} should ask for an authorization code"
-            );
+            assert_eq!(result.note.as_deref(), Some(note), "{domain}");
         }
 
         for (domain, key) in [
             ("exmail.qq.com", NOTE_ENTERPRISE),
             ("yahoo.com", NOTE_APP_PASSWORD_YAHOO),
+            ("yandex.ru", NOTE_APP_PASSWORD_YANDEX),
             ("icloud.com", NOTE_APP_PASSWORD_APPLE),
             ("proton.me", NOTE_PROTON_BRIDGE),
+            ("zoho.com", NOTE_ENABLE_IMAP),
         ] {
             let result = lookup(domain)
                 .expect(domain)
@@ -467,6 +254,37 @@ mod tests {
     }
 
     #[test]
+    fn yandex_lookup_carries_the_ru_dav_hosts() {
+        let result = lookup("yandex.ru")
+            .expect("yandex")
+            .into_result("a@yandex.ru");
+        assert_eq!(
+            result.caldav_url.as_deref(),
+            Some("https://caldav.yandex.ru")
+        );
+        assert_eq!(
+            result.carddav_url.as_deref(),
+            Some("https://carddav.yandex.ru")
+        );
+    }
+
+    #[test]
+    fn sina_cn_uses_its_own_brand_host() {
+        let result = lookup("sina.cn").expect("sina.cn").into_result("a@sina.cn");
+        assert_eq!(result.imap.expect("imap").host, "imap.sina.cn");
+    }
+
+    #[test]
+    fn netease_brands_use_per_domain_hosts_and_the_full_address() {
+        let result = lookup("126.com")
+            .expect("126.com")
+            .into_result("someone@126.com");
+        let imap = result.imap.expect("imap");
+        assert_eq!(imap.host, "imap.126.com");
+        assert_eq!(imap.username, "someone@126.com");
+    }
+
+    #[test]
     fn proton_uses_bridge() {
         let result = lookup("proton.me")
             .expect("proton")
@@ -505,7 +323,7 @@ mod tests {
             "imap.qiye.163.com"
         );
 
-        let hosts = vec!["mx1.qq.com.".to_string()];
+        let hosts = vec!["mxbiz1.qq.com.".to_string()];
         assert_eq!(
             match_mx(&hosts).expect("exmail").imap.expect("imap").host,
             "imap.exmail.qq.com"
@@ -515,10 +333,22 @@ mod tests {
     }
 
     #[test]
+    fn consumer_netease_mx_is_not_the_enterprise_preset() {
+        assert!(match_mx(&["163mx01.mxmail.netease.com".to_string()]).is_none());
+    }
+
+    #[test]
     fn dav_presets() {
         let (caldav, carddav) = preset_dav("icloud.com").expect("icloud dav");
         assert!(caldav.expect("caldav").contains("caldav.icloud.com"));
         assert!(carddav.expect("carddav").contains("contacts.icloud.com"));
+
+        // A known provider without DAV must report "known, nothing to probe".
+        assert_eq!(
+            preset_dav("163.com"),
+            Some((None, Some("https://contacts.163.com".into())))
+        );
+        assert_eq!(preset_dav("126.com"), Some((None, None)));
         assert!(preset_dav("example.org").is_none());
     }
 }
