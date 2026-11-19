@@ -10,6 +10,7 @@ import { calendar } from "./calendar";
 import { people } from "./people";
 import { todo } from "./todo";
 import { settings } from "./settings";
+import { sync } from "./sync";
 
 export type UiLanguage = "zh-CN" | "en-US";
 
@@ -28,6 +29,7 @@ const all: DictionarySet[] = [
   people,
   todo,
   settings,
+  sync,
 ] as DictionarySet[];
 
 export const dictionaries: DictionarySet = {

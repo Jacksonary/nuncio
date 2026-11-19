@@ -47,6 +47,12 @@ export interface ComposeWindowProps {
 
 export interface SettingsPanelProps {
   onClose: () => void;
+  /**
+   * Account to open on arrival. The mail sidebar raises this from "repair
+   * account" so the panel lands on that account's detail page instead of the
+   * settings index, where the user would have to find the account again.
+   */
+  accountId?: string | null;
 }
 
 export interface AddAccountDialogProps {

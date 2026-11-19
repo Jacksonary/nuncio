@@ -190,7 +190,7 @@ function tileForOAuth(provider: OAuthProvider): ProviderTile {
 
 export function AddAccountDialog({ open, onClose, onCreated }: AddAccountDialogProps) {
   const t = useT();
-  const { settings, update: updateSettings } = useSettings();
+  const { settings, updateAsync } = useSettings();
   const accountsQuery = useAccounts();
   const appInfo = useAppInfo();
   const createAccount = useCreateAccount();
@@ -366,12 +366,43 @@ export function AddAccountDialog({ open, onClose, onCreated }: AddAccountDialogP
     }
   };
 
+  /**
+   * Persist the client secret typed into the missing-client panel.
+   *
+   * The keyring write is deliberately deferred to the moment the user starts
+   * the sign-in: that is the first point where the secret is actually needed,
+   * and the explicit confirmation that it should be stored. Writing it from
+   * the auxiliary "Save" button (or while typing) would leave a secret behind
+   * when the wizard is cancelled before any account exists.
+   */
+  const persistClientSecret = async (): Promise<boolean> => {
+    // Only Google uses the advanced secret; a draft left over from an earlier
+    // Google tile must not be written when signing in to another provider.
+    if (tile?.oauthProvider !== "google") return true;
+    const secret = clientSecretPatch(googleClientSecret);
+    if (secret === undefined) return true;
+    try {
+      await updateAsync({ advanced: { googleClientSecret: secret } });
+      setGoogleClientSecret("");
+      return true;
+    } catch {
+      // useUpdateSettings already surfaced the failure; keep the draft so the
+      // user can retry instead of losing what they typed.
+      return false;
+    }
+  };
+
   const startOauth = async () => {
-    if (!tile?.oauthProvider) return;
+    if (!tile?.oauthProvider || oauthBusy) return;
     const run = oauthRunRef.current + 1;
     oauthRunRef.current = run;
     setOauthBusy(true);
     setOauthError(null);
+    if (!(await persistClientSecret())) {
+      if (oauthRunRef.current === run) setOauthBusy(false);
+      return;
+    }
+    if (oauthRunRef.current !== run) return;
     try {
       const result = await accounts.oauthLogin(
         tile.oauthProvider,
@@ -495,21 +526,21 @@ export function AddAccountDialog({ open, onClose, onCreated }: AddAccountDialogP
         : !(appInfo.data?.buildHasMicrosoftClient || settings.advanced.microsoftClientId)
       : false;
 
-  const saveClientIds = () => {
-    const advanced: {
-      googleClientId: string | null;
-      microsoftClientId: string | null;
-      googleClientSecret?: string;
-    } = {
-      googleClientId: googleClientId.trim() || null,
-      microsoftClientId: microsoftClientId.trim() || null,
-    };
-    // Only send a secret the user actually typed; the mask is never written back.
-    const secret = clientSecretPatch(googleClientSecret);
-    if (secret !== undefined) advanced.googleClientSecret = secret;
-    updateSettings({ advanced });
-    setGoogleClientSecret("");
-    toast.success(t("settings.addAccount.clientSaved"));
+  const saveClientIds = async () => {
+    // The secret draft stays in memory: it is persisted only when the user
+    // commits to the sign-in (see persistClientSecret), so closing the wizard
+    // here cannot leave a keyring entry behind.
+    try {
+      await updateAsync({
+        advanced: {
+          googleClientId: googleClientId.trim() || null,
+          microsoftClientId: microsoftClientId.trim() || null,
+        },
+      });
+      toast.success(t("settings.addAccount.clientSaved"));
+    } catch {
+      // Reported by useUpdateSettings; the draft stays in the inputs.
+    }
   };
 
   const openHelp = () => {
@@ -751,7 +782,7 @@ export function AddAccountDialog({ open, onClose, onCreated }: AddAccountDialogP
                     />
                   )}
                   <div className={styles.actions}>
-                    <Button appearance="primary" size="small" onClick={saveClientIds}>
+                    <Button appearance="primary" size="small" onClick={() => void saveClientIds()}>
                       {t("common.save")}
                     </Button>
                   </div>

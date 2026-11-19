@@ -25,6 +25,23 @@ fn is_local_only(provider: ProviderKind) -> bool {
     matches!(provider, ProviderKind::Local | ProviderKind::Pop3)
 }
 
+/// Whether a delete must erase the message instead of moving it to Trash.
+///
+/// The backend owns this decision: it sees each message's real folder, while a
+/// client only sees one selected folder (which is wrong for search results).
+/// A draft is always erased outright — "discard draft" must not leave a copy in
+/// Trash, and a draft keeps `is_draft` set when merely moved, so the Drafts
+/// count would never drop. The Drafts folder role is checked as well because a
+/// server flag can lag behind the folder a message actually sits in.
+fn delete_is_permanent(requested: bool, source_role: FolderRole, is_draft: bool) -> bool {
+    requested
+        || is_draft
+        || matches!(
+            source_role,
+            FolderRole::Trash | FolderRole::Junk | FolderRole::Drafts
+        )
+}
+
 /// Serializable copy of [`StoredMessage`] (core keeps that type serde-free).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct StoredSnapshot {
@@ -636,9 +653,12 @@ impl MailService {
 
     /// Apply an action to one or more messages: local state changes are
     /// immediate, the server work is queued, and an undo entry is recorded.
-    pub async fn message_act(&self, ids: &[String], action: &MessageAction) -> Result<()> {
+    ///
+    /// Returns the undo entry id, or an empty string when the action recorded
+    /// nothing reversible (for example discarding a queued outbox item).
+    pub async fn message_act(&self, ids: &[String], action: &MessageAction) -> Result<String> {
         if ids.is_empty() {
-            return Ok(());
+            return Ok(String::new());
         }
         // Synthetically projected outbox rows are not in the message table.
         // Deleting one discards the queued message; flags/moves do not apply.
@@ -657,11 +677,11 @@ impl MailService {
                     for id in outbox_ids {
                         self.outbox_discard(id).await?;
                     }
-                    return Ok(());
+                    return Ok(String::new());
                 }
                 MessageAction::SetSeen { .. } | MessageAction::SetFlagged { .. } => {
                     // Outbox rows are always "read" and cannot be flagged.
-                    return Ok(());
+                    return Ok(String::new());
                 }
                 _ => {
                     return Err(AppError::invalid_input(
@@ -747,7 +767,7 @@ impl MailService {
                         .await?
                         .unwrap_or(FolderRole::Other);
                     permanent =
-                        *requested || matches!(source_role, FolderRole::Trash | FolderRole::Junk);
+                        delete_is_permanent(*requested, source_role, message.summary.is_draft);
                     if !permanent {
                         target_folder = self
                             .role_folder(&account, FolderRole::Trash, &mut role_cache)
@@ -790,7 +810,7 @@ impl MailService {
             });
         }
         if targets.is_empty() {
-            return Ok(());
+            return Ok(String::new());
         }
 
         // ── local changes (single transaction) ────────────────────────
@@ -978,18 +998,19 @@ impl MailService {
         let description_for_db = description.clone();
         let value_for_db = serde_json::to_value(&payload)
             .map_err(|error| AppError::internal(format!("cannot encode undo entry: {error}")))?;
-        self.inner
+        let undo_id = self
+            .inner
             .ctx
             .db
             .write(move |db| {
-                repo::undo::push(
+                Ok(repo::undo::push(
                     db,
                     &account_for_undo,
                     action_kind,
                     &description_for_db,
                     &value_for_db,
-                )?;
-                Ok(())
+                )?
+                .id)
             })
             .await?;
 
@@ -1024,7 +1045,7 @@ impl MailService {
             ops = op_ids.len(),
             "applied message action"
         );
-        Ok(())
+        Ok(undo_id)
     }
 
     async fn role_folder(
@@ -1289,14 +1310,16 @@ impl MailService {
     }
 
     /// Apply an action to every message of the given conversations.
+    ///
+    /// Returns the undo entry id like [`Self::message_act`].
     pub async fn message_act_threads(
         &self,
         account_id: &str,
         thread_ids: &[String],
         action: &MessageAction,
-    ) -> Result<()> {
+    ) -> Result<String> {
         if thread_ids.is_empty() {
-            return Ok(());
+            return Ok(String::new());
         }
         let mut ids: Vec<String> = Vec::new();
         for thread_id in thread_ids {
@@ -1321,6 +1344,11 @@ impl MailService {
     /// nothing to undo (or the action can no longer be reverted).
     pub async fn message_undo_last(&self) -> Result<bool> {
         self.undo_last().await
+    }
+
+    /// Revert one specific action by the undo id returned from `message_act`.
+    pub async fn message_undo(&self, undo_id: &str) -> Result<bool> {
+        self.undo_by_id(undo_id).await
     }
 
     /// Run one local rule immediately against a folder; returns the number of
@@ -1719,4 +1747,35 @@ fn list_label_messages(
         next_cursor,
         total,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::delete_is_permanent;
+    use nuncio_core::models::FolderRole;
+
+    #[test]
+    fn a_discarded_draft_is_deleted_rather_than_trashed() {
+        // The Drafts folder is a normal folder, so a role-only rule would move
+        // the draft to Trash and leave is_draft set.
+        let requested = false;
+        let is_draft = true;
+        assert!(delete_is_permanent(requested, FolderRole::Other, is_draft));
+        // The folder role is enough even when the server flag is missing.
+        let is_draft = false;
+        assert!(delete_is_permanent(requested, FolderRole::Drafts, is_draft));
+    }
+
+    #[test]
+    fn trash_and_junk_are_already_permanent() {
+        assert!(delete_is_permanent(false, FolderRole::Trash, false));
+        assert!(delete_is_permanent(false, FolderRole::Junk, false));
+        assert!(!delete_is_permanent(false, FolderRole::Inbox, false));
+        assert!(!delete_is_permanent(false, FolderRole::Archive, false));
+    }
+
+    #[test]
+    fn an_explicit_request_wins() {
+        assert!(delete_is_permanent(true, FolderRole::Inbox, false));
+    }
 }

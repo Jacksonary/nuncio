@@ -10,6 +10,11 @@ export type ContactEditorRequest =
   | { mode: "create"; addressBookId: Id | null }
   | { mode: "edit"; contactId: Id };
 
+/** A delete command raised by the Delete hotkey, valid for one list read. */
+export interface ContactDeleteRequest {
+  ids: Id[];
+}
+
 interface PeopleUiState {
   favoritesOnly: boolean;
   search: string;
@@ -22,8 +27,12 @@ interface PeopleUiState {
   importOpen: boolean;
   /** Incremented by the search hotkey; Main focuses the search box. */
   focusSearchRequest: number;
-  /** Incremented by the Delete hotkey; Main shows the delete confirmation. */
-  deleteRequest: number;
+  /**
+   * Raised by the Delete hotkey. The ids are captured at that moment; the list
+   * consumes the request when it reads it, so cancelling the confirmation
+   * cannot replay it after a remount.
+   */
+  deleteRequest: ContactDeleteRequest | null;
 
   setFavoritesOnly: (value: boolean) => void;
   setSearch: (value: string) => void;
@@ -37,10 +46,12 @@ interface PeopleUiState {
   closeEditor: () => void;
   setImportOpen: (open: boolean) => void;
   requestSearchFocus: () => void;
-  requestDelete: () => void;
+  requestDelete: (fallbackId?: Id | null) => void;
+  /** Read and clear the pending delete command (one-shot semantics). */
+  consumeDeleteRequest: () => ContactDeleteRequest | null;
 }
 
-export const usePeopleUiStore = create<PeopleUiState>()((set) => ({
+export const usePeopleUiStore = create<PeopleUiState>()((set, get) => ({
   favoritesOnly: false,
   search: "",
   selectedIds: [],
@@ -49,7 +60,7 @@ export const usePeopleUiStore = create<PeopleUiState>()((set) => ({
   editor: null,
   importOpen: false,
   focusSearchRequest: 0,
-  deleteRequest: 0,
+  deleteRequest: null,
 
   setFavoritesOnly: (value) => set({ favoritesOnly: value }),
   setSearch: (value) => set({ search: value }),
@@ -70,7 +81,24 @@ export const usePeopleUiStore = create<PeopleUiState>()((set) => ({
   setImportOpen: (open) => set({ importOpen: open }),
   requestSearchFocus: () =>
     set((state) => ({ focusSearchRequest: state.focusSearchRequest + 1 })),
-  requestDelete: () => set((state) => ({ deleteRequest: state.deleteRequest + 1 })),
+  requestDelete: (fallbackId) =>
+    set((state) => {
+      const ids =
+        state.selectedIds.length > 0
+          ? state.selectedIds
+          : fallbackId
+            ? [fallbackId]
+            : [];
+      // Nothing selected: leave any state untouched rather than queueing an
+      // empty confirmation.
+      if (ids.length === 0) return {};
+      return { deleteRequest: { ids } };
+    }),
+  consumeDeleteRequest: () => {
+    const request = get().deleteRequest;
+    if (request) set({ deleteRequest: null });
+    return request;
+  },
 }));
 
 /** Scope currently shown in the list. */

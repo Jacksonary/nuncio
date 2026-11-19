@@ -748,29 +748,22 @@ export function TaskDetail({ taskId, seedTask, lists, accounts, today, onDeleted
           />
           {reminderOpen && !readOnly ? (
             <div className={styles.reminderEditor}>
+              {/* Only the explicit remove button below clears a reminder; a
+                  per-field clear used to delete the whole reminder and close
+                  the editor. */}
               <DatePicker
                 value={reminderDate}
                 onChange={(date) => {
-                  if (!date) {
-                    clearReminder();
-                    return;
-                  }
-                  applyReminder(date, reminderTime ?? "09:00");
+                  if (date) applyReminder(date, reminderTime ?? "09:00");
                 }}
                 label={t("todo.reminder.date")}
-                clearable
               />
               <TimePicker
                 value={reminderTime}
                 onChange={(time) => {
-                  if (!time) {
-                    clearReminder();
-                    return;
-                  }
-                  applyReminder(reminderDate ?? today, time);
+                  if (time) applyReminder(reminderDate ?? today, time);
                 }}
                 label={t("todo.reminder.time")}
-                clearable
               />
               {task.reminderAt ? (
                 <Button

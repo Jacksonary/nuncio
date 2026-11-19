@@ -36,6 +36,49 @@ export const queryKeyPrefixes = {
   rules: ["rules"] as const,
 };
 
+/**
+ * Every cache prefix owned by an account.
+ *
+ * Deleting an account — or moving it in or out of the linked inbox — has to
+ * drop all of these. The delete mutation and the shell event bridge both
+ * iterate this list through {@link invalidateAccountScopedData}, so the two
+ * call sites cannot drift apart.
+ */
+export const accountScopedPrefixes = [
+  queryKeyPrefixes.accounts,
+  queryKeyPrefixes.identities,
+  queryKeyPrefixes.folders,
+  queryKeyPrefixes.messages,
+  queryKeyPrefixes.message,
+  queryKeyPrefixes.thread,
+  queryKeyPrefixes.unifiedCounts,
+  queryKeyPrefixes.calendars,
+  queryKeyPrefixes.events,
+  queryKeyPrefixes.event,
+  queryKeyPrefixes.addressBooks,
+  queryKeyPrefixes.contacts,
+  queryKeyPrefixes.contact,
+  queryKeyPrefixes.groups,
+  queryKeyPrefixes.taskLists,
+  queryKeyPrefixes.tasks,
+  queryKeyPrefixes.task,
+  queryKeyPrefixes.smartCounts,
+  queryKeyPrefixes.syncStatus,
+  queryKeyPrefixes.rules,
+] as const;
+
+/** The slice of TanStack's QueryClient this module needs (keeps it testable). */
+export interface QueryKeyInvalidator {
+  invalidateQueries(filters: { queryKey: readonly unknown[] }): unknown;
+}
+
+/** Drop every cache that belongs to an account. */
+export function invalidateAccountScopedData(client: QueryKeyInvalidator): void {
+  for (const prefix of accountScopedPrefixes) {
+    void client.invalidateQueries({ queryKey: prefix });
+  }
+}
+
 export const queryKeys = {
   accounts: () => [...queryKeyPrefixes.accounts] as const,
   folders: (accountId: Id) => ["folders", accountId] as const,

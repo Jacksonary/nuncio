@@ -206,6 +206,14 @@
   white-space: nowrap;
 }
 
+.listTitleActions {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  flex: none;
+  align-self: center;
+}
+
 .listCount {
   flex: none;
   font-size: 11px;

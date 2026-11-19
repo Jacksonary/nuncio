@@ -65,6 +65,8 @@ export const todo: {
     "todo.empty.flaggedEmail.description": "把邮件标记为待办后会显示在这里。",
     "todo.empty.list.title": "此列表为空",
     "todo.empty.list.description": "添加第一个任务开始吧。",
+    "todo.empty.hiddenCompleted.title": "所有任务都已完成",
+    "todo.empty.hiddenCompleted.description": "已隐藏 {count} 个已完成的任务。",
     "todo.empty.addTask": "添加任务",
     "todo.empty.selectTask.title": "选择一个任务",
     "todo.empty.selectTask.description": "在左侧选择一个任务以查看和编辑详细信息。",
@@ -238,6 +240,7 @@ export const todo: {
     "todo.toast.deleted": "任务已删除",
     "todo.toast.undo": "撤销",
     "todo.toast.restored": "任务已恢复",
+    "todo.toast.restoredPartial": "已恢复“{title}”，但未能标记为已完成",
 
     "todo.error.load": "无法加载任务",
     "todo.error.loadLists": "无法加载任务列表",
@@ -309,6 +312,8 @@ export const todo: {
     "todo.empty.flaggedEmail.description": "Emails you turn into tasks appear here.",
     "todo.empty.list.title": "This list is empty",
     "todo.empty.list.description": "Add your first task to get started.",
+    "todo.empty.hiddenCompleted.title": "All tasks are completed",
+    "todo.empty.hiddenCompleted.description": "{count} completed tasks are hidden.",
     "todo.empty.addTask": "Add a task",
     "todo.empty.selectTask.title": "Select a task",
     "todo.empty.selectTask.description": "Pick a task on the left to see and edit its details.",
@@ -482,6 +487,7 @@ export const todo: {
     "todo.toast.deleted": "Task deleted",
     "todo.toast.undo": "Undo",
     "todo.toast.restored": "Task restored",
+    "todo.toast.restoredPartial": "“{title}” restored, but not marked as completed",
 
     "todo.error.load": "Could not load tasks",
     "todo.error.loadLists": "Could not load task lists",

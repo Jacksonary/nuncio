@@ -265,6 +265,53 @@ pub fn insert(conn: &Connection, folder: &Folder) -> Result<()> {
     Ok(())
 }
 
+/// Insert a folder on the restore path.
+///
+/// A restored folder is a preference carrier: the next server sync reconciles
+/// it by `(account_id, remote_path)`. On a conflict (for example a local
+/// account folder that already exists on this device) keep the existing id —
+/// messages reference it — and apply the restored preference fields. Counters
+/// and `last_sync_at` are deliberately left alone here and are zeroed by the
+/// caller.
+pub fn restore(conn: &Connection, folder: &Folder) -> Result<()> {
+    if folder.remote_path.trim().is_empty() {
+        return Err(AppError::invalid_input(
+            "folder remote path must not be empty",
+        ));
+    }
+    let now = now_string();
+    conn.execute(
+        "INSERT INTO folder (
+            id, account_id, parent_id, remote_path, name, role, unread_count, total_count,
+            is_favorite, sync_enabled, is_selectable, sort_order, last_sync_at, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, ?7, ?8, ?9, ?10, NULL, ?11, ?11)
+         ON CONFLICT DO UPDATE SET
+            parent_id = excluded.parent_id,
+            remote_path = excluded.remote_path,
+            name = excluded.name,
+            role = excluded.role,
+            is_favorite = excluded.is_favorite,
+            sync_enabled = excluded.sync_enabled,
+            is_selectable = excluded.is_selectable,
+            sort_order = excluded.sort_order,
+            updated_at = excluded.updated_at",
+        params![
+            folder.id,
+            folder.account_id,
+            folder.parent_id,
+            folder.remote_path,
+            folder.name,
+            folder.role.as_str(),
+            folder.is_favorite as i64,
+            folder.sync_enabled as i64,
+            folder.is_selectable as i64,
+            folder.sort_order,
+            now
+        ],
+    )?;
+    Ok(())
+}
+
 pub fn rename(conn: &Connection, id: &str, name: &str) -> Result<Folder> {
     let changed = conn.execute(
         "UPDATE folder SET name = ?2, updated_at = ?3 WHERE id = ?1",
@@ -411,27 +458,27 @@ pub fn unified_counts(conn: &Connection) -> Result<UnifiedCounts> {
         "SELECT COUNT(*) FROM message m
          JOIN folder f ON f.id = m.folder_id
          JOIN account a ON a.id = m.account_id
-         WHERE a.include_in_unified = 1 AND f.role = 'inbox' AND m.is_deleted_local = 0 AND m.seen = 0",
+         WHERE a.include_in_unified = 1 AND a.mail_enabled = 1 AND f.role = 'inbox' AND m.is_deleted_local = 0 AND m.seen = 0",
         [],
         |row| row.get(0),
     )?;
     let flagged: i64 = conn.query_row(
         "SELECT COUNT(*) FROM message m
          JOIN account a ON a.id = m.account_id
-         WHERE a.include_in_unified = 1 AND m.is_deleted_local = 0 AND m.flagged = 1",
+         WHERE a.include_in_unified = 1 AND a.mail_enabled = 1 AND m.is_deleted_local = 0 AND m.flagged = 1",
         [],
         |row| row.get(0),
     )?;
     let drafts: i64 = conn.query_row(
         "SELECT COUNT(*) FROM message m
          JOIN account a ON a.id = m.account_id
-         WHERE a.include_in_unified = 1 AND m.is_deleted_local = 0 AND m.is_draft = 1",
+         WHERE a.include_in_unified = 1 AND a.mail_enabled = 1 AND m.is_deleted_local = 0 AND m.is_draft = 1",
         [],
         |row| row.get(0),
     )?;
     let outbox: i64 = conn.query_row(
         "SELECT COUNT(*) FROM outbox o JOIN account a ON a.id = o.account_id
-         WHERE a.include_in_unified = 1 AND o.state <> 'sent'",
+         WHERE a.include_in_unified = 1 AND a.mail_enabled = 1 AND o.state <> 'sent'",
         [],
         |row| row.get(0),
     )?;
@@ -469,6 +516,7 @@ pub fn delete_for_account(conn: &Connection, account_id: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::db::Db;
+    use crate::models::{MessageSummary, StoredMessage};
 
     fn setup() -> Db {
         let db = Db::open_in_memory().expect("db");
@@ -507,6 +555,65 @@ mod tests {
             Ok(())
         })
         .expect("folders");
+    }
+
+    /// The unified drafts count reads `is_draft`, so the flag must stop being
+    /// true once the message leaves a Drafts-role folder.
+    #[test]
+    fn leaving_drafts_clears_the_draft_flag_and_unified_count() {
+        let db = setup();
+        db.write_sync(|conn| {
+            // The built-in local account is calendar/contacts/tasks only
+            // (mail_enabled = 0 in the seed). A real mail account that
+            // contributes to the linked inbox has mail turned on, and the
+            // unified views now test both flags, so the fixture has to model
+            // an actual mail account rather than a disabled one.
+            let mut account = crate::repo::accounts::get_required(conn, "local")?;
+            account.include_in_unified = true;
+            account.mail_enabled = true;
+            crate::repo::accounts::upsert(conn, &account)?;
+
+            let drafts = upsert_remote(
+                conn,
+                &Folder::new("f-drafts", "local", "Drafts", FolderRole::Drafts),
+            )?;
+            let other_drafts = upsert_remote(
+                conn,
+                &Folder::new("f-drafts-2", "local", "Drafts 2", FolderRole::Drafts),
+            )?;
+            let trash = upsert_remote(
+                conn,
+                &Folder::new("f-trash", "local", "Trash", FolderRole::Trash),
+            )?;
+
+            let mut summary = MessageSummary::new(
+                "m1",
+                "local",
+                &drafts.id,
+                "thread:m1",
+                crate::models::now(),
+            );
+            summary.seen = true;
+            summary.is_draft = true;
+            crate::repo::messages::upsert(conn, &StoredMessage::new(summary))?;
+            assert_eq!(unified_counts(conn)?.drafts, 1);
+
+            // Migrating between two Drafts-role folders keeps the flag.
+            crate::repo::messages::move_to_folder(conn, &["m1".to_string()], &other_drafts.id)?;
+            assert!(crate::repo::messages::get_required(conn, "m1")?
+                .summary
+                .is_draft);
+            assert_eq!(unified_counts(conn)?.drafts, 1);
+
+            // Leaving Drafts for Trash clears it, and the unified badge follows.
+            crate::repo::messages::move_to_folder(conn, &["m1".to_string()], &trash.id)?;
+            assert!(!crate::repo::messages::get_required(conn, "m1")?
+                .summary
+                .is_draft);
+            assert_eq!(unified_counts(conn)?.drafts, 0);
+            Ok(())
+        })
+        .expect("draft move");
     }
 
     #[test]

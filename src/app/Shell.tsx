@@ -1,33 +1,31 @@
 /**
  * Application shell: custom title strip, collapsible navigation pane with the
- * active module's sidebar, bottom module switcher / sync status, settings
- * flyout, global toasts and first-run onboarding.
+ * active module's sidebar, bottom module switcher / connectivity indicator,
+ * settings flyout, global toasts and first-run onboarding.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { isTauri } from "@tauri-apps/api/core";
 import {
   Add24Regular,
-  CheckmarkCircle16Regular,
+  ArrowSync16Regular,
   Navigation24Regular,
   Settings24Regular,
-  Warning16Regular,
   WifiOff20Regular,
 } from "@fluentui/react-icons";
 import { AddAccountDialog, SettingsPanel } from "@/modules/settings";
 import {
   Button,
   IconButton,
+  ModuleSyncDot,
   SidePanel,
-  Spinner,
   Tooltip,
   WindowControls,
   toast,
 } from "@/components";
 import { accounts, isIpcError, sync as syncApi } from "@/ipc/api";
-import type { AppModule, SyncModule, SyncStatus } from "@/ipc/types";
+import type { AppModule, SyncModule } from "@/ipc/types";
 import { shouldShowFirstRun } from "@/lib/accounts";
-import { formatRelativeTime } from "@/lib/format";
 import { installEventBridge } from "@/lib/eventBridge";
 import { installHotkeys, registerHotkeys } from "@/lib/hotkeys";
 import { useT } from "@/lib/i18n";
@@ -58,6 +56,15 @@ const moduleSyncTargets: Partial<Record<AppModule, SyncModule>> = {
   todo: "tasks",
 };
 
+/**
+ * The sync module a manual action targets. Mail has no polling entry above
+ * because IDLE keeps it current, but a user-requested sync still has to name
+ * its module so the backend does not widen it to every module.
+ */
+export function syncTargetFor(module: AppModule): SyncModule {
+  return moduleSyncTargets[module] ?? "mail";
+}
+
 /** Do not re-sync a module more than once in this window when the user flips between modules. */
 const MODULE_SYNC_THROTTLE_MS = 30_000;
 
@@ -68,6 +75,7 @@ export function Shell() {
   const activeModule = useShellStore((state) => state.activeModule);
   const railCollapsed = useShellStore((state) => state.railCollapsed);
   const showSettings = useShellStore((state) => state.showSettings);
+  const settingsAccountId = useShellStore((state) => state.settingsAccountId);
   const showAddAccount = useShellStore((state) => state.showAddAccount);
   const setShowAddAccount = useShellStore((state) => state.setShowAddAccount);
   const firstRunSkipped = useShellStore((state) => state.firstRunSkipped);
@@ -82,13 +90,6 @@ export function Shell() {
     queryKey: queryKeys.accounts(),
     queryFn: accounts.list,
     staleTime: 60_000,
-  });
-
-  const syncQuery = useQuery({
-    queryKey: queryKeys.syncStatus(),
-    queryFn: syncApi.status,
-    staleTime: 15_000,
-    refetchInterval: 60_000,
   });
 
   const [online, setOnline] = useState<boolean>(() =>
@@ -129,13 +130,15 @@ export function Shell() {
   }, [activeModule]);
 
   const syncNow = useCallback(async () => {
+    const module = syncTargetFor(activeModule);
+    const moduleName = t(moduleDef.labelKey);
     try {
-      await syncApi.now(null, null);
-      toast.success(t("shell.syncStarted"));
+      await syncApi.now(null, module);
+      toast.success(t("shell.syncDone", { module: moduleName }));
     } catch (error) {
-      toast.error(t("shell.syncFailed"), errorMessage(error));
+      toast.error(t("shell.syncError", { module: moduleName }), errorMessage(error));
     }
-  }, [t]);
+  }, [activeModule, moduleDef.labelKey, t]);
 
   useEffect(() => {
     return registerHotkeys([
@@ -187,54 +190,8 @@ export function Shell() {
     document.title = `${t(moduleDef.labelKey)} — ${t("shell.appName")}`;
   }, [moduleDef.labelKey, t]);
 
-  const statuses: SyncStatus[] = syncQuery.data ?? [];
-  const syncing = statuses.filter((status) => status.state === "syncing");
-  const progress = syncing.reduce(
-    (total, status) => {
-      if (status.progress) {
-        total.done += status.progress.done;
-        total.total += status.progress.total;
-      }
-      return total;
-    },
-    { done: 0, total: 0 },
-  );
-  const needsReauth = statuses.some((status) => status.state === "needsReauth");
-  const hasError = statuses.some((status) => status.state === "error");
-  const hasOffline = statuses.some((status) => status.state === "offline");
-  const lastSyncAt = statuses.reduce<string | null>((latest, status) => {
-    if (!status.lastSyncAt) return latest;
-    return !latest || status.lastSyncAt > latest ? status.lastSyncAt : latest;
-  }, null);
-
-  let syncLabel: string;
-  let syncTone: "normal" | "error" | "warning" | "success" = "normal";
-  if (syncing.length > 0) {
-    syncLabel =
-      progress.total > 0
-        ? t("shell.syncProgress", { done: progress.done, total: progress.total })
-        : t("shell.syncPending");
-  } else if (needsReauth) {
-    syncLabel = t("shell.needsReauth");
-    syncTone = "error";
-  } else if (hasError) {
-    syncLabel = t("shell.syncFailed");
-    syncTone = "error";
-  } else if (hasOffline || !online) {
-    syncLabel = t("shell.syncOffline");
-    syncTone = "warning";
-  } else if (lastSyncAt) {
-    syncLabel = t("shell.synced");
-    syncTone = "success";
-  } else {
-    syncLabel = t("shell.neverSynced");
-  }
-
-  const syncTooltip = lastSyncAt
-    ? `${syncLabel} · ${formatRelativeTime(lastSyncAt)}`
-    : syncLabel;
-
   const newLabel = t(newActionLabelKeys[activeModule]);
+  const syncNowLabel = t("shell.syncNow", { module: t(moduleDef.labelKey) });
   const onNew = moduleDef.onNew;
 
   // Core always seeds the built-in "local" account, so a fresh install still
@@ -295,40 +252,33 @@ export function Shell() {
           </div>
 
           <div className={styles.navFooter}>
-            <Tooltip content={syncTooltip}>
+            <div className={styles.footerRow}>
               <button
                 type="button"
-                className={styles.syncRow}
+                className={styles.syncNow}
                 onClick={() => void syncNow()}
-                aria-label={`${t("shell.syncStatus")}: ${syncLabel}`}
+                aria-label={syncNowLabel}
+                title={syncNowLabel}
               >
-                <span
-                  className={`${styles.syncIcon} ${
-                    syncTone === "error"
-                      ? styles.syncIconError
-                      : syncTone === "warning"
-                        ? styles.syncIconWarning
-                        : syncTone === "success"
-                          ? styles.syncIconSuccess
-                          : ""
-                  }`}
-                  aria-hidden="true"
-                >
-                  {syncing.length > 0 ? (
-                    <Spinner size="tiny" />
-                  ) : syncTone === "error" || syncTone === "warning" ? (
-                    syncTone === "error" ? (
-                      <Warning16Regular />
-                    ) : (
-                      <WifiOff20Regular />
-                    )
-                  ) : (
-                    <CheckmarkCircle16Regular />
-                  )}
+                <span className={styles.syncNowIcon} aria-hidden="true">
+                  <ArrowSync16Regular />
                 </span>
-                <span className={styles.syncText}>{syncLabel}</span>
+                <span className={styles.syncNowText}>{syncNowLabel}</span>
               </button>
-            </Tooltip>
+              {!online ? (
+                <span
+                  className={styles.offlineIndicator}
+                  role="status"
+                  aria-label={t("shell.offlineIndicator")}
+                  title={t("shell.offlineIndicator")}
+                >
+                  <WifiOff20Regular aria-hidden="true" />
+                  <span className={styles.offlineIndicatorText}>
+                    {t("shell.offlineIndicator")}
+                  </span>
+                </span>
+              ) : null}
+            </div>
 
             <div className={styles.switcher}>
               {moduleOrder.map((moduleId) => {
@@ -349,6 +299,9 @@ export function Shell() {
                     {!railCollapsed ? (
                       <span className={styles.moduleLabel}>{t(definition.labelKey)}</span>
                     ) : null}
+                    <span className={styles.moduleDot}>
+                      <ModuleSyncDot module={syncTargetFor(moduleId)} />
+                    </span>
                   </button>
                 );
                 return railCollapsed ? (
@@ -399,7 +352,7 @@ export function Shell() {
         title={t("shell.settings")}
         width={460}
       >
-        <SettingsPanel onClose={() => setShowSettings(false)} />
+        <SettingsPanel accountId={settingsAccountId} onClose={() => setShowSettings(false)} />
       </SidePanel>
 
       <AddAccountDialog

@@ -10,7 +10,7 @@ import {
   useQueryClient,
   type UseMutationResult,
 } from "@tanstack/react-query";
-import { accounts, app, folders, identities, rules, signatures } from "@/ipc/api";
+import { accounts, app, folders, identities, rules, signatures, sync } from "@/ipc/api";
 import type {
   Account,
   AccountPatch,
@@ -20,7 +20,12 @@ import type {
   Signature,
   StorageUsage,
 } from "@/ipc/types";
-import { queryKeys, queryKeyPrefixes } from "@/lib/queryKeys";
+import {
+  accountScopedPrefixes,
+  invalidateAccountScopedData,
+  queryKeys,
+  queryKeyPrefixes,
+} from "@/lib/queryKeys";
 
 const APP_INFO_KEY = ["appInfo"] as const;
 const STORAGE_USAGE_KEY = ["storageUsage"] as const;
@@ -71,39 +76,49 @@ export interface UpdateAccountVariables {
   patch: AccountPatch;
 }
 
+/**
+ * Recompute the OS unread badge. There is no dedicated command: the badge is
+ * derived from `include_in_unified` inside the mail sync's notification step
+ * (`sync::notify::update_badge`), so ask for a sync of the affected account.
+ * Failures are cosmetic — the next scheduled sync corrects the badge.
+ */
+function refreshUnreadBadge(accountId: string): void {
+  sync.now(accountId, "mail").catch((error: unknown) => {
+    console.warn("[settings] badge refresh sync failed", error);
+  });
+}
+
 export function useUpdateAccount(): UseMutationResult<Account, unknown, UpdateAccountVariables> {
   const client = useQueryClient();
   const invalidate = useAccountInvalidation();
   return useMutation({
     mutationFn: ({ id, patch }: UpdateAccountVariables) => accounts.update(id, patch),
-    onSuccess: (account) => {
+    onSuccess: (account, variables) => {
       client.setQueryData<Account[]>(queryKeys.accounts(), (list) =>
         list ? list.map((item) => (item.id === account.id ? account : item)) : list,
       );
+      // Linked-inbox membership feeds the unified list, every derived count and
+      // the OS badge; refreshing only the account row leaves all three stale.
+      if (variables.patch.includeInUnified !== undefined) {
+        invalidateAccountScopedData(client);
+        refreshUnreadBadge(variables.id);
+      }
     },
     onSettled: invalidate,
   });
 }
 
+/** Prefixes dropped on account delete, exported for the parity test. */
+export const deleteAccountPrefixes = accountScopedPrefixes;
+
 export function useDeleteAccount(): UseMutationResult<void, unknown, string> {
   const client = useQueryClient();
-  const invalidate = useAccountInvalidation();
   return useMutation({
     mutationFn: (id: string) => accounts.delete(id),
     onSuccess: () => {
-      invalidate();
-      for (const prefix of [
-        queryKeyPrefixes.folders,
-        queryKeyPrefixes.messages,
-        queryKeyPrefixes.unifiedCounts,
-        queryKeyPrefixes.identities,
-        queryKeyPrefixes.calendars,
-        queryKeyPrefixes.addressBooks,
-        queryKeyPrefixes.taskLists,
-        queryKeyPrefixes.syncStatus,
-      ]) {
-        void client.invalidateQueries({ queryKey: prefix });
-      }
+      // The shared list covers everything the deleted account owned, including
+      // calendar events, contacts and tasks that used to stay on screen.
+      invalidateAccountScopedData(client);
     },
   });
 }

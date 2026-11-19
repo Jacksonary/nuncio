@@ -477,11 +477,6 @@ function EditorDialog({ request }: { request: ContactEditorRequest }) {
         onClose={closeEditor}
         title={translate("people.editor.titleEdit")}
         width={560}
-        footer={
-          <Button appearance="subtle" onClick={closeEditor}>
-            {translate("common.close")}
-          </Button>
-        }
       >
         <EmptyState
           compact

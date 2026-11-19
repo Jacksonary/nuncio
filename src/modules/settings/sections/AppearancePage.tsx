@@ -144,32 +144,6 @@ export function AppearancePage({ onBack }: { onBack: () => void }) {
               ))}
             </div>
           </StackRow>
-          <SettingRow label={t("settings.appearance.swipeLeft")} description={t("settings.appearance.swipeHint")}>
-            <Select
-              ariaLabel={t("settings.appearance.swipeLeft")}
-              value={settings.mail.swipeLeft}
-              onChange={(value) =>
-                update({ mail: { swipeLeft: value as HoverAction } })
-              }
-              options={HOVER_ACTIONS.map((action) => ({
-                value: action,
-                label: t(`settings.hoverAction.${action}`),
-              }))}
-            />
-          </SettingRow>
-          <SettingRow label={t("settings.appearance.swipeRight")}>
-            <Select
-              ariaLabel={t("settings.appearance.swipeRight")}
-              value={settings.mail.swipeRight}
-              onChange={(value) =>
-                update({ mail: { swipeRight: value as HoverAction } })
-              }
-              options={HOVER_ACTIONS.map((action) => ({
-                value: action,
-                label: t(`settings.hoverAction.${action}`),
-              }))}
-            />
-          </SettingRow>
         </Card>
       </Section>
 

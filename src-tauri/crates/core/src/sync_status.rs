@@ -146,12 +146,22 @@ impl SyncStatusHub {
         self.set(status)
     }
 
-    pub fn offline(&self, account_id: &str, module: SyncModule) -> SyncStatus {
+    /// Record a transient failure that a later poll will retry.
+    ///
+    /// `last_sync_at` is deliberately not touched: a retry is not a successful
+    /// sync, so the UI must keep showing the age of the last real one.
+    pub fn retrying(
+        &self,
+        account_id: &str,
+        module: SyncModule,
+        message: impl Into<String>,
+    ) -> SyncStatus {
         let mut status = self
             .get(account_id, module)
             .unwrap_or_else(|| SyncStatus::new(account_id, module));
-        status.state = SyncState::Offline;
+        status.state = SyncState::Retrying;
         status.progress = None;
+        status.message = Some(message.into());
         self.set(status)
     }
 
@@ -209,7 +219,7 @@ mod tests {
         let hub = SyncStatusHub::new(sink);
         hub.fail("a1", SyncModule::Calendar, "boom");
         hub.needs_reauth("a1", SyncModule::Contacts);
-        hub.offline("a2", SyncModule::Tasks);
+        hub.retrying("a2", SyncModule::Tasks, "provider rate limited");
         assert_eq!(hub.all().len(), 3);
         assert_eq!(hub.for_account("a1").len(), 2);
         assert_eq!(
@@ -237,6 +247,41 @@ mod tests {
                 done: 10,
                 total: 10
             })
+        );
+    }
+
+    #[test]
+    fn retrying_clears_progress_without_claiming_a_sync() {
+        let hub = SyncStatusHub::new(Arc::new(RecordingEventSink::new()));
+        hub.finish("a1", SyncModule::Calendar);
+        let last_sync = hub
+            .get("a1", SyncModule::Calendar)
+            .expect("status")
+            .last_sync_at;
+        assert!(last_sync.is_some(), "finish records a successful sync");
+
+        hub.begin("a1", SyncModule::Calendar, Some(100));
+        let status = hub.retrying("a1", SyncModule::Calendar, "provider rate limited");
+        assert_eq!(status.state, SyncState::Retrying);
+        assert_eq!(status.progress, None);
+        assert_eq!(status.message.as_deref(), Some("provider rate limited"));
+        assert_eq!(
+            status.last_sync_at, last_sync,
+            "a retry must not masquerade as a successful sync"
+        );
+    }
+
+    #[test]
+    fn wire_strings_match_the_frontend_contract() {
+        let retrying = serde_json::to_value(SyncState::Retrying).expect("serialize");
+        assert_eq!(retrying, "retrying");
+        assert_eq!(
+            "retrying".parse::<SyncState>().expect("parse"),
+            SyncState::Retrying
+        );
+        assert!(
+            serde_json::from_str::<SyncState>("\"offline\"").is_err(),
+            "offline is no longer a module sync state"
         );
     }
 }

@@ -15,7 +15,12 @@ import { toast } from "@/components/Toast";
 import { formatListDate, formatTime } from "@/lib/format";
 import { t } from "@/lib/i18n";
 import { queryClient } from "@/lib/queryClient";
-import { queryKeys, queryKeyPrefixes } from "@/lib/queryKeys";
+import {
+  accountScopedPrefixes,
+  invalidateAccountScopedData,
+  queryKeys,
+  queryKeyPrefixes,
+} from "@/lib/queryKeys";
 import {
   useShellStore,
   type CalendarSelection,
@@ -28,14 +33,14 @@ function invalidate(prefix: readonly unknown[]): void {
 }
 
 function invalidateAccountData(): void {
-  invalidate(queryKeyPrefixes.accounts);
-  invalidate(queryKeyPrefixes.identities);
-  invalidate(queryKeyPrefixes.folders);
-  invalidate(queryKeyPrefixes.unifiedCounts);
-  invalidate(queryKeyPrefixes.calendars);
-  invalidate(queryKeyPrefixes.addressBooks);
-  invalidate(queryKeyPrefixes.taskLists);
+  invalidateAccountScopedData(queryClient);
 }
+
+/**
+ * Prefixes dropped for an account change, exported so the settings delete
+ * mutation and this bridge are pinned to the same list by the parity test.
+ */
+export const accountDataPrefixes = accountScopedPrefixes;
 
 function invalidateMailData(): void {
   invalidate(queryKeyPrefixes.folders);

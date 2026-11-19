@@ -131,7 +131,16 @@ export function useMailSettings() {
 export function useUnifiedAccounts(): Account[] {
   const accounts = useMailAccounts();
   return useMemo(
-    () => accounts.filter((account) => account.includeInUnified),
+    () =>
+      accounts.filter(
+        (account) =>
+          // Turning mail off leaves `includeInUnified` set, so membership must
+          // test both flags. Without the explicit `mailEnabled` check the hook
+          // silently depends on `useMailAccounts` prefetching; a mail-disabled
+          // account would then keep contributing folders and messages to the
+          // linked views.
+          account.mailEnabled && account.includeInUnified,
+      ),
     [accounts],
   );
 }

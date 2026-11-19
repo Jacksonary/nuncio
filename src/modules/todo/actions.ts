@@ -246,20 +246,46 @@ export async function reorderTasks(listId: string, ids: string[]): Promise<void>
   }
 }
 
+/**
+ * Apply completion to a task that was just re-created. Kept separate so a
+ * failed second step can be retried without creating the task again.
+ */
+async function completeRestoredTask(created: Task, title: string): Promise<void> {
+  try {
+    const saved = await tasksApi.setCompleted(created.id, true);
+    replaceTaskInCaches(saved);
+    invalidateDerivedData();
+    invalidateTaskQueries();
+    toast.success(t("todo.toast.restored"), title);
+  } catch (error) {
+    // The task itself is back. Never claim a clean restore; offer the retry.
+    invalidateTaskQueries();
+    toast.show({
+      type: "error",
+      title: t("todo.toast.restoredPartial", { title }),
+      message: errorMessage(error),
+      duration: 12_000,
+      actions: [
+        {
+          label: t("common.retry"),
+          onClick: () => {
+            void completeRestoredTask(created, title);
+          },
+        },
+      ],
+    });
+  }
+}
+
 async function restoreDeletedTask(task: Task): Promise<void> {
   const input = taskToInput(task, { freshStepIds: true });
   const created = await createTask(task.listId, input);
   if (!created) return;
-  if (task.status === "completed") {
-    try {
-      const saved = await tasksApi.setCompleted(created.id, true);
-      replaceTaskInCaches(saved);
-      invalidateDerivedData();
-    } catch (error) {
-      toast.error(t("todo.error.action"), errorMessage(error));
-    }
+  if (task.status !== "completed") {
+    toast.success(t("todo.toast.restored"), task.title);
+    return;
   }
-  toast.success(t("todo.toast.restored"), task.title);
+  await completeRestoredTask(created, task.title);
 }
 
 export async function deleteTaskWithUndo(task: Task): Promise<boolean> {

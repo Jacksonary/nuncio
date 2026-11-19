@@ -19,6 +19,7 @@ import {
   secondaryNodes,
   type FolderNode,
 } from "./logic";
+import { folderBadgeCount } from "./Sidebar";
 
 interface SimFolder {
   /** Raw remote path as returned by `LIST` (may be modified UTF-7). */
@@ -650,5 +651,37 @@ describe("structural edge cases", () => {
     ]);
     const tree = displayFolderTree(buildFolderTree(folders));
     expect(flatNames(tree).filter((name) => name === "[Gmail]")).toHaveLength(0);
+  });
+});
+
+/* ────────────────────────── inbox-only badges ─────────────────────── */
+
+/**
+ * Only the inbox advertises a number. Every other row (drafts, sent, flagged,
+ * outbox, junk, trash) stayed blank on purpose: the user acts on unread mail
+ * arriving in the inbox, and a number on every row made the rail unreadable.
+ */
+describe("folder badge scope", () => {
+  const folder = (role: FolderRole, unreadCount: number) => ({ role, unreadCount });
+
+  it("counts unread mail for the inbox", () => {
+    expect(folderBadgeCount(folder("inbox", 4))).toBe(4);
+    expect(folderBadgeCount(folder("inbox", 0))).toBe(0);
+  });
+
+  it("gives every other role no badge", () => {
+    for (const role of [
+      "drafts",
+      "outbox",
+      "flagged",
+      "important",
+      "sent",
+      "junk",
+      "trash",
+      "archive",
+      "other",
+    ] as FolderRole[]) {
+      expect(folderBadgeCount(folder(role, 7))).toBe(0);
+    }
   });
 });

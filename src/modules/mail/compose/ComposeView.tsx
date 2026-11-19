@@ -1462,7 +1462,6 @@ function Composer({ initialDraft, mode, onClose, onSent }: ComposerProps) {
         <AttachmentsBar
           attachments={draft.attachments}
           onRemove={removeAttachment}
-          onAdd={() => void pickFiles()}
           compact={mode === "inline"}
         />
       ) : null}

@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use nuncio_core::events::MailChangeKind;
-use nuncio_core::models::{PendingOpState, ProviderKind, StoredMessage};
+use nuncio_core::models::{PendingOpState, ProviderKind, StoredMessage, UndoEntry};
 use nuncio_core::{events, repo, AppError, Result};
 use tracing::{debug, warn};
 
@@ -17,6 +17,7 @@ fn is_local_only(provider: ProviderKind) -> bool {
 }
 
 impl MailService {
+    /// Revert the most recent undoable action (the keyboard shortcut path).
     pub(crate) async fn undo_last(&self) -> Result<bool> {
         let entry = self
             .inner
@@ -24,6 +25,25 @@ impl MailService {
             .db
             .read(|db| repo::undo::pop_last(db, None))
             .await?;
+        self.apply_undo_entry(entry).await
+    }
+
+    /// Revert one specific action, as identified by the id returned when it ran.
+    ///
+    /// Toasts use this so an action that happened afterwards is not the one
+    /// that gets reverted.
+    pub(crate) async fn undo_by_id(&self, undo_id: &str) -> Result<bool> {
+        let undo_id = undo_id.to_string();
+        let entry = self
+            .inner
+            .ctx
+            .db
+            .read(move |db| repo::undo::pop_by_id(db, &undo_id))
+            .await?;
+        self.apply_undo_entry(entry).await
+    }
+
+    async fn apply_undo_entry(&self, entry: Option<UndoEntry>) -> Result<bool> {
         let Some(entry) = entry else {
             return Ok(false);
         };

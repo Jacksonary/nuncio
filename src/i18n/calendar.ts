@@ -224,6 +224,7 @@ export const calendar: {
     "calendar.search.placeholder": "搜索事件",
     "calendar.search.results": "搜索结果",
     "calendar.search.noResults": "没有匹配的事件",
+    "calendar.search.error": "搜索事件失败",
     "calendar.search.hint": "输入标题、地点或说明进行搜索",
 
     "calendar.agenda.empty": "未来 30 天没有安排。",
@@ -454,6 +455,7 @@ export const calendar: {
     "calendar.search.placeholder": "Search events",
     "calendar.search.results": "Search results",
     "calendar.search.noResults": "No matching events",
+    "calendar.search.error": "Could not search events",
     "calendar.search.hint": "Search by title, location, or notes",
 
     "calendar.agenda.empty": "Nothing scheduled in the next 30 days.",

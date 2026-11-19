@@ -73,7 +73,8 @@ import {
 } from "./actions";
 import { onMailCommand } from "./commands";
 import { useMailCompose } from "./composeIntegration";
-import { safeFilename } from "./logic";
+import { safeFilename, parseUnifiedFolderId } from "./logic";
+import { useConversationView } from "./conversationPrefs";
 import { isOutboxMessageId } from "./outbox";
 import {
   buildArticle,
@@ -251,6 +252,19 @@ function MessageReader({
 
   const detail = detailQuery.data;
 
+  // Same mailbox key the list uses, so the reader groups exactly when the list
+  // does: the unified views share one choice, a real folder uses its account's,
+  // and a standalone window (no selection) falls back to the message's account.
+  const listFolderId = useShellStore((state) => state.selection.mail.folderId);
+  const listFolder = listFolderId ? folders.byId.get(listFolderId) : undefined;
+  const conversationAccountId = parseUnifiedFolderId(listFolderId)
+    ? null
+    : (listFolder?.accountId ?? detail?.summary.accountId ?? null);
+  const [conversationView] = useConversationView(
+    conversationAccountId,
+    mailSettings.conversationView,
+  );
+
   if (detailQuery.isLoading) {
     return (
       <div className={styles.readerPane}>
@@ -278,8 +292,7 @@ function MessageReader({
   }
 
   const folder = folders.byId.get(detail.summary.folderId);
-  const conversation =
-    mailSettings.conversationView && detail.summary.threadCount > 1;
+  const conversation = conversationView && detail.summary.threadCount > 1;
 
   if (conversation) {
     return (
@@ -620,8 +633,8 @@ function MessageCard({
     if (isOutbox) return;
     setBusyAction("archive");
     try {
-      await apply({ ids: [summary.id], action: { kind: "archive" } });
-      messageActionToast({ kind: "archive" }, 1);
+      const outcome = await apply({ ids: [summary.id], action: { kind: "archive" } });
+      messageActionToast({ kind: "archive" }, 1, outcome.undoId);
       if (standalone) onRemoved?.();
       else clearSelection();
     } catch {
@@ -632,7 +645,9 @@ function MessageCard({
   }, [apply, clearSelection, isOutbox, onRemoved, standalone, summary.id]);
 
   const remove = useCallback(async () => {
-    const permanent = isPermanentDelete(folderRole);
+    // A draft is always gone for good: moving it to Trash would leave
+    // is_draft set and keep inflating the Drafts count.
+    const permanent = summary.isDraft || isPermanentDelete(folderRole);
     if (mailSettings.confirmDelete || permanent) {
       const ok = await confirm({
         title: permanent ? tt("mail.reader.deletePermanentTitle") : tt("mail.reader.deleteTitle"),
@@ -646,8 +661,8 @@ function MessageCard({
     }
     setBusyAction("delete");
     try {
-      await apply({ ids: [summary.id], action: { kind: "delete", permanent } });
-      messageActionToast({ kind: "delete", permanent }, 1);
+      const outcome = await apply({ ids: [summary.id], action: { kind: "delete", permanent } });
+      messageActionToast({ kind: "delete", permanent }, 1, outcome.undoId);
       if (standalone) onRemoved?.();
       else clearSelection();
     } catch {
@@ -662,6 +677,7 @@ function MessageCard({
     mailSettings.confirmDelete,
     standalone,
     summary.id,
+    summary.isDraft,
     tt,
   ]);
 
@@ -865,8 +881,11 @@ function MessageCard({
         onSelect: () => {
           void (async () => {
             try {
-              await apply({ ids: [summary.id], action: { kind: "move", folderId: choice.folder.id } });
-              messageActionToast({ kind: "move", folderId: choice.folder.id }, 1);
+              const outcome = await apply({
+                ids: [summary.id],
+                action: { kind: "move", folderId: choice.folder.id },
+              });
+              messageActionToast({ kind: "move", folderId: choice.folder.id }, 1, outcome.undoId);
               if (standalone) onRemoved?.();
               else clearSelection();
             } catch {

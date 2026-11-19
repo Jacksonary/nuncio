@@ -17,6 +17,7 @@ import {
 import {
   Add16Regular,
   ArrowExport16Regular,
+  ArrowSync16Regular,
   Delete16Regular,
   People20Regular,
   Star16Filled,
@@ -25,7 +26,9 @@ import {
   Button,
   Checkbox,
   EmptyState,
+  IconButton,
   Menu,
+  ModuleSyncStatus,
   SearchBox,
   Spinner,
   Avatar,
@@ -34,6 +37,7 @@ import {
   toast,
   type MenuEntry,
 } from "@/components";
+import { sync as syncApi } from "@/ipc/api";
 import type { ContactSummary } from "@/ipc/types";
 import { useT } from "@/lib/i18n";
 import { useAppSettings } from "@/lib/useSettings";
@@ -91,6 +95,7 @@ export function ContactList() {
   const selection = useShellStore((state) => state.selection.people);
   const setSelection = useShellStore((state) => state.setSelection);
   const favoritesOnly = usePeopleUiStore((state) => state.favoritesOnly);
+  const setFavoritesOnly = usePeopleUiStore((state) => state.setFavoritesOnly);
   const search = usePeopleUiStore((state) => state.search);
   const setSearch = usePeopleUiStore((state) => state.setSearch);
   const selectedIds = usePeopleUiStore((state) => state.selectedIds);
@@ -214,6 +219,21 @@ export function ContactList() {
     [setAnchor, setSelection, toggleSelected],
   );
 
+  const [syncing, setSyncing] = useState(false);
+  const syncNow = useCallback(async () => {
+    setSyncing(true);
+    try {
+      // Contacts are shown across accounts, so the list header can only offer
+      // the module-wide sync; a per-account scope would not match what is shown.
+      await syncApi.now(null, "contacts");
+      toast.success(t("people.list.syncStarted"));
+    } catch (error) {
+      toast.error(t("people.list.sync"), peopleErrorText(error));
+    } finally {
+      setSyncing(false);
+    }
+  }, [t]);
+
   const confirmBulkDelete = useCallback(
     async (ids: string[]) => {
       if (ids.length === 0) return;
@@ -249,19 +269,35 @@ export function ContactList() {
   );
 
   useEffect(() => {
-    if (deleteRequest === 0) return;
-    const ids =
-      usePeopleUiStore.getState().selectedIds.length > 0
-        ? usePeopleUiStore.getState().selectedIds
-        : selection.contactId
-          ? [selection.contactId]
-          : [];
-    if (ids.length > 0) void confirmBulkDelete(ids);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [deleteRequest]);
+    if (!deleteRequest) return;
+    // Consume before showing the dialog. The request is a command: once read
+    // it is gone, so cancelling and remounting the list cannot replay it.
+    const request = usePeopleUiStore.getState().consumeDeleteRequest();
+    if (!request || request.ids.length === 0) return;
+    void confirmBulkDelete(request.ids);
+  }, [deleteRequest, confirmBulkDelete]);
+
+  const clearFilters = useCallback(() => {
+    setSearch("");
+    setFavoritesOnly(false);
+    if (selection.groupId) {
+      setSelection("people", { groupId: null, contactId: null });
+    }
+  }, [selection.groupId, setFavoritesOnly, setSearch, setSelection]);
 
   const groupMenuItems = useMemo<MenuEntry[]>(() => {
-    const writableBooks = books.filter((book) => !book.isReadOnly);
+    // Groups belong to one address book, so only offer the books the selected
+    // contacts actually come from. Offering every writable book is what let a
+    // cross-book membership slip through.
+    const selected = new Set(selectedIds);
+    const contactBook = new Map<string, string>();
+    for (const contact of contacts) {
+      if (selected.has(contact.id)) contactBook.set(contact.id, contact.addressBookId);
+    }
+    const selectedBookIds = new Set(contactBook.values());
+    const writableBooks = books.filter(
+      (book) => !book.isReadOnly && selectedBookIds.has(book.id),
+    );
     const entries: MenuEntry[] = [];
     for (const book of writableBooks) {
       const bookGroups = groups.filter((group) => group.addressBookId === book.id);
@@ -273,12 +309,12 @@ export function ContactList() {
           label: group.name,
           icon: <Add16Regular />,
           onSelect: () => {
-            const ids = usePeopleUiStore.getState().selectedIds;
-            const { writable, readOnly } = partitionWritable(contacts, books, ids);
-            if (readOnly.length > 0) {
-              toast.info(t("people.bulk.readOnlySkipped", { count: readOnly.length }));
-            }
-            if (writable.length > 0) void addContactsToGroup(writable, group.id);
+            // Re-read the selection but keep the same book restriction: a
+            // mixed selection only joins this book's contacts to this group.
+            const ids = usePeopleUiStore
+              .getState()
+              .selectedIds.filter((id) => contactBook.get(id) === book.id);
+            if (ids.length > 0) void addContactsToGroup(ids, group.id);
           },
         });
       }
@@ -291,7 +327,7 @@ export function ContactList() {
       });
     }
     return entries;
-  }, [books, contacts, groups, t]);
+  }, [books, contacts, groups, selectedIds, t]);
 
   const [groupMenu, setGroupMenu] = useState<{ open: boolean; anchor: HTMLElement | null }>({
     open: false,
@@ -313,24 +349,30 @@ export function ContactList() {
     groupName,
   );
 
+  // Search, favourites and a group are all filters over the address book; an
+  // empty list under any of them means "no matches", not "no contacts yet".
+  const filtered =
+    Boolean(trimmedSearch) || favoritesOnly || Boolean(selection.groupId);
   const emptyState = (
     <div className={styles.listEmpty}>
       <EmptyState
         icon={<People20Regular />}
         title={
-          trimmedSearch
+          filtered
             ? t("people.list.noMatchesTitle")
             : t("people.list.emptyTitle")
         }
         description={
-          trimmedSearch
-            ? t("people.list.noMatchesDescription")
+          filtered
+            ? trimmedSearch
+              ? t("people.list.noMatchesDescription")
+              : t("people.list.noMatchesFilteredDescription")
             : t("people.list.emptyDescription")
         }
         actions={
-          trimmedSearch ? (
-            <Button size="small" appearance="subtle" onClick={() => setSearch("")}>
-              {t("common.clear")}
+          filtered ? (
+            <Button size="small" appearance="subtle" onClick={clearFilters}>
+              {trimmedSearch ? t("common.clear") : t("people.list.clearFilters")}
             </Button>
           ) : (
             <Button size="small" appearance="primary" onClick={() => void openNewContact()}>
@@ -413,11 +455,23 @@ export function ContactList() {
       <div className={styles.listHeader}>
         <div className={styles.listTitleRow}>
           <span className={styles.listTitle}>{title}</span>
-          <span className={styles.listCount}>
-            {query.isLoading || query.isError
-              ? ""
-              : t("people.list.total", { count: total })}
-          </span>
+          {/* Sync lives in the title row, above the bulk bar's own row, so an
+              active selection never displaces or overlays it. */}
+          <div className={styles.listTitleActions}>
+            <span className={styles.listCount}>
+              {query.isLoading || query.isError
+                ? ""
+                : t("people.list.total", { count: total })}
+            </span>
+            <ModuleSyncStatus module="contacts" />
+            <IconButton
+              icon={syncing ? <Spinner size="tiny" /> : <ArrowSync16Regular />}
+              label={t("people.list.sync")}
+              size="small"
+              onClick={() => void syncNow()}
+              disabled={syncing}
+            />
+          </div>
         </div>
         <SearchBox
           ref={searchRef}
@@ -499,12 +553,9 @@ export function ContactList() {
         )}
       </div>
 
+      {/* The scope total is already shown next to the title; the footer keeps
+          only the multi-select hint so the number is not repeated. */}
       <div className={styles.listFooter}>
-        <span>
-          {query.isLoading
-            ? t("people.list.loading")
-            : t("people.list.total", { count: total })}
-        </span>
         <span>{t("people.list.multiSelectHint")}</span>
       </div>
 

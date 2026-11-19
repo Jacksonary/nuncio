@@ -156,7 +156,7 @@ async fn handle_failure(
     let auth = matches!(&error, AppError::Auth(_));
     let retryable = matches!(
         &error,
-        AppError::Network(_) | AppError::Conflict(_) | AppError::Io(_)
+        AppError::Network(_) | AppError::Service(_) | AppError::Conflict(_) | AppError::Io(_)
     ) && op.attempts < MAX_ATTEMPTS;
     if auth {
         ctx.sync_status

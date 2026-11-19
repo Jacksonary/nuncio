@@ -22,11 +22,14 @@ import styles from "../settings.module.css";
 export function AccountsSection({
   onAddAccount,
   onBack,
-}: AccountsSectionProps & { onBack?: () => void }) {
+  initialAccountId,
+}: AccountsSectionProps & { onBack?: () => void; initialAccountId?: string | null }) {
   const t = useT();
   const accountsQuery = useAccounts();
   const reorder = useReorderAccounts();
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  // Seeded from the deep link so opening settings from an account row lands on
+  // that account, not the index the user then has to hunt through.
+  const [selectedId, setSelectedId] = useState<string | null>(initialAccountId ?? null);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [dragId, setDragId] = useState<string | null>(null);
   const [dragOverId, setDragOverId] = useState<string | null>(null);

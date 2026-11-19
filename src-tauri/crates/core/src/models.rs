@@ -2373,8 +2373,6 @@ pub struct MailSettings {
     pub remote_images: RemoteImagesPolicy,
     pub light_message_background: bool,
     pub hover_actions: Vec<HoverAction>,
-    pub swipe_left: HoverAction,
-    pub swipe_right: HoverAction,
     pub confirm_delete: bool,
     pub auto_advance: AutoAdvance,
     pub default_font_family: String,
@@ -2398,8 +2396,6 @@ impl Default for MailSettings {
             remote_images: RemoteImagesPolicy::Always,
             light_message_background: false,
             hover_actions: vec![HoverAction::Archive, HoverAction::Delete, HoverAction::Flag],
-            swipe_left: HoverAction::Delete,
-            swipe_right: HoverAction::Archive,
             confirm_delete: true,
             auto_advance: AutoAdvance::Next,
             default_font_family: String::new(),
@@ -2645,8 +2641,6 @@ patch_struct!(MailSettingsPatch {
     remote_images: RemoteImagesPolicy,
     light_message_background: bool,
     hover_actions: Vec<HoverAction>,
-    swipe_left: HoverAction,
-    swipe_right: HoverAction,
     confirm_delete: bool,
     auto_advance: AutoAdvance,
     default_font_family: String,
@@ -2874,7 +2868,10 @@ pub enum SyncState {
     Idle,
     Syncing,
     Error,
-    Offline,
+    /// A transient provider/transport failure; the next poll will retry.
+    /// Device connectivity is not represented here — the UI reads that from
+    /// `navigator.onLine` itself.
+    Retrying,
     NeedsReauth,
 }
 
@@ -2884,7 +2881,7 @@ impl SyncState {
             Self::Idle => "idle",
             Self::Syncing => "syncing",
             Self::Error => "error",
-            Self::Offline => "offline",
+            Self::Retrying => "retrying",
             Self::NeedsReauth => "needsReauth",
         }
     }
@@ -2898,7 +2895,7 @@ impl FromStr for SyncState {
             "idle" => Ok(Self::Idle),
             "syncing" => Ok(Self::Syncing),
             "error" => Ok(Self::Error),
-            "offline" => Ok(Self::Offline),
+            "retrying" => Ok(Self::Retrying),
             "needsReauth" => Ok(Self::NeedsReauth),
             other => Err(AppError::invalid_input(format!(
                 "unknown sync state: {other}"
@@ -3554,8 +3551,6 @@ mod tests {
             s.mail.hover_actions,
             vec![HoverAction::Archive, HoverAction::Delete, HoverAction::Flag]
         );
-        assert_eq!(s.mail.swipe_left, HoverAction::Delete);
-        assert_eq!(s.mail.swipe_right, HoverAction::Archive);
         assert_eq!(s.mail.prefetch_unread_bodies, 50);
         assert_eq!(s.mail.body_cache_limit_mb, 500);
         assert_eq!(s.mail.other_folders_poll_minutes, 15);

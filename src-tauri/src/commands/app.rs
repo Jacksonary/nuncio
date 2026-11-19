@@ -7,10 +7,14 @@ use tauri::State;
 use tracing::{debug, info, warn};
 
 use nuncio_core::events;
-use nuncio_core::models::{AppInfo, Platform, StorageUsage};
+use nuncio_core::models::{
+    AddressBook, AppInfo, Calendar, Contact, Folder, Platform, StorageUsage,
+    StoredEvent, Task, TaskList,
+};
+use nuncio_core::repo::pim_maps::PimMapRecord;
 use nuncio_core::{repo, AppError};
 
-use crate::backup::{self, BackupDocument};
+use crate::backup::{self, BackupDocument, RestorePlan};
 use crate::pending::{self, PendingOpen};
 use crate::state::AppState;
 use crate::windows;
@@ -229,6 +233,51 @@ pub async fn app_open_log_dir(state: State<'_, AppState>) -> nuncio_core::Result
     Ok(())
 }
 
+/// PIM data that travels in the same encrypted document as the accounts.
+struct BackupSections {
+    address_books: Vec<AddressBook>,
+    contact_groups: Vec<backup::ContactGroup>,
+    contacts: Vec<Contact>,
+    calendars: Vec<Calendar>,
+    events: Vec<backup::BackupEvent>,
+    task_lists: Vec<TaskList>,
+    tasks: Vec<Task>,
+    folders: Vec<Folder>,
+    pim_maps: Vec<backup::PimMap>,
+}
+
+fn collect_backup_sections(conn: &rusqlite::Connection) -> nuncio_core::Result<BackupSections> {
+    Ok(BackupSections {
+        address_books: repo::address_books::list(conn, None)?,
+        contact_groups: repo::contacts::list_groups_all(conn)?
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+        contacts: repo::contacts::list_all(conn)?,
+        calendars: repo::calendars::list(conn)?,
+        events: repo::events::list_all(conn)?
+            .into_iter()
+            .map(|stored| backup::BackupEvent {
+                event: stored.event,
+                rrule: stored.rrule,
+                exdates: stored.exdates,
+            })
+            .collect(),
+        task_lists: repo::task_lists::list(conn)?,
+        tasks: repo::tasks::list_all(conn)?,
+        // `folder_preferences` zeroes the counters and the sync cursor: they
+        // describe this device's cache, not the user's preferences.
+        folders: repo::folders::list_all(conn)?
+            .iter()
+            .map(backup::folder_preferences)
+            .collect(),
+        pim_maps: repo::pim_maps::list_all(conn)?
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+    })
+}
+
 #[tauri::command]
 pub async fn app_backup_export(
     state: State<'_, AppState>,
@@ -251,6 +300,7 @@ pub async fn app_backup_export(
         .await?;
     let signatures = ctx.db.read(repo::signatures::list).await?;
     let rules = ctx.db.read(repo::rules::list).await?;
+    let sections = ctx.db.read(collect_backup_sections).await?;
 
     let secrets = if include_credentials {
         let ids: Vec<String> = accounts.iter().map(|account| account.id.clone()).collect();
@@ -259,7 +309,17 @@ pub async fn app_backup_export(
         None
     };
 
-    let document = BackupDocument::new(settings, accounts, identities, signatures, rules, secrets);
+    let mut document = BackupDocument::new(settings, accounts, identities, signatures, rules);
+    document.address_books = sections.address_books;
+    document.contact_groups = sections.contact_groups;
+    document.contacts = sections.contacts;
+    document.calendars = sections.calendars;
+    document.events = sections.events;
+    document.task_lists = sections.task_lists;
+    document.tasks = sections.tasks;
+    document.folders = sections.folders;
+    document.pim_maps = sections.pim_maps;
+    document.secrets = secrets;
     let bytes = backup::encrypt(&document, &password)?;
 
     let target = PathBuf::from(path);
@@ -312,6 +372,17 @@ pub async fn app_backup_import(
     // Snapshot the accounts that are running right now; after the transaction
     // this table holds the restored set instead.
     let previous_accounts = ctx.db.read(repo::accounts::list).await?;
+
+    // Decide once which PIM rows can land: the owning account must be part of
+    // the restored set, and the parent row (address book / calendar / task
+    // list) must survive too. Orphans from a corrupt file are simply dropped.
+    let restored_accounts: std::collections::HashSet<String> = document
+        .accounts
+        .iter()
+        .map(|account| account.id.clone())
+        .chain(std::iter::once(local_id.clone()))
+        .collect();
+    let plan = RestorePlan::from_document(&document, &restored_accounts);
 
     // A backup may carry a legacy plaintext advanced Google client secret;
     // strip it before the settings row is written and hand it to the keyring
@@ -375,6 +446,49 @@ pub async fn app_backup_import(
                 }
                 repo::rules::upsert(conn, rule)?;
             }
+
+            // Parent rows first, so the foreign keys and the child filters see
+            // them. Ids are preserved because PIM mappings, folder preferences
+            // and task/list links reference them.
+            for book in &plan.address_books {
+                let mut book = book.clone();
+                repo::address_books::insert(conn, &mut book)?;
+            }
+            for group in &plan.contact_groups {
+                let record = nuncio_core::repo::contacts::ContactGroupRecord::from(group.clone());
+                repo::contacts::insert_group_record(conn, &record)?;
+            }
+            for contact in &plan.contacts {
+                // `create` preserves the id and writes `contact_group_member`,
+                // with group ids already filtered by `RestorePlan`.
+                repo::contacts::create(conn, contact)?;
+            }
+            for calendar in &plan.calendars {
+                let mut calendar = calendar.clone();
+                repo::calendars::insert(conn, &mut calendar)?;
+            }
+            for backup in &plan.events {
+                let stored = StoredEvent {
+                    rrule: backup.rrule.clone(),
+                    exdates: backup.exdates.clone(),
+                    ..StoredEvent::new(backup.event.clone())
+                };
+                repo::events::upsert(conn, &stored)?;
+            }
+            for list in &plan.task_lists {
+                repo::task_lists::insert(conn, list)?;
+            }
+            for task in &plan.tasks {
+                repo::tasks::upsert_remote(conn, task, None, None)?;
+            }
+            for folder in &plan.folders {
+                repo::folders::restore(conn, folder)?;
+            }
+            for map in &plan.pim_maps {
+                let record = PimMapRecord::from(map.clone());
+                repo::pim_maps::insert(conn, &record)?;
+            }
+
             // Settings belong to the same commit: a restore that replaced the
             // accounts but failed to store its settings would leave a mixed
             // configuration behind.

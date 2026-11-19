@@ -21,11 +21,6 @@ export function ScopeDialog({ open, mode, onCancel, onChoose }: ScopeDialogProps
       onClose={onCancel}
       title={t(mode === "delete" ? "calendar.scope.deleteTitle" : "calendar.scope.title")}
       width={420}
-      footer={
-        <Button appearance="subtle" onClick={onCancel}>
-          {t("common.cancel")}
-        </Button>
-      }
     >
       <p className={styles.message}>
         {t(mode === "delete" ? "calendar.scope.deleteMessage" : "calendar.scope.message")}

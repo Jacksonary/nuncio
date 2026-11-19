@@ -362,6 +362,18 @@ pub fn set_flags(
 }
 
 pub fn move_to_folder(conn: &Connection, ids: &[String], folder_id: &str) -> Result<usize> {
+    // `is_draft` must follow the folder: the unified drafts view counts the
+    // flag, so a draft moved to Trash (or any other folder) has to lose it.
+    // Moving between two Drafts-role folders (the local placeholder and the
+    // server folder) is a migration and keeps the flag.
+    let target_is_drafts = conn
+        .query_row(
+            "SELECT role = ?2 FROM folder WHERE id = ?1",
+            params![folder_id, FolderRole::Drafts.as_str()],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some_and(|value| value != 0);
     let mut affected_folders = Vec::new();
     for id in ids {
         if let Some(old) = conn
@@ -380,8 +392,21 @@ pub fn move_to_folder(conn: &Connection, ids: &[String], folder_id: &str) -> Res
     let mut count = 0;
     for id in ids {
         count += conn.execute(
-            "UPDATE message SET folder_id = ?2, updated_at = ?3 WHERE id = ?1",
-            params![id, folder_id, now_string()],
+            "UPDATE message SET
+                 folder_id = ?2,
+                 is_draft = CASE
+                     WHEN is_draft = 1 AND ?4 = 0
+                          AND folder_id IN (SELECT id FROM folder WHERE role = ?5)
+                     THEN 0 ELSE is_draft END,
+                 updated_at = ?3
+             WHERE id = ?1",
+            params![
+                id,
+                folder_id,
+                now_string(),
+                target_is_drafts as i64,
+                FolderRole::Drafts.as_str()
+            ],
         )?;
     }
     affected_folders.push(folder_id.to_string());
@@ -429,6 +454,18 @@ fn folders_for_ids(conn: &Connection, ids: &[String]) -> Result<Vec<String>> {
         }
     }
     Ok(folders)
+}
+
+/// Every message id stored in a folder, including rows hidden by a local
+/// soft delete (they still belong to the folder and must move with it).
+pub fn ids_in_folder(conn: &Connection, folder_id: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT id FROM message WHERE folder_id = ?1")?;
+    let mut rows = stmt.query(params![folder_id])?;
+    let mut ids = Vec::new();
+    while let Some(row) = rows.next()? {
+        ids.push(row.get(0)?);
+    }
+    Ok(ids)
 }
 
 /// Physically delete every message in a folder (empty trash / junk).
@@ -677,7 +714,7 @@ fn build_scope(builder: &mut QueryBuilder, scope: &MailScope) -> Result<()> {
         }
         MailScope::Unified { role } => {
             let unified_account =
-                "m.account_id IN (SELECT id FROM account WHERE include_in_unified = 1)";
+                "m.account_id IN (SELECT id FROM account WHERE include_in_unified = 1 AND mail_enabled = 1)";
             match role {
                 FolderRole::Flagged => {
                     builder.push(format!("m.flagged = 1 AND {unified_account}"), Vec::new())
@@ -693,7 +730,7 @@ fn build_scope(builder: &mut QueryBuilder, scope: &MailScope) -> Result<()> {
                 other => {
                     builder.push(
                         "m.folder_id IN (SELECT f.id FROM folder f JOIN account a ON a.id = f.account_id
-                         WHERE f.role = ? AND a.include_in_unified = 1)",
+                         WHERE f.role = ? AND a.include_in_unified = 1 AND a.mail_enabled = 1)",
                         vec![text(other.as_str())],
                     );
                 }
@@ -796,7 +833,7 @@ fn list_outbox(
     unified_only: bool,
 ) -> Result<MessagePage> {
     let unified_clause = if unified_only {
-        "AND a.include_in_unified = 1"
+        "AND a.include_in_unified = 1 AND a.mail_enabled = 1"
     } else {
         ""
     };

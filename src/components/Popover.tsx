@@ -5,9 +5,12 @@
  * consumer can decide its own internal layout.
  */
 import {
+  createContext,
   useCallback,
+  useContext,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
   type CSSProperties,
@@ -16,6 +19,64 @@ import {
 import { createPortal } from "react-dom";
 import { cn } from "@/lib/cn";
 import styles from "./Popover.module.css";
+
+/** The only DOM capability containment checks need (keeps the helpers testable). */
+export interface SurfaceContainment {
+  contains(target: unknown): boolean;
+}
+
+export interface OpenSurface {
+  token: symbol;
+  depth: number;
+  element: SurfaceContainment | null;
+}
+
+/**
+ * Every open popover surface. Nested surfaces are portalled to <body>, so an
+ * ancestor cannot discover them through the DOM; this registry (plus the React
+ * nesting depth) is how Escape picks the innermost surface and how an ancestor
+ * recognises a pointer-down inside a descendant portal.
+ */
+const openSurfaces: OpenSurface[] = [];
+
+export function isInsideSurface(
+  target: unknown,
+  self: SurfaceContainment | null | undefined,
+  descendants: Iterable<SurfaceContainment>,
+): boolean {
+  if (self?.contains(target)) return true;
+  for (const surface of descendants) {
+    if (surface.contains(target)) return true;
+  }
+  return false;
+}
+
+/**
+ * Escape belongs to the deepest open surface that contains the focused target,
+ * so a Select/date picker inside a form closes itself instead of the form.
+ */
+export function isInnermostSurfaceAt(
+  surfaces: readonly OpenSurface[],
+  token: symbol,
+  target: unknown,
+): boolean {
+  const own = surfaces.find((surface) => surface.token === token);
+  if (!own) return false;
+  return !surfaces.some(
+    (surface) =>
+      surface.token !== token &&
+      surface.depth > own.depth &&
+      surface.element?.contains(target) === true,
+  );
+}
+
+interface PopoverNesting {
+  /** Depth a popover rendered at this point would receive. */
+  depth: number;
+  register: (element: HTMLElement) => () => void;
+}
+
+const PopoverNestingContext = createContext<PopoverNesting | null>(null);
 
 export type PopoverPlacement =
   | "bottom"
@@ -147,6 +208,46 @@ export function Popover({
   const [position, setPosition] = useState<Position | null>(null);
   const [contentSize, setContentSize] = useState<{ width: number; height: number } | null>(null);
 
+  const parentNesting = useContext(PopoverNestingContext);
+  const depth = parentNesting?.depth ?? 0;
+  const surfaceToken = useRef<symbol>(Symbol("popover")).current;
+  const descendantSurfaces = useRef(new Set<SurfaceContainment>());
+
+  const registerDescendant = useCallback(
+    (element: HTMLElement) => {
+      descendantSurfaces.current.add(element);
+      // Bubble it up too so a grandparent with an intermediate portal between
+      // them still considers the click inside.
+      const unregisterFromParent = parentNesting?.register(element);
+      return () => {
+        descendantSurfaces.current.delete(element);
+        unregisterFromParent?.();
+      };
+    },
+    [parentNesting],
+  );
+
+  const nesting = useMemo(
+    () => ({ depth: depth + 1, register: registerDescendant }),
+    [depth, registerDescendant],
+  );
+
+  useEffect(() => {
+    if (!open) return;
+    const entry: OpenSurface = { token: surfaceToken, depth, element: contentRef.current };
+    openSurfaces.push(entry);
+    return () => {
+      const index = openSurfaces.indexOf(entry);
+      if (index !== -1) openSurfaces.splice(index, 1);
+    };
+  }, [open, depth, surfaceToken]);
+
+  // Let the enclosing popover treat this portal as part of its own surface.
+  useEffect(() => {
+    if (!open || !parentNesting || !contentRef.current) return;
+    return parentNesting.register(contentRef.current);
+  }, [open, parentNesting]);
+
   const update = useCallback(() => {
     const content = contentRef.current;
     if (!content) return;
@@ -209,7 +310,7 @@ export function Popover({
     const handlePointerDown = (event: PointerEvent) => {
       const target = event.target as Node | null;
       if (!target) return;
-      if (contentRef.current?.contains(target)) return;
+      if (isInsideSurface(target, contentRef.current, descendantSurfaces.current)) return;
       if (anchor?.contains(target)) return;
       onClose();
     };
@@ -221,13 +322,16 @@ export function Popover({
     if (!open || !closeOnEscape) return;
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
+      // Only the innermost surface reacts. Otherwise Escape meant for a nested
+      // Select/date picker would also close the popover or dialog hosting it.
+      if (!isInnermostSurfaceAt(openSurfaces, surfaceToken, event.target)) return;
       event.preventDefault();
       event.stopPropagation();
       onClose();
     };
     document.addEventListener("keydown", handleKeyDown, true);
     return () => document.removeEventListener("keydown", handleKeyDown, true);
-  }, [open, closeOnEscape, onClose]);
+  }, [open, closeOnEscape, onClose, surfaceToken]);
 
   if (!open) return null;
   if (typeof document === "undefined") return null;
@@ -247,21 +351,23 @@ export function Popover({
   const measured = position !== null && contentSize !== null;
 
   const surface = (
-    <div
-      ref={contentRef}
-      id={id}
-      role={role}
-      aria-label={ariaLabel}
-      className={cn(
-        styles.popover,
-        !measured && styles.measuring,
-        className,
-      )}
-      style={computedStyle}
-      data-popover=""
-    >
-      {children}
-    </div>
+    <PopoverNestingContext.Provider value={nesting}>
+      <div
+        ref={contentRef}
+        id={id}
+        role={role}
+        aria-label={ariaLabel}
+        className={cn(
+          styles.popover,
+          !measured && styles.measuring,
+          className,
+        )}
+        style={computedStyle}
+        data-popover=""
+      >
+        {children}
+      </div>
+    </PopoverNestingContext.Provider>
   );
 
   return portal ? createPortal(surface, document.body) : surface;

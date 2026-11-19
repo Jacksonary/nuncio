@@ -6,6 +6,7 @@
 import { People24Regular } from "@fluentui/react-icons";
 import type { ModuleDefinition } from "@/app/moduleTypes";
 import type { HotkeyDefinition } from "@/lib/hotkeys";
+import { useShellStore } from "@/lib/store";
 import { openNewContact } from "./actions";
 import { usePeopleUiStore } from "./uiStore";
 import { PeopleSidebar } from "./Sidebar";
@@ -37,7 +38,12 @@ const hotkeys: HotkeyDefinition[] = [
   {
     id: "people.delete",
     keys: "Delete",
-    handler: () => usePeopleUiStore.getState().requestDelete(),
+    handler: () => {
+      // Capture the focused contact now: the request must not read whatever
+      // happens to be selected when the list next mounts.
+      const focused = useShellStore.getState().selection.people.contactId;
+      usePeopleUiStore.getState().requestDelete(focused);
+    },
     enabled: noDialogOpen,
     preventDefault: true,
   },

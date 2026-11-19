@@ -112,6 +112,17 @@ function roleLabel(folder: Folder): string {
   return translated !== key ? translated : folder.name;
 }
 
+/**
+ * Only the inbox advertises a number. Drafts, sent, flagged, outbox and the
+ * "More" rollup were noise: the user acts on unread mail arriving in the
+ * inbox, and a badge on every row made the rail unreadable.
+ *
+ * Exported for the sidebar simulation tests, which assert the rule per role.
+ */
+export function folderBadgeCount(folder: Pick<Folder, "role" | "unreadCount">): number {
+  return folder.role === "inbox" ? folder.unreadCount : 0;
+}
+
 interface FolderDialogState {
   kind: "create" | "rename" | "move" | "delete" | "empty";
   accountId: string;
@@ -155,6 +166,7 @@ function FolderRow({
   // Selecting it would ask the server for a mailbox it refuses to open, so the
   // row only toggles its children.
   const selectable = folder.isSelectable;
+  const badgeCount = folderBadgeCount(folder);
   const activate = () => {
     if (selectable) onSelect(folder);
     else if (hasChildren) onToggle(folder.id);
@@ -247,11 +259,13 @@ function FolderRow({
             </span>
           </Tooltip>
         ) : null}
-        <CountBadge
-          count={folder.unreadCount}
-          appearance="accent"
-          label={t("mail.sidebar.unreadCount", { count: folder.unreadCount })}
-        />
+        {badgeCount > 0 ? (
+          <CountBadge
+            count={badgeCount}
+            appearance="accent"
+            label={t("mail.sidebar.unreadCount", { count: badgeCount })}
+          />
+        ) : null}
       </div>
       {hasChildren && open
         ? node.children.map((child) => (
@@ -288,9 +302,10 @@ export function MailSidebar() {
 
   const selection = useShellStore((state) => state.selection.mail);
   const setSelection = useShellStore((state) => state.setSelection);
-  const setShowSettings = useShellStore((state) => state.setShowSettings);
   const setShowAddAccount = useShellStore((state) => state.setShowAddAccount);
   const closeInlineCompose = useShellStore((state) => state.closeInlineCompose);
+  // Lands on that account's detail page rather than the settings index.
+  const openAccountSettingsInPanel = useShellStore((state) => state.openAccountSettings);
 
   const [expandedAccounts, setExpandedAccounts] = useState<Set<string>>(new Set());
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
@@ -401,6 +416,15 @@ export function MailSidebar() {
     }
     return result;
   }, [folders, mailAccounts]);
+
+  // useAllFolders only reports an aggregate `isError`, so a refetch has to
+  // cover every account's folder query; the ones that already succeeded are
+  // cheap to revalidate.
+  const retryFolders = useCallback(() => {
+    for (const account of mailAccounts) {
+      void queryClient.refetchQueries({ queryKey: queryKeys.folders(account.id) });
+    }
+  }, [mailAccounts, queryClient]);
 
   const selectFolder = useCallback(
     (folder: Folder | null, unifiedRole: FolderRole | null) => {
@@ -711,20 +735,10 @@ export function MailSidebar() {
         id: "settings",
         label: tt("mail.sidebar.accountSettings"),
         icon: <Settings16Regular />,
-        onSelect: () => setShowSettings(true),
+        onSelect: () => openAccountSettingsInPanel(account.id),
       },
-      ...(account.state === "needsReauth"
-        ? [
-            {
-              id: "repair",
-              label: tt("mail.sidebar.repairAccount"),
-              icon: <Warning16Regular />,
-              onSelect: () => setShowSettings(true),
-            },
-          ]
-        : []),
     ],
-    [openCreateDialog, setShowSettings, tt],
+    [openAccountSettingsInPanel, openCreateDialog, tt],
   );
 
   if (accountsQuery.isLoading) {
@@ -770,6 +784,10 @@ export function MailSidebar() {
     <div className={styles.sidebar}>
       {unifiedAccounts.length >= 2 ? (
         <div className={styles.sidebarSection}>
+          {/* The header opens the unified inbox, so its 收件箱 child already
+              shows that number. An aggregate across inbox + flagged + drafts
+              would mix unread with total metrics and count flagged drafts
+              twice, so the parent intentionally carries no badge. */}
           <div
             className={[
               styles.unifiedRow,
@@ -799,12 +817,6 @@ export function MailSidebar() {
             >
               {tt("mail.sidebar.unified")}
             </button>
-            <CountBadge
-              count={unifiedCounts.data?.inbox ?? 0}
-              label={tt("mail.sidebar.unreadCount", {
-                count: unifiedCounts.data?.inbox ?? 0,
-              })}
-            />
           </div>
           {unifiedOpen
             ? unifiedEntries.map((entry) => {
@@ -844,10 +856,14 @@ export function MailSidebar() {
                       )}
                     </span>
                     <span className={styles.folderName}>{entry.label}</span>
-                    <CountBadge
-                      count={entry.count}
-                      label={tt("mail.sidebar.unreadCount", { count: entry.count })}
-                    />
+                    {/* Only the unified inbox carries a number, matching the
+                        per-account rows below. */}
+                    {entry.role === "inbox" && entry.count > 0 ? (
+                      <CountBadge
+                        count={entry.count}
+                        label={tt("mail.sidebar.unreadCount", { count: entry.count })}
+                      />
+                    ) : null}
                   </div>
                 );
               })
@@ -864,6 +880,12 @@ export function MailSidebar() {
         const accountOpen = expandedAccounts.has(account.id);
         const moreOpen = moreAccounts.has(account.id);
         const accountUnread = unreadByAccount.get(account.id) ?? 0;
+        // Aggregate `folders.isError` cannot say which account failed, so read
+        // this account's own query state; the hook above re-renders when any
+        // result changes. A failed account renders the error below instead of
+        // an empty tree, which would otherwise look like "no folders".
+        const folderQueryState = queryClient.getQueryState(queryKeys.folders(account.id));
+        const foldersFailed = folderQueryState?.status === "error";
         return (
           <div key={account.id} className={styles.sidebarSection}>
             <div className={styles.accountRow}>
@@ -912,10 +934,14 @@ export function MailSidebar() {
                   </span>
                 </Tooltip>
               ) : null}
-              <CountBadge
-                count={accountUnread}
-                label={tt("mail.sidebar.unreadCount", { count: accountUnread })}
-              />
+              {/* Only while collapsed: an expanded account shows the number on
+                  its inbox row, and repeating it here doubles it. */}
+              {accountOpen ? null : (
+                <CountBadge
+                  count={accountUnread}
+                  label={tt("mail.sidebar.unreadCount", { count: accountUnread })}
+                />
+              )}
               <MenuButton
                 label={tt("mail.sidebar.accountMenu")}
                 items={accountMenu(account)}
@@ -925,11 +951,33 @@ export function MailSidebar() {
                 icon={<MoreHorizontal16Regular />}
               />
             </div>
+            {foldersFailed ? (
+              // Reuses the mail-list load-failure copy: the sidebar has no
+              // load-failure key of its own yet and the i18n files are owned
+              // elsewhere in this pass.
+              <EmptyState
+                compact
+                icon={<ErrorCircle16Regular />}
+                title={tt("mail.list.errorTitle")}
+                description={
+                  folderQueryState?.error ? errorText(folderQueryState.error) : undefined
+                }
+                actions={
+                  <Button size="small" onClick={retryFolders}>
+                    {tt("common.retry")}
+                  </Button>
+                }
+              />
+            ) : null}
             {account.state === "needsReauth" ? (
               <div className={styles.reauthBar}>
                 <Warning16Regular aria-hidden="true" />
                 <span>{tt("mail.sidebar.reauthMessage")}</span>
-                <Button size="small" appearance="subtle" onClick={() => setShowSettings(true)}>
+                <Button
+                  size="small"
+                  appearance="subtle"
+                  onClick={() => openAccountSettingsInPanel(account.id)}
+                >
                   {tt("mail.sidebar.repairAccount")}
                 </Button>
               </div>
@@ -980,10 +1028,9 @@ export function MailSidebar() {
                     <span className={styles.folderName}>
                       {tt("mail.sidebar.moreFolders")}
                     </span>
-                    <CountBadge
-                      count={secondaryUnread}
-                      label={tt("mail.sidebar.unreadCount", { count: secondaryUnread })}
-                    />
+                    {/* No badge: the rollup spans folders whose numbers have
+                        different meanings, and only the inbox shows one. The
+                        unread total survives in the aria-label. */}
                   </div>
                 ) : null}
                 {moreOpen

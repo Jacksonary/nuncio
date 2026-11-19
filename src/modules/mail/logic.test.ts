@@ -5,8 +5,10 @@ import {
   aggregateUnread,
   buildFolderTree,
   buildMessageRows,
+  constrainToResultSet,
   dateGroupKey,
   displayFolderTree,
+  emptyStateCopy,
   primaryNodes,
   secondaryNodes,
   messageIds,
@@ -146,6 +148,71 @@ describe("nextAfterRemoval", () => {
   it("returns null in list mode or when everything was removed", () => {
     expect(nextAfterRemoval(ordered, new Set(["b"]), "b", "list")).toBeNull();
     expect(nextAfterRemoval(ordered, new Set(ordered), "b", "next")).toBeNull();
+  });
+});
+
+describe("constrainToResultSet", () => {
+  it("drops ids that are no longer in the result set", () => {
+    expect(constrainToResultSet(["a", "stale", "c"], ["a", "b", "c"])).toEqual(["a", "c"]);
+  });
+
+  it("keeps the requested order and removes duplicates", () => {
+    expect(constrainToResultSet(["c", "a", "c", "b"], ["a", "b", "c"])).toEqual([
+      "c",
+      "a",
+      "b",
+    ]);
+  });
+
+  it("returns nothing when the whole selection is stale", () => {
+    expect(constrainToResultSet(["x", "y"], ["a", "b"])).toEqual([]);
+    expect(constrainToResultSet(["a"], [])).toEqual([]);
+  });
+});
+
+describe("emptyStateCopy", () => {
+  it("uses the search copy and no filter action while searching", () => {
+    expect(
+      emptyStateCopy({ searching: true, filter: "flagged", role: "inbox" }),
+    ).toEqual({
+      titleKey: "mail.list.emptySearchTitle",
+      descriptionKey: "mail.list.emptySearchHint",
+      clearFilter: false,
+    });
+  });
+
+  it("uses a per-filter title and offers to clear the filter", () => {
+    expect(emptyStateCopy({ searching: false, filter: "attachments", role: "inbox" })).toEqual({
+      titleKey: "mail.list.emptyAttachments",
+      descriptionKey: "mail.list.emptyFilterHint",
+      clearFilter: true,
+    });
+    expect(emptyStateCopy({ searching: false, filter: "unread", role: "inbox" })).toEqual({
+      titleKey: "mail.list.emptyUnread",
+      descriptionKey: "mail.list.emptyFilterHint",
+      clearFilter: true,
+    });
+  });
+
+  it("explains an empty folder by its role instead of asking for new mail", () => {
+    const roleHint = (role: import("@/ipc/types").FolderRole) =>
+      emptyStateCopy({ searching: false, filter: "all", role }).descriptionKey;
+    expect(roleHint("drafts")).toBe("mail.list.emptyHintDrafts");
+    expect(roleHint("sent")).toBe("mail.list.emptyHintSent");
+    expect(roleHint("outbox")).toBe("mail.list.emptyHintOutbox");
+    expect(roleHint("trash")).toBe("mail.list.emptyHintTrash");
+    expect(roleHint("junk")).toBe("mail.list.emptyHintJunk");
+    expect(roleHint("archive")).toBe("mail.list.emptyHintArchive");
+  });
+
+  it("falls back to the generic hint for inbox and unknown roles", () => {
+    for (const role of ["inbox", "other", null] as const) {
+      expect(emptyStateCopy({ searching: false, filter: "all", role })).toEqual({
+        titleKey: "mail.list.emptyFolder",
+        descriptionKey: "mail.list.emptyHint",
+        clearFilter: false,
+      });
+    }
   });
 });
 

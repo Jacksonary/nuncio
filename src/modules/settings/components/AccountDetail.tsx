@@ -8,7 +8,6 @@ import {
   Add24Regular,
   Delete24Regular,
   Edit24Regular,
-  Key24Regular,
 } from "@fluentui/react-icons";
 import {
   Avatar,
@@ -307,24 +306,24 @@ export function AccountDetail({
             {account.authKind === "password" ? (
               <PasswordReset account={account} />
             ) : (
+              // Re-authentication lives in the warning banner when the provider
+              // rejects the token; here the card only reports the current state.
               <SettingRow
                 label={t("settings.account.oauthAccount")}
-                description={t("settings.account.oauthAccountDesc")}
+                description={account.stateMessage ?? t("settings.account.oauthAccountDesc")}
               >
-                <Button
-                  icon={<Key24Regular />}
-                  loading={reauth.isPending}
-                  onClick={() => void doReauth()}
-                >
-                  {t("settings.account.reauth")}
-                </Button>
+                <Badge appearance={account.state === "ok" ? "success" : "warning"}>
+                  {t(`settings.account.state.${account.state}`)}
+                </Badge>
               </SettingRow>
             )}
-            <SettingRow label={t("settings.account.lastState")} description={account.stateMessage ?? undefined}>
-              <Badge appearance={account.state === "ok" ? "success" : "warning"}>
-                {t(`settings.account.state.${account.state}`)}
-              </Badge>
-            </SettingRow>
+            {account.authKind === "password" ? (
+              <SettingRow label={t("settings.account.lastState")} description={account.stateMessage ?? undefined}>
+                <Badge appearance={account.state === "ok" ? "success" : "warning"}>
+                  {t(`settings.account.state.${account.state}`)}
+                </Badge>
+              </SettingRow>
+            ) : null}
           </Card>
         </Section>
       ) : null}

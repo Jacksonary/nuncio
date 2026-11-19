@@ -23,7 +23,12 @@ fn note_sync_error(
     error: &AppError,
     report_network_errors: bool,
 ) {
-    if error.code() == "network" && !report_network_errors {
+    if error.code() == "service" {
+        // A provider throttling us (429) or failing (5xx) is not a broken
+        // account: say we will try again rather than raising an error.
+        ctx.sync_status
+            .retrying(account_id, SyncModule::Mail, error.message());
+    } else if error.code() == "network" && !report_network_errors {
         debug!(
             account = account_id,
             code = error.code(),

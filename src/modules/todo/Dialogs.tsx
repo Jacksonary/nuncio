@@ -370,12 +370,9 @@ export function DueDateDialog({ open, onClose, value, onPick }: DueDateDialogPro
         </>
       }
     >
-      <DatePicker
-        value={date}
-        onChange={setDate}
-        label={t("todo.detail.dueDate")}
-        clearable
-      />
+      {/* Clearing lives in the footer so it persists immediately; a picker-local
+          clear would only disable Confirm and then be discarded on cancel. */}
+      <DatePicker value={date} onChange={setDate} label={t("todo.detail.dueDate")} />
     </Dialog>
   );
 }

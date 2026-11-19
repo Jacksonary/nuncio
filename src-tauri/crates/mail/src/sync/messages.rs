@@ -34,7 +34,6 @@ const FULL_RECONCILE_HOURS: i64 = 12;
 #[derive(Debug, Default)]
 pub struct SyncOutcome {
     pub new_messages: Vec<nuncio_core::models::MessageSummary>,
-    pub updated_ids: Vec<String>,
     pub deleted_ids: Vec<String>,
     pub initial: bool,
     pub folder_id: String,
@@ -366,7 +365,6 @@ pub async fn sync_folder_graph(
 
     Ok(SyncOutcome {
         new_messages: inserted,
-        updated_ids: Vec::new(),
         deleted_ids,
         initial,
         folder_id: folder.id.clone(),
@@ -614,21 +612,18 @@ async fn incremental_sync(
         if let Some(modseq) = stored_modseq {
             match fetch_changed_flags(conn, modseq as u64).await {
                 Ok(changes) => {
-                    let updated = apply_flag_updates(ctx, folder, &changes).await?;
-                    outcome.updated_ids.extend(updated);
+                    apply_flag_updates(ctx, folder, &changes).await?;
                 }
                 Err(error) => {
                     warn!(%error, folder = %folder.remote_path, "CHANGEDSINCE failed; falling back to UID diff");
                     let changes = fetch_all_flags(conn, None).await?;
-                    let updated = apply_flag_updates(ctx, folder, &changes).await?;
-                    outcome.updated_ids.extend(updated);
+                    apply_flag_updates(ctx, folder, &changes).await?;
                 }
             }
         }
     } else {
         let changes = fetch_all_flags(conn, None).await?;
-        let updated = apply_flag_updates(ctx, folder, &changes).await?;
-        outcome.updated_ids.extend(updated);
+        apply_flag_updates(ctx, folder, &changes).await?;
         mark_full_reconcile(ctx, &account.id, &folder.id).await?;
     }
 
@@ -1211,20 +1206,26 @@ pub(crate) fn reconcile_threads(
     Ok(())
 }
 
+/// Store the server's flags for the messages that changed and announce them.
+///
+/// Flags are changed by other mail clients too, so the local cache update is
+/// invisible to the UI unless it is published: `unread_count` is derived from
+/// these rows, hence the recompute inside the write before the event goes out.
 async fn apply_flag_updates(
     ctx: &CoreContext,
     folder: &Folder,
     changes: &[FlagChange],
-) -> Result<Vec<String>> {
+) -> Result<()> {
     if changes.is_empty() {
-        return Ok(Vec::new());
+        return Ok(());
     }
     let folder_id = folder.id.clone();
     let changes: Vec<(i64, FlagSnapshot)> = changes
         .iter()
         .map(|change| (change.uid, change.flags))
         .collect();
-    ctx.db
+    let updated = ctx
+        .db
         .write(move |db| {
             let mut updated = Vec::new();
             for (uid, flags) in changes {
@@ -1272,9 +1273,25 @@ async fn apply_flag_updates(
                 }
                 updated.push(id);
             }
+            if !updated.is_empty() {
+                // The unread/total counts are snapshots of the message rows, so
+                // they have to be consistent before the UI reacts to the event.
+                repo::folders::recompute_counts(db, &folder_id)?;
+            }
             Ok(updated)
         })
-        .await
+        .await?;
+
+    if !updated.is_empty() {
+        events::emit_mail_changed(
+            ctx.events.as_ref(),
+            folder.account_id.clone(),
+            vec![folder.id.clone()],
+            updated,
+            events::MailChangeKind::Updated,
+        );
+    }
+    Ok(())
 }
 
 fn local_uids(db: &rusqlite::Connection, folder_id: &str) -> Result<Vec<(String, i64)>> {
@@ -1760,6 +1777,99 @@ mod tests {
             Ok(())
         })
         .expect("seed and re-sync");
+    }
+
+    #[tokio::test]
+    async fn server_flag_changes_emit_updated_event_and_refresh_counts() {
+        use nuncio_core::traits::testing::{
+            NullCredentialProvider, NullNotifier, RecordingEventSink,
+        };
+
+        let sink = std::sync::Arc::new(RecordingEventSink::new());
+        let ctx = nuncio_core::CoreContext::new(
+            nuncio_core::db::Db::open_in_memory().expect("in-memory database"),
+            nuncio_core::Paths::new(std::env::temp_dir().join(nuncio_core::models::new_id())),
+            sink.clone(),
+            std::sync::Arc::new(NullCredentialProvider),
+            std::sync::Arc::new(NullNotifier),
+        )
+        .await
+        .expect("core context");
+
+        ctx.db
+            .write(|db| {
+                seed_graph_folder(db);
+                insert_message(db, "m1", Some(1), None, false, None);
+                insert_message(db, "m2", Some(2), None, false, None);
+                // m1 was unread locally; another client has now read it.
+                db.execute("UPDATE message SET seen = 0 WHERE id = 'm1'", [])?;
+                Ok(())
+            })
+            .await
+            .expect("seed");
+
+        let folder = ctx
+            .db
+            .read(|db| repo::folders::get_required(db, "fld"))
+            .await
+            .expect("folder");
+
+        let read = FlagSnapshot {
+            seen: true,
+            ..FlagSnapshot::default()
+        };
+        let changes = vec![
+            FlagChange {
+                uid: 1,
+                flags: read,
+            },
+            // Already stored exactly like this: it must not be reported.
+            FlagChange {
+                uid: 2,
+                flags: read,
+            },
+        ];
+        apply_flag_updates(&ctx, &folder, &changes)
+            .await
+            .expect("apply flags");
+
+        let seen: i64 = ctx
+            .db
+            .read(|db| {
+                Ok(
+                    db.query_row("SELECT seen FROM message WHERE id = 'm1'", [], |row| {
+                        row.get(0)
+                    })?,
+                )
+            })
+            .await
+            .expect("seen flag");
+        assert_eq!(seen, 1, "the server flag is stored");
+
+        let (event, payload) = sink.last().expect("a change event");
+        assert_eq!(event, events::MAIL_CHANGED);
+        assert_eq!(payload["accountId"], "acc");
+        assert_eq!(payload["folderIds"], serde_json::json!(["fld"]));
+        assert_eq!(payload["messageIds"], serde_json::json!(["m1"]));
+        assert_eq!(payload["kind"], "updated");
+
+        let folder = ctx
+            .db
+            .read(|db| repo::folders::get_required(db, "fld"))
+            .await
+            .expect("folder");
+        assert_eq!(folder.unread_count, 0, "both rows are read now");
+        assert_eq!(
+            folder.total_count, 2,
+            "counts are recomputed before the event"
+        );
+
+        // No changes, no event.
+        let before = sink.len();
+        apply_flag_updates(&ctx, &folder, &[])
+            .await
+            .expect("no changes");
+        assert_eq!(sink.len(), before);
     }
 
     /// Seed the account/folder Graph sync tests write into.

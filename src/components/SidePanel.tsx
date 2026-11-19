@@ -3,9 +3,12 @@
  * Escape or the close button, restores focus to the trigger.
  */
 import {
+  createContext,
   useCallback,
+  useContext,
   useEffect,
   useId,
+  useMemo,
   useRef,
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
@@ -14,11 +17,45 @@ import { createPortal } from "react-dom";
 import { Dismiss16Regular } from "@fluentui/react-icons";
 import { cn } from "@/lib/cn";
 import { useT } from "@/lib/i18n";
+import { confirm } from "./Dialog";
 import { IconButton } from "./IconButton";
 import styles from "./SidePanel.module.css";
 
 const FOCUSABLE =
   'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+/** Lets panel content report unsaved edits to the panel's shared dismiss guard. */
+export interface SidePanelCloseGuard {
+  setDirty: (dirty: boolean) => void;
+}
+
+const SidePanelCloseGuardContext = createContext<SidePanelCloseGuard | null>(null);
+
+export function useSidePanelCloseGuard(): SidePanelCloseGuard | null {
+  return useContext(SidePanelCloseGuardContext);
+}
+
+/**
+ * Text-entry controls that hold a draft until an explicit save. Numeric and
+ * choice controls are excluded: settings write them on every change, so there
+ * is no unsaved value to warn about.
+ */
+export interface DraftFieldTarget {
+  tagName?: string;
+  type?: string;
+  isContentEditable?: boolean;
+}
+
+const DRAFT_INPUT_TYPES = new Set(["", "text", "search", "email", "url", "tel", "password"]);
+
+export function isDraftTextField(target: DraftFieldTarget | null | undefined): boolean {
+  if (!target) return false;
+  if (target.isContentEditable) return true;
+  const tag = target.tagName?.toLowerCase();
+  if (tag === "textarea") return true;
+  if (tag !== "input") return false;
+  return DRAFT_INPUT_TYPES.has((target.type ?? "").toLowerCase());
+}
 
 export interface SidePanelProps {
   open: boolean;
@@ -54,6 +91,32 @@ export function SidePanel({
   const panelRef = useRef<HTMLDivElement | null>(null);
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const previousFocus = useRef<HTMLElement | null>(null);
+  const dirtyRef = useRef(false);
+
+  const closeGuard = useMemo<SidePanelCloseGuard>(
+    () => ({
+      setDirty: (dirty: boolean) => {
+        dirtyRef.current = dirty;
+      },
+    }),
+    [],
+  );
+
+  // Every dismissal path (X, Escape, backdrop) goes through here so dirty
+  // form content can be protected once, instead of in each panel body.
+  const requestClose = useCallback(async () => {
+    if (dirtyRef.current) {
+      const discard = await confirm({
+        title: t("common.unsavedTitle"),
+        message: t("common.unsavedMessage"),
+        confirmLabel: t("common.discardChanges"),
+        cancelLabel: t("common.keepEditing"),
+      });
+      if (!discard) return;
+      dirtyRef.current = false;
+    }
+    onClose();
+  }, [onClose, t]);
 
   useEffect(() => {
     if (!open) return;
@@ -79,7 +142,7 @@ export function SidePanel({
         if (!dismissible) return;
         event.preventDefault();
         event.stopPropagation();
-        onClose();
+        void requestClose();
         return;
       }
       if (event.key !== "Tab") return;
@@ -103,7 +166,7 @@ export function SidePanel({
         first.focus();
       }
     },
-    [dismissible, onClose],
+    [dismissible, requestClose],
   );
 
   if (!open || typeof document === "undefined") return null;
@@ -113,7 +176,7 @@ export function SidePanel({
       className={styles.overlay}
       onPointerDown={(event) => {
         if (closeOnBackdrop && dismissible && event.target === event.currentTarget) {
-          onClose();
+          void requestClose();
         }
       }}
     >
@@ -137,11 +200,13 @@ export function SidePanel({
               icon={<Dismiss16Regular />}
               label={t("common.close")}
               size="small"
-              onClick={onClose}
+              onClick={() => void requestClose()}
             />
           ) : null}
         </div>
-        <div ref={bodyRef} className={cn(styles.body, bodyClassName)}>{children}</div>
+        <SidePanelCloseGuardContext.Provider value={closeGuard}>
+          <div ref={bodyRef} className={cn(styles.body, bodyClassName)}>{children}</div>
+        </SidePanelCloseGuardContext.Provider>
         {footer ? <div className={styles.footer}>{footer}</div> : null}
       </div>
     </div>,

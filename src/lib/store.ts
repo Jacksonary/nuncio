@@ -47,6 +47,12 @@ export interface ShellStore {
   activeModule: AppModule;
   railCollapsed: boolean;
   showSettings: boolean;
+  /**
+   * Account the settings panel should open on. Set together with
+   * `showSettings` by a deep link (the mail sidebar's "repair account"), and
+   * cleared on close so a later plain open lands on the index again.
+   */
+  settingsAccountId: string | null;
   selection: SelectionState;
   /** Persisted splitter sizes, keyed by `storageKey`. */
   panelSizes: Record<string, number>;
@@ -61,6 +67,8 @@ export interface ShellStore {
   setRailCollapsed: (collapsed: boolean) => void;
   toggleRail: () => void;
   setShowSettings: (open: boolean) => void;
+  /** Open settings and land on one account's detail page. */
+  openAccountSettings: (accountId: string) => void;
   setShowAddAccount: (open: boolean) => void;
   setSelection: <K extends keyof SelectionState>(
     module: K,
@@ -87,6 +95,7 @@ export const useShellStore = create<ShellStore>()(
       activeModule: "mail",
       railCollapsed: false,
       showSettings: false,
+      settingsAccountId: null,
       showAddAccount: false,
       selection: initialSelection,
       panelSizes: {},
@@ -98,7 +107,10 @@ export const useShellStore = create<ShellStore>()(
       setActiveModule: (module) => set({ activeModule: module }),
       setRailCollapsed: (collapsed) => set({ railCollapsed: collapsed }),
       toggleRail: () => set((state) => ({ railCollapsed: !state.railCollapsed })),
-      setShowSettings: (open) => set({ showSettings: open }),
+      // Closing clears the deep-link target so the next plain open shows the
+      // index again.
+      setShowSettings: (open) => set({ showSettings: open, settingsAccountId: null }),
+      openAccountSettings: (accountId) => set({ showSettings: true, settingsAccountId: accountId }),
       setShowAddAccount: (open) => set({ showAddAccount: open }),
       setSelection: (module, patch) =>
         set((state) => ({

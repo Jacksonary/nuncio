@@ -33,6 +33,7 @@ use crate::contacts::provider::{
 use crate::error::{invalid, AppError, Result};
 use crate::http::HttpClient;
 use crate::op_worker::{self, PimOpExecutor};
+use crate::status::record_failure;
 
 /// `sync_state.module` used for contact cursors.
 pub const SYNC_MODULE: &str = "contacts";
@@ -260,21 +261,12 @@ impl ContactsService {
                         return Ok(());
                     }
                 }
-                match &error {
-                    AppError::Auth(_) => self
-                        .ctx
-                        .sync_status
-                        .needs_reauth(&account.id, SyncModule::Contacts),
-                    AppError::Network(_) => self
-                        .ctx
-                        .sync_status
-                        .offline(&account.id, SyncModule::Contacts),
-                    _ => self.ctx.sync_status.fail(
-                        &account.id,
-                        SyncModule::Contacts,
-                        error.message(),
-                    ),
-                };
+                record_failure(
+                    &self.ctx.sync_status,
+                    &account.id,
+                    SyncModule::Contacts,
+                    &error,
+                );
                 Err(error)
             }
         }
@@ -820,7 +812,7 @@ impl ContactsService {
 
     pub async fn group_set_members(&self, group_id: &str, contact_ids: Vec<String>) -> Result<()> {
         let group_id = group_id.to_string();
-        let (group, previous) = self
+        let (group, previous, current) = self
             .ctx
             .db
             .write({
@@ -833,11 +825,18 @@ impl ContactsService {
                         .map(|contact| contact.id)
                         .collect();
                     contacts_repo::set_group_members(conn, &group_id, &contact_ids)?;
-                    Ok((group, previous_members))
+                    // Re-read instead of trusting the input: ids from another
+                    // address book are filtered out, and the remote diff must
+                    // not mention them.
+                    let current_members: Vec<String> = contacts_repo::members(conn, &group_id)?
+                        .into_iter()
+                        .map(|contact| contact.id)
+                        .collect();
+                    Ok((group, previous_members, current_members))
                 }
             })
             .await?;
-        let current: HashSet<String> = contact_ids.into_iter().collect();
+        let current: HashSet<String> = current.into_iter().collect();
         let previous_set: HashSet<String> = previous.into_iter().collect();
         let added: Vec<String> = current.difference(&previous_set).cloned().collect();
         let removed: Vec<String> = previous_set.difference(&current).cloned().collect();
@@ -1917,10 +1916,14 @@ fn restore_contact(conn: &rusqlite::Connection, snapshot: &ContactSnapshot) -> R
 }
 
 fn group_names_for(conn: &rusqlite::Connection, contact_id: &str) -> Result<Vec<String>> {
+    // Only groups from the contact's own address book; a cross-book membership
+    // must never be pushed to the provider as a category.
     let mut stmt = conn.prepare(
         "SELECT g.name FROM contact_group g
          JOIN contact_group_member m ON m.group_id = g.id
-         WHERE m.contact_id = ?1 ORDER BY g.name ASC",
+         JOIN contact c ON c.id = m.contact_id
+         WHERE m.contact_id = ?1 AND c.address_book_id = g.address_book_id
+         ORDER BY g.name ASC",
     )?;
     let mut rows = stmt.query(rusqlite::params![contact_id])?;
     let mut out = Vec::new();
@@ -2098,6 +2101,84 @@ mod tests {
             .await
             .expect("find")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn cross_book_group_membership_is_ignored_by_count_and_list() {
+        let ctx = ctx().await;
+        let service = service(&ctx);
+        let other_id = "other-contacts";
+        let other = AddressBook {
+            id: other_id.into(),
+            account_id: "local".into(),
+            name: "Other".into(),
+            is_read_only: false,
+            is_default: false,
+        };
+        ctx.db
+            .write(move |conn| repo::address_books::insert(conn, &mut other.clone()))
+            .await
+            .expect("book");
+
+        let in_book = service
+            .contact_create(contact("local-contacts", "Ada Lovelace", "ada@example.com"))
+            .await
+            .expect("create");
+        let other_contact = service
+            .contact_create(contact(other_id, "Grace Hopper", "grace@example.com"))
+            .await
+            .expect("create");
+        let group = service
+            .group_create("local-contacts", "Mathematicians")
+            .await
+            .expect("group");
+
+        // The group editor is asked to add a contact from another book.
+        service
+            .group_set_members(
+                &group.id,
+                vec![in_book.id.clone(), other_contact.id.clone()],
+            )
+            .await
+            .expect("members");
+
+        let groups = service
+            .group_list(Some("local-contacts".into()))
+            .await
+            .expect("groups");
+        let team = groups
+            .iter()
+            .find(|candidate| candidate.id == group.id)
+            .expect("group row");
+        assert_eq!(team.member_count, 1, "cross-book member must not be counted");
+
+        let page = service
+            .contact_list(ContactListQuery {
+                address_book_id: Some("local-contacts".into()),
+                group_id: Some(group.id.clone()),
+                query: None,
+                favorites_only: false,
+                cursor: None,
+                limit: 50,
+            })
+            .await
+            .expect("list");
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items.len(), 1, "group count and list must agree");
+
+        // The editor path (`contact_update` -> `replace_groups`) ignores it too.
+        let mut edited = other_contact;
+        edited.group_ids = vec![group.id.clone()];
+        service.contact_update(edited).await.expect("update");
+        let groups = service
+            .group_list(Some("local-contacts".into()))
+            .await
+            .expect("groups");
+        let team = groups
+            .iter()
+            .find(|candidate| candidate.id == group.id)
+            .expect("group row");
+        assert_eq!(team.member_count, 1);
     }
 
     #[tokio::test]

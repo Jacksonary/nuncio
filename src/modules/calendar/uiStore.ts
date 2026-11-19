@@ -11,6 +11,23 @@ export interface NewEventSeed {
   end: Date;
   allDay: boolean;
   calendarId: string | null;
+  /**
+   * Draft title typed into QuickCreate. "More options" hands the same draft to
+   * the full editor instead of starting from an empty form.
+   */
+  title?: string;
+}
+
+/** Keep the QuickCreate draft when continuing into the full editor. */
+export function mergeSeedDraft(
+  seed: NewEventSeed,
+  draft: { title: string; calendarId: string | null },
+): NewEventSeed {
+  return {
+    ...seed,
+    title: draft.title,
+    calendarId: draft.calendarId ?? seed.calendarId,
+  };
 }
 
 export type EditorRequest =

@@ -230,9 +230,9 @@ impl GraphMailClient {
             401 => AppError::auth(format!("Graph authentication failed: {snippet}")),
             403 => AppError::unsupported(format!("Graph denied access: {snippet}")),
             404 => AppError::not_found(format!("Graph resource missing: {snippet}")),
-            429 => AppError::network(format!("Graph rate limited: {snippet}")),
+            429 => AppError::service(format!("Graph rate limited: {snippet}")),
             _ if status.is_server_error() => {
-                AppError::network(format!("Graph error {status}: {snippet}"))
+                AppError::service(format!("Graph error {status}: {snippet}"))
             }
             _ => AppError::protocol(format!("Graph returned {status}: {snippet}")),
         }
@@ -352,13 +352,15 @@ mod tests {
             GraphMailClient::failure(StatusCode::NOT_FOUND, "gone"),
             AppError::NotFound(_)
         ));
+        // 429/5xx mean the service answered and refused; the executor must
+        // retry them, but they say nothing about device connectivity.
         assert!(matches!(
             GraphMailClient::failure(StatusCode::TOO_MANY_REQUESTS, "slow down"),
-            AppError::Network(_)
+            AppError::Service(_)
         ));
         assert!(matches!(
             GraphMailClient::failure(StatusCode::INTERNAL_SERVER_ERROR, "boom"),
-            AppError::Network(_)
+            AppError::Service(_)
         ));
         assert!(matches!(
             GraphMailClient::failure(StatusCode::BAD_REQUEST, "bad"),

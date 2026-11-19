@@ -85,6 +85,14 @@
   min-width: var(--sp-2);
 }
 
+/* The status label can be a full sentence and the list pane gets narrow, so
+   keep it from squeezing the title out; its own label already ellipsizes. */
+.headerSync {
+  flex: none;
+  min-width: 0;
+  max-width: 40%;
+}
+
 .addRow {
   flex: none;
   display: flex;

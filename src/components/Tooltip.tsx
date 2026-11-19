@@ -17,6 +17,22 @@ import { cn } from "@/lib/cn";
 import { Popover, type PopoverPlacement } from "./Popover";
 import styles from "./Tooltip.module.css";
 
+/**
+ * True when focus landed on the element the way a keyboard user would put it
+ * there. Browsers expose that as `:focus-visible`: it does not match when the
+ * focus was moved by script after a mouse interaction, which is exactly the
+ * auto-focus-the-first-control case. If the selector is unsupported, keep the
+ * old behaviour (show) rather than hide the tooltip from keyboard users.
+ */
+export function isKeyboardFocus(target: Pick<Element, "matches"> | EventTarget | null): boolean {
+  if (!target || typeof (target as Element).matches !== "function") return true;
+  try {
+    return (target as Element).matches(":focus-visible");
+  } catch {
+    return true;
+  }
+}
+
 export interface TooltipProps {
   content: ReactNode;
   children: ReactNode;
@@ -91,7 +107,13 @@ export function Tooltip({
         className={cn(styles.anchor, className)}
         onMouseEnter={() => show()}
         onMouseLeave={hide}
-        onFocus={() => show()}
+        onFocus={(event) => {
+          // Only a keyboard focus explains itself. A panel or dialog that
+          // moves focus to its first control on open is not the user pointing
+          // at it, and a bubble popping up unprompted ("Back" over the arrow
+          // the moment settings opens) is just noise.
+          if (isKeyboardFocus(event.target)) show();
+        }}
         onBlur={hide}
         onPointerDown={hide}
         onContextMenu={hide}

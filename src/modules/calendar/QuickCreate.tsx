@@ -7,7 +7,7 @@ import { formatTime } from "@/lib/format";
 import { invalidateCalendarData } from "./actions";
 import { localTimeZone } from "./dates";
 import { rangeToInput as rangeToInputModel } from "./model";
-import type { NewEventSeed } from "./uiStore";
+import { mergeSeedDraft, type NewEventSeed } from "./uiStore";
 import styles from "./QuickCreate.module.css";
 
 export interface QuickCreateProps {
@@ -154,7 +154,11 @@ export function QuickCreate({
         <p className={styles.hint}>{t("calendar.editor.noCalendars")}</p>
       ) : null}
       <div className={styles.footer}>
-        <Button appearance="subtle" size="small" onClick={() => onOpenEditor(seed)}>
+        <Button
+          appearance="subtle"
+          size="small"
+          onClick={() => onOpenEditor(mergeSeedDraft(seed, { title, calendarId }))}
+        >
           {t("calendar.quick.more")}
         </Button>
         <span className={styles.spacer} />

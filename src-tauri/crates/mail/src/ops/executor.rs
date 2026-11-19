@@ -944,7 +944,7 @@ pub async fn run_due_graph(ctx: &CoreContext, account: &Account) -> Result<ExecO
 /// a synchronous result for the command layer.
 ///
 /// Every error goes through [`handle_failure`], exactly like the queue pass:
-/// retryable failures (network, auth, transient protocol) leave the row
+/// retryable failures (network, service, auth, transient protocol) leave the row
 /// `pending` with backoff, everything else is rolled back and marked failed.
 /// Returning early without settling the row would leave it `inProgress` until
 /// the ten-minute recovery sweep, so a user retry in between could run a
@@ -1587,7 +1587,11 @@ async fn handle_failure(
     // refreshing a valid token cannot grant a permission.
     let retryable = matches!(
         error,
-        AppError::Network(_) | AppError::Auth(_) | AppError::Db(_) | AppError::Io(_)
+        AppError::Network(_)
+            | AppError::Service(_)
+            | AppError::Auth(_)
+            | AppError::Db(_)
+            | AppError::Io(_)
     ) || matches!(
         error,
         AppError::Protocol(_) if op.attempts < 2
@@ -1911,7 +1915,7 @@ pub async fn run_one_now(
     let mut selected = None;
     match execute_one(ctx, conn, account, &mut selected, op).await {
         Ok(()) => mark_done(ctx, std::slice::from_ref(&op.id)).await,
-        Err(error) if error.code() == "network" || error.code() == "auth" => {
+        Err(error) if matches!(error.code(), "network" | "service" | "auth") => {
             // Immediate command: leave the op pending so the next queue pass
             // retries it with backoff.
             Err(error)

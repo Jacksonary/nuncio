@@ -32,13 +32,17 @@ export async function copyText(value: string): Promise<boolean> {
   return false;
 }
 
-export async function pickSavePath(defaultPath: string, title: string): Promise<string | null> {
+export async function pickSavePath(
+  defaultPath: string,
+  title: string,
+  filters?: { name: string; extensions: string[] }[],
+): Promise<string | null> {
   if (!isTauri()) return null;
   const { save } = await import("@tauri-apps/plugin-dialog");
   const path = await save({
     title,
     defaultPath,
-    filters: [
+    filters: filters ?? [
       { name: t("settings.data.backupFilter"), extensions: ["nuncio-backup", "zip", "json"] },
       { name: t("settings.data.allFilesFilter"), extensions: ["*"] },
     ],

@@ -103,6 +103,43 @@ pub fn create(conn: &Connection, account_id: &str, name: &str, color: &str) -> R
     get_required(conn, &id)
 }
 
+/// Insert a list with its original id (restore path).
+///
+/// [`create`] always mints a new id, which would break the task rows and PIM
+/// mappings that reference the list.
+pub fn insert(conn: &Connection, list: &TaskList) -> Result<TaskList> {
+    if list.id.trim().is_empty() {
+        return Err(AppError::invalid_input("task list id is required"));
+    }
+    if list.name.trim().is_empty() {
+        return Err(AppError::invalid_input("task list name must not be empty"));
+    }
+    conn.execute(
+        "INSERT INTO task_list
+             (id, account_id, name, color, is_default, is_read_only, sort_order, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+         ON CONFLICT(id) DO UPDATE SET
+             account_id = excluded.account_id,
+             name = excluded.name,
+             color = excluded.color,
+             is_default = excluded.is_default,
+             is_read_only = excluded.is_read_only,
+             sort_order = excluded.sort_order,
+             updated_at = excluded.updated_at",
+        params![
+            list.id,
+            list.account_id,
+            list.name,
+            list.color,
+            list.is_default as i64,
+            list.is_read_only as i64,
+            list.sort_order,
+            now_string()
+        ],
+    )?;
+    get_required(conn, &list.id)
+}
+
 pub fn update(
     conn: &Connection,
     id: &str,

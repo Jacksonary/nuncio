@@ -5,7 +5,6 @@ import {
   outboxStatusKey,
   parseOutboxStatus,
 } from "./outbox";
-import { isSupportedSwipeAction } from "./logic";
 
 describe("outbox id helpers", () => {
   it("recognises synthetic outbox message ids", () => {
@@ -57,20 +56,5 @@ describe("parseOutboxStatus", () => {
   it("maps states to i18n keys", () => {
     expect(outboxStatusKey("failed")).toBe("mail.outbox.state.failed");
     expect(outboxStatusKey("pending")).toBe("mail.outbox.state.pending");
-  });
-});
-
-describe("isSupportedSwipeAction", () => {
-  it("accepts actions that need no destination folder", () => {
-    expect(isSupportedSwipeAction("archive")).toBe(true);
-    expect(isSupportedSwipeAction("delete")).toBe(true);
-    expect(isSupportedSwipeAction("flag")).toBe(true);
-    expect(isSupportedSwipeAction("read")).toBe(true);
-  });
-
-  it("ignores move and none", () => {
-    expect(isSupportedSwipeAction("move")).toBe(false);
-    expect(isSupportedSwipeAction("none")).toBe(false);
-    expect(isSupportedSwipeAction(null)).toBe(false);
   });
 });

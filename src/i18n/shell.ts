@@ -19,18 +19,13 @@ export const shell = {
     "shell.toggleRail": "折叠或展开导航",
     "shell.moduleSwitcher": "模块切换",
 
-    "shell.syncStatus": "同步状态",
-    "shell.syncProgress": "正在同步 {done}/{total}",
-    "shell.syncPending": "正在同步…",
-    "shell.synced": "已同步",
-    "shell.neverSynced": "尚未同步",
-    "shell.syncFailed": "同步出错",
-    "shell.needsReauth": "需要重新登录",
-    "shell.syncOffline": "离线，稍后自动重试",
     "shell.offlineBanner": "当前离线，操作将在恢复连接后自动同步。",
     "shell.offlineRetry": "立即检查",
-    "shell.syncStarted": "已开始同步",
-    "shell.syncFailedToast": "同步失败：{message}",
+    "shell.offlineIndicator": "离线",
+    "shell.neverSynced": "尚未同步",
+    "shell.syncNow": "同步{module}",
+    "shell.syncDone": "已同步{module}",
+    "shell.syncError": "同步{module}失败",
 
     "shell.firstRun.title": "欢迎使用 Nuncio",
     "shell.firstRun.subtitle":
@@ -89,7 +84,7 @@ export const shell = {
 
     "shell.shortcuts.modules": "切换模块",
     "shell.shortcuts.settings": "打开设置",
-    "shell.shortcuts.sync": "同步全部账户",
+    "shell.shortcuts.sync": "同步当前模块",
   },
   "en-US": {
     "shell.appName": "Nuncio",
@@ -107,18 +102,13 @@ export const shell = {
     "shell.toggleRail": "Collapse or expand navigation",
     "shell.moduleSwitcher": "Modules",
 
-    "shell.syncStatus": "Sync status",
-    "shell.syncProgress": "Syncing {done}/{total}",
-    "shell.syncPending": "Syncing…",
-    "shell.synced": "Synced",
-    "shell.neverSynced": "Not synced yet",
-    "shell.syncFailed": "Sync error",
-    "shell.needsReauth": "Sign-in required",
-    "shell.syncOffline": "Offline — will retry automatically",
     "shell.offlineBanner": "You are offline. Changes will sync when the connection returns.",
     "shell.offlineRetry": "Check now",
-    "shell.syncStarted": "Sync started",
-    "shell.syncFailedToast": "Sync failed: {message}",
+    "shell.offlineIndicator": "Offline",
+    "shell.neverSynced": "Not synced yet",
+    "shell.syncNow": "Sync {module}",
+    "shell.syncDone": "{module} synced",
+    "shell.syncError": "Could not sync {module}",
 
     "shell.firstRun.title": "Welcome to Nuncio",
     "shell.firstRun.subtitle":
@@ -181,6 +171,6 @@ export const shell = {
 
     "shell.shortcuts.modules": "Switch modules",
     "shell.shortcuts.settings": "Open settings",
-    "shell.shortcuts.sync": "Sync all accounts",
+    "shell.shortcuts.sync": "Sync current module",
   },
 } as const;

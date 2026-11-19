@@ -34,6 +34,7 @@ use crate::http::HttpClient;
 use crate::ops::{self, CalendarSnapshot, EventSnapshot, PimOp};
 use crate::provider::{CalendarCursor, CalendarProvider, EventWindow, RemoteCalendar, RemoteEvent};
 use crate::reminders::ReminderEngine;
+use crate::status::record_failure;
 use crate::store::{self, CalendarRemote};
 use crate::tasks::{task_reminder_key, TaskReminderSource, TasksService};
 use crate::util::{
@@ -711,28 +712,12 @@ impl PimService {
                         return Ok(());
                     }
                 }
-                match &error {
-                    AppError::Auth(_) | AppError::Network(_) => {
-                        if matches!(error, AppError::Auth(_)) {
-                            self.inner
-                                .ctx
-                                .sync_status
-                                .needs_reauth(&account.id, SyncModule::Calendar);
-                        } else {
-                            self.inner
-                                .ctx
-                                .sync_status
-                                .offline(&account.id, SyncModule::Calendar);
-                        }
-                    }
-                    _ => {
-                        self.inner.ctx.sync_status.fail(
-                            &account.id,
-                            SyncModule::Calendar,
-                            error.message(),
-                        );
-                    }
-                }
+                record_failure(
+                    &self.inner.ctx.sync_status,
+                    &account.id,
+                    SyncModule::Calendar,
+                    &error,
+                );
                 Err(error)
             }
         }
@@ -3185,7 +3170,7 @@ impl PimService {
     async fn handle_op_failure(&self, op: &PendingOp, error: AppError) {
         let retryable = matches!(
             &error,
-            AppError::Network(_) | AppError::Conflict(_) | AppError::Io(_)
+            AppError::Network(_) | AppError::Service(_) | AppError::Conflict(_) | AppError::Io(_)
         ) && op.attempts < 5;
         let auth = matches!(&error, AppError::Auth(_));
         if auth {

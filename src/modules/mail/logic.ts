@@ -2,7 +2,12 @@
  * Pure helpers for the mail module: date grouping, multi-selection and
  * folder-tree shape. Kept free of React and IPC so they are unit-testable.
  */
-import type { Folder, FolderRole, HoverAction, MessageSummary } from "@/ipc/types";
+import type {
+  Folder,
+  FolderRole,
+  MailFilter,
+  MessageSummary,
+} from "@/ipc/types";
 import { addDays, isSameDay, isThisWeek, startOfWeek } from "@/lib/format";
 
 /* ───────────────────────────── Date groups ───────────────────────────── */
@@ -161,6 +166,29 @@ export function actionTargets(
 }
 
 /**
+ * Keep only ids that are still in the current result set.
+ *
+ * The selection lives in component state while the list underneath can change
+ * (folder switch, refetch, filter). An action must never be able to reach a
+ * message the user can no longer see, so the action path intersects with the
+ * rows actually on screen before calling the backend.
+ */
+export function constrainToResultSet(
+  ids: readonly string[],
+  available: readonly string[],
+): string[] {
+  const present = new Set(available);
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const id of ids) {
+    if (!present.has(id) || seen.has(id)) continue;
+    seen.add(id);
+    result.push(id);
+  }
+  return result;
+}
+
+/**
  * Pick the message that should be opened after deleting `removed` from the
  * ordered id list, honouring the auto-advance preference.
  */
@@ -191,6 +219,68 @@ export function nextAfterRemoval(
     if (id && !removed.has(id)) return id;
   }
   return remaining[0] ?? null;
+}
+
+/* ───────────────────────────── Empty states ──────────────────────────── */
+
+export interface EmptyStateCopy {
+  titleKey: string;
+  descriptionKey: string;
+  /** Show the "clear filter" action; only a filtered view has one to clear. */
+  clearFilter: boolean;
+}
+
+const FILTER_EMPTY_TITLE: Record<MailFilter, string> = {
+  all: "mail.list.emptyFolder",
+  unread: "mail.list.emptyUnread",
+  flagged: "mail.list.emptyFlagged",
+  attachments: "mail.list.emptyAttachments",
+  mentionsMe: "mail.list.emptyMentions",
+};
+
+/**
+ * A mailbox is empty for a different reason depending on its role: telling the
+ * user to wait for new mail makes no sense in Drafts, Sent or the Outbox.
+ */
+const ROLE_EMPTY_HINT: Partial<Record<FolderRole, string>> = {
+  drafts: "mail.list.emptyHintDrafts",
+  sent: "mail.list.emptyHintSent",
+  outbox: "mail.list.emptyHintOutbox",
+  trash: "mail.list.emptyHintTrash",
+  junk: "mail.list.emptyHintJunk",
+  archive: "mail.list.emptyHintArchive",
+};
+
+/**
+ * Pick the copy for the list's empty state. Search and filter matches are a
+ * different situation from an empty mailbox, so they get their own wording
+ * (and a way out) before the folder role decides the explanation.
+ */
+export function emptyStateCopy(input: {
+  searching: boolean;
+  filter: MailFilter;
+  role: FolderRole | null;
+}): EmptyStateCopy {
+  if (input.searching) {
+    return {
+      titleKey: "mail.list.emptySearchTitle",
+      descriptionKey: "mail.list.emptySearchHint",
+      clearFilter: false,
+    };
+  }
+  if (input.filter !== "all") {
+    return {
+      titleKey: FILTER_EMPTY_TITLE[input.filter],
+      descriptionKey: "mail.list.emptyFilterHint",
+      clearFilter: true,
+    };
+  }
+  return {
+    titleKey: "mail.list.emptyFolder",
+    descriptionKey:
+      (input.role ? ROLE_EMPTY_HINT[input.role] : undefined) ?? "mail.list.emptyHint",
+    clearFilter: false,
+  };
 }
 
 /* ───────────────────────────── Folder tree ───────────────────────────── */
@@ -531,23 +621,6 @@ export function parseUnifiedFolderId(value: string | null): FolderRole | null {
 }
 
 /* ───────────────────────────── Swipe actions ──────────────────────────── */
-
-export type SupportedSwipeAction = "archive" | "delete" | "flag" | "read";
-
-/**
- * Swipe gestures only support actions that make sense without a target
- * folder; "move" has no destination and "none" disables the gesture.
- */
-export function isSupportedSwipeAction(
-  action: HoverAction | null | undefined,
-): action is SupportedSwipeAction {
-  return (
-    action === "archive" ||
-    action === "delete" ||
-    action === "flag" ||
-    action === "read"
-  );
-}
 
 /* ───────────────────────────── Misc helpers ───────────────────────────── */
 

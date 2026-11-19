@@ -117,12 +117,16 @@ export const messages = {
   thread: (accountId: T.Id, threadId: string) => call<T.MessageSummary[]>("message_thread", { accountId, threadId }),
   /** Downloads the body if not cached. allowRemote overrides the remote-content policy for this call. */
   get: (id: T.Id, allowRemote: boolean) => call<T.MessageDetail>("message_get", { id, allowRemote }),
-  /** Optimistic: updates locally, queues server ops, emits mail://changed. */
-  act: (ids: T.Id[], action: T.MessageAction) => call<void>("message_act", { ids, action }),
+  /**
+   * Optimistic: updates locally, queues server ops, emits mail://changed.
+   * Returns the undo id to pass to `undoLast`.
+   */
+  act: (ids: T.Id[], action: T.MessageAction) => call<string>("message_act", { ids, action }),
   /** Applies the action to every message of the given conversations. */
   actThreads: (accountId: T.Id, threadIds: string[], action: T.MessageAction) =>
-    call<void>("message_act_threads", { accountId, threadIds, action }),
-  undoLast: () => call<boolean>("message_undo_last"),
+    call<string>("message_act_threads", { accountId, threadIds, action }),
+  /** Undo one action by id; null reverts the most recent action globally. */
+  undoLast: (undoId: T.Id | null = null) => call<boolean>("message_undo_last", { undoId }),
   saveEml: (id: T.Id, path: string) => call<void>("message_save_eml", { id, path }),
   openEml: (path: string) => call<T.MessageDetail>("message_open_eml", { path }),
   /** Remember sender (email) or domain ("@example.com") as trusted for remote content. */

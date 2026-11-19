@@ -133,7 +133,7 @@ pub async fn message_act(
     state: State<'_, AppState>,
     ids: Vec<String>,
     action: MessageAction,
-) -> nuncio_core::Result<()> {
+) -> nuncio_core::Result<String> {
     state.mail.message_act(&ids, &action).await
 }
 
@@ -143,16 +143,24 @@ pub async fn message_act_threads(
     account_id: String,
     thread_ids: Vec<String>,
     action: MessageAction,
-) -> nuncio_core::Result<()> {
+) -> nuncio_core::Result<String> {
     state
         .mail
         .message_act_threads(&account_id, &thread_ids, &action)
         .await
 }
 
+/// Undo by the id returned from `message_act`; without one, the most recent
+/// action (keyboard shortcut path) is reverted.
 #[tauri::command]
-pub async fn message_undo_last(state: State<'_, AppState>) -> nuncio_core::Result<bool> {
-    state.mail.message_undo_last().await
+pub async fn message_undo_last(
+    state: State<'_, AppState>,
+    undo_id: Option<String>,
+) -> nuncio_core::Result<bool> {
+    match undo_id {
+        Some(id) if !id.is_empty() => state.mail.message_undo(&id).await,
+        _ => state.mail.message_undo_last().await,
+    }
 }
 
 #[tauri::command]

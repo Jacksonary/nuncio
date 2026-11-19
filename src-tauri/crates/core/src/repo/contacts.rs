@@ -1,5 +1,6 @@
 //! Contacts, groups and contact-book queries.
 
+use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use crate::error::AppError;
@@ -122,8 +123,15 @@ pub fn list(conn: &Connection, query: &ContactListQuery) -> Result<ContactPage> 
         values.push(crate::repo::text(book));
     }
     if let Some(group) = &query.group_id {
-        clauses
-            .push("id IN (SELECT contact_id FROM contact_group_member WHERE group_id = ?)".into());
+        // A group belongs to exactly one address book. Cross-book memberships
+        // are ignored by both this list and `list_groups`' member count, so
+        // the two can never disagree about how many contacts a group holds.
+        clauses.push(
+            "id IN (SELECT m.contact_id FROM contact_group_member m
+                    JOIN contact_group g ON g.id = m.group_id
+                    WHERE m.group_id = ? AND g.address_book_id = contact.address_book_id)"
+                .into(),
+        );
         values.push(crate::repo::text(group));
     }
     if query.favorites_only {
@@ -373,6 +381,42 @@ pub fn count(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row("SELECT COUNT(*) FROM contact", [], |row| row.get(0))?)
 }
 
+/// Every contact with its group membership (backup export).
+///
+/// The paged [`list`] returns summaries and follows a cursor; a backup needs
+/// complete records, so it reads the table once and attaches the membership
+/// rows in a second pass.
+pub fn list_all(conn: &Connection) -> Result<Vec<Contact>> {
+    let sql =
+        format!("SELECT {CONTACT_COLUMNS} FROM contact ORDER BY lower(display_name) ASC, id ASC");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    let mut contacts = Vec::new();
+    while let Some(row) = rows.next()? {
+        contacts.push(row_to_contact(row)?);
+    }
+    drop(rows);
+    drop(stmt);
+
+    let mut memberships: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut stmt = conn
+        .prepare("SELECT contact_id, group_id FROM contact_group_member ORDER BY group_id ASC")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        memberships
+            .entry(row.get(0)?)
+            .or_default()
+            .push(row.get(1)?);
+    }
+    for contact in &mut contacts {
+        if let Some(groups) = memberships.remove(&contact.id) {
+            contact.group_ids = groups;
+        }
+    }
+    Ok(contacts)
+}
+
 pub fn by_remote_id(
     conn: &Connection,
     address_book_id: &str,
@@ -394,8 +438,12 @@ pub fn by_remote_id(
 /* ───────────────────────────── groups ─────────────────────────────── */
 
 pub fn list_groups(conn: &Connection, address_book_id: Option<&str>) -> Result<Vec<ContactGroup>> {
+    // Count only members whose contact lives in the group's own address book;
+    // that is the same predicate `list(..group_id..)` uses to show the group.
     let sql = "SELECT g.id, g.address_book_id, g.account_id, g.name,
-                      (SELECT COUNT(*) FROM contact_group_member m WHERE m.group_id = g.id) AS member_count
+                      (SELECT COUNT(*) FROM contact_group_member m
+                         JOIN contact c ON c.id = m.contact_id
+                        WHERE m.group_id = g.id AND c.address_book_id = g.address_book_id) AS member_count
                FROM contact_group g
                WHERE (?1 IS NULL OR g.address_book_id = ?1)
                ORDER BY g.name COLLATE NOCASE ASC";
@@ -417,6 +465,68 @@ pub fn list_groups(conn: &Connection, address_book_id: Option<&str>) -> Result<V
 pub fn get_group(conn: &Connection, id: &str) -> Result<Option<ContactGroup>> {
     let groups = list_groups(conn, None)?;
     Ok(groups.into_iter().find(|group| group.id == id))
+}
+
+/// One `contact_group` row including its sync metadata.
+///
+/// The IPC [`ContactGroup`] model only carries the member count, which is a
+/// derived value. Backup export needs the stable `remote_id` and timestamps so
+/// a restore can keep matching the server group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContactGroupRecord {
+    pub id: String,
+    pub address_book_id: String,
+    pub account_id: String,
+    pub name: String,
+    pub remote_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+pub fn list_groups_all(conn: &Connection) -> Result<Vec<ContactGroupRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, address_book_id, account_id, name, remote_id, created_at, updated_at
+         FROM contact_group ORDER BY name COLLATE NOCASE ASC, id ASC",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut groups = Vec::new();
+    while let Some(row) = rows.next()? {
+        groups.push(ContactGroupRecord {
+            id: crate::repo::get_string(row, "id")?,
+            address_book_id: crate::repo::get_string(row, "address_book_id")?,
+            account_id: crate::repo::get_string(row, "account_id")?,
+            name: crate::repo::get_string(row, "name")?,
+            remote_id: crate::repo::get_opt_string(row, "remote_id")?,
+            created_at: crate::repo::get_dt(row, "created_at")?,
+            updated_at: crate::repo::get_dt(row, "updated_at")?,
+        });
+    }
+    Ok(groups)
+}
+
+/// Insert a group with its original id and sync metadata (restore path).
+pub fn insert_group_record(conn: &Connection, group: &ContactGroupRecord) -> Result<()> {
+    conn.execute(
+        "INSERT INTO contact_group
+             (id, address_book_id, account_id, name, remote_id, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(id) DO UPDATE SET
+             address_book_id = excluded.address_book_id,
+             account_id = excluded.account_id,
+             name = excluded.name,
+             remote_id = excluded.remote_id,
+             updated_at = excluded.updated_at",
+        params![
+            group.id,
+            group.address_book_id,
+            group.account_id,
+            group.name,
+            group.remote_id,
+            crate::repo::dt_string(group.created_at),
+            crate::repo::dt_string(group.updated_at)
+        ],
+    )?;
+    Ok(())
 }
 
 pub fn create_group(conn: &Connection, address_book_id: &str, name: &str) -> Result<ContactGroup> {
@@ -460,8 +570,13 @@ pub fn set_group_members(conn: &Connection, group_id: &str, contact_ids: &[Strin
         params![group_id],
     )?;
     for contact_id in contact_ids {
+        // Groups are scoped to an address book: skip ids from another book
+        // instead of storing a membership the group list would filter out.
         conn.execute(
-            "INSERT OR IGNORE INTO contact_group_member (group_id, contact_id, added_at) VALUES (?1, ?2, ?3)",
+            "INSERT OR IGNORE INTO contact_group_member (group_id, contact_id, added_at)
+             SELECT g.id, c.id, ?3
+             FROM contact_group g JOIN contact c ON c.id = ?2
+             WHERE g.id = ?1 AND c.address_book_id = g.address_book_id",
             params![group_id, contact_id, now_string()],
         )?;
     }
@@ -474,8 +589,13 @@ fn replace_groups(conn: &Connection, contact_id: &str, group_ids: &[String]) -> 
         params![contact_id],
     )?;
     for group_id in group_ids {
+        // A contact can only join groups of its own address book; ids from a
+        // different book are ignored rather than saved and hidden later.
         conn.execute(
-            "INSERT OR IGNORE INTO contact_group_member (group_id, contact_id, added_at) VALUES (?1, ?2, ?3)",
+            "INSERT OR IGNORE INTO contact_group_member (group_id, contact_id, added_at)
+             SELECT g.id, c.id, ?3
+             FROM contact_group g JOIN contact c ON c.id = ?2
+             WHERE g.id = ?1 AND c.address_book_id = g.address_book_id",
             params![group_id, contact_id, now_string()],
         )?;
     }
@@ -483,8 +603,14 @@ fn replace_groups(conn: &Connection, contact_id: &str, group_ids: &[String]) -> 
 }
 
 pub fn group_ids_for_contact(conn: &Connection, contact_id: &str) -> Result<Vec<String>> {
+    // Legacy rows may still link a contact to another book's group; hide them
+    // so the editor only offers memberships the group list would show.
     let mut stmt = conn.prepare(
-        "SELECT group_id FROM contact_group_member WHERE contact_id = ?1 ORDER BY group_id ASC",
+        "SELECT m.group_id FROM contact_group_member m
+         JOIN contact_group g ON g.id = m.group_id
+         JOIN contact c ON c.id = m.contact_id
+         WHERE m.contact_id = ?1 AND c.address_book_id = g.address_book_id
+         ORDER BY m.group_id ASC",
     )?;
     let mut rows = stmt.query(params![contact_id])?;
     let mut ids = Vec::new();
@@ -499,7 +625,9 @@ pub fn members(conn: &Connection, group_id: &str) -> Result<Vec<Contact>> {
     let mut stmt = conn.prepare(
         "SELECT c.id FROM contact c
          JOIN contact_group_member m ON m.contact_id = c.id
-         WHERE m.group_id = ?1 ORDER BY lower(c.display_name) ASC",
+         JOIN contact_group g ON g.id = m.group_id
+         WHERE m.group_id = ?1 AND c.address_book_id = g.address_book_id
+         ORDER BY lower(c.display_name) ASC",
     )?;
     let mut rows = stmt.query(params![group_id])?;
     let mut ids = Vec::new();

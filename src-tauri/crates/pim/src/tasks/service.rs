@@ -22,6 +22,7 @@ use crate::backend::{backend_for, is_implicit_dav_auth_failure, Backend};
 use crate::error::{invalid, unsupported, AppError, Result};
 use crate::http::HttpClient;
 use crate::op_worker::{self, PimOpExecutor};
+use crate::status::record_failure;
 use crate::store::{self, TaskListRemote};
 use crate::tasks::dav::CalDavTaskProvider;
 use crate::tasks::google::GoogleTasksProvider;
@@ -180,21 +181,12 @@ impl TasksService {
                         return Ok(());
                     }
                 }
-                match &error {
-                    AppError::Auth(_) => {
-                        self.ctx
-                            .sync_status
-                            .needs_reauth(&account.id, SyncModule::Tasks);
-                    }
-                    AppError::Network(_) => {
-                        self.ctx.sync_status.offline(&account.id, SyncModule::Tasks);
-                    }
-                    _ => {
-                        self.ctx
-                            .sync_status
-                            .fail(&account.id, SyncModule::Tasks, error.message());
-                    }
-                }
+                record_failure(
+                    &self.ctx.sync_status,
+                    &account.id,
+                    SyncModule::Tasks,
+                    &error,
+                );
                 Err(error)
             }
         }
@@ -555,15 +547,82 @@ impl TasksService {
         if is_list {
             sort_for_list(&mut tasks);
         }
+        self.prune_missing_links(&mut tasks).await?;
         Ok(tasks)
     }
 
     pub async fn task_get(&self, id: &str) -> Result<Task> {
         let id = id.to_string();
-        self.ctx
+        let mut task = self
+            .ctx
             .db
             .read(move |conn| tasks_repo::get_required(conn, &id))
-            .await
+            .await?;
+        self.prune_missing_links(std::slice::from_mut(&mut task))
+            .await?;
+        Ok(task)
+    }
+
+    /// Drop links whose source message no longer exists.
+    ///
+    /// Mail deletion cannot cascade into `task` (the column has no foreign
+    /// key), so a task can outlive the message it was created from. Returning
+    /// the stale id makes the task detail offer "open e-mail" and open a
+    /// message window for a row that is gone; clearing it here also stops the
+    /// task from counting as flagged mail once it is read again.
+    async fn prune_missing_links(&self, tasks: &mut [Task]) -> Result<()> {
+        let linked: Vec<String> = tasks
+            .iter()
+            .filter_map(|task| task.linked_message_id.clone())
+            .collect();
+        if linked.is_empty() {
+            return Ok(());
+        }
+        let existing: HashSet<String> = self
+            .ctx
+            .db
+            .read(move |conn| {
+                let mut existing = HashSet::new();
+                for message_id in linked {
+                    if messages_repo::get(conn, &message_id)?.is_some() {
+                        existing.insert(message_id);
+                    }
+                }
+                Ok(existing)
+            })
+            .await?;
+
+        let mut cleared_ids = Vec::new();
+        let mut cleared_lists = Vec::new();
+        for task in tasks.iter_mut() {
+            let Some(message_id) = task.linked_message_id.clone() else {
+                continue;
+            };
+            if existing.contains(&message_id) {
+                continue;
+            }
+            task.linked_message_id = None;
+            cleared_ids.push(task.id.clone());
+            cleared_lists.push(task.list_id.clone());
+        }
+        if cleared_ids.is_empty() {
+            return Ok(());
+        }
+        self.ctx
+            .db
+            .write(move |conn| {
+                for task_id in cleared_ids {
+                    tasks_repo::set_linked_message(conn, &task_id, None)?;
+                }
+                Ok(())
+            })
+            .await?;
+        // Other windows may still hold the stale link; the cleared rows live
+        // in these lists.
+        cleared_lists.sort();
+        cleared_lists.dedup();
+        emit_tasks_changed(self.ctx.events.as_ref(), cleared_lists);
+        Ok(())
     }
 
     pub async fn task_create(&self, list_id: &str, input: TaskInput) -> Result<Task> {
@@ -1158,9 +1217,7 @@ impl PimOpExecutor for TasksService {
                             href: result.href.clone(),
                             etag: result.etag.clone(),
                         };
-                        let undone = provider
-                            .delete_task(&account, &list, &created_ref)
-                            .await;
+                        let undone = provider.delete_task(&account, &list, &created_ref).await;
                         match undone {
                             Ok(()) => {}
                             Err(cleanup) => {
@@ -1990,7 +2047,7 @@ fn normalize_color_or_default(color: &str) -> String {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use nuncio_core::models::{RecurrenceFreq, RecurrenceRule};
+    use nuncio_core::models::{MessageSummary, RecurrenceFreq, RecurrenceRule, StoredMessage};
     use nuncio_core::{CoreContext, Paths};
 
     async fn service() -> (CoreContext, TasksService) {
@@ -2059,6 +2116,87 @@ mod tests {
 
         service.task_delete(&task.id).await.expect("delete");
         assert!(service.task_get(&task.id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn clears_link_when_linked_message_is_gone() {
+        let (ctx, service) = service().await;
+        let task = service
+            .task_create("local-tasks", input("Reply to the report"))
+            .await
+            .expect("create");
+
+        let message_id = new_id();
+        let folder_id = ctx
+            .db
+            .write({
+                let message_id = message_id.clone();
+                move |conn| {
+                    let folder = repo::folders::create(conn, "local", None, "Inbox")?;
+                    let summary = MessageSummary::new(
+                        message_id,
+                        "local",
+                        folder.id.clone(),
+                        "thread-1",
+                        Utc::now(),
+                    );
+                    repo::messages::upsert(conn, &StoredMessage::new(summary))?;
+                    Ok(folder.id)
+                }
+            })
+            .await
+            .expect("message");
+
+        let task_id = task.id.clone();
+        let linked = message_id.clone();
+        ctx.db
+            .write(move |conn| tasks_repo::set_linked_message(conn, &task_id, Some(&linked)))
+            .await
+            .expect("link");
+        assert!(service
+            .task_get(&task.id)
+            .await
+            .expect("get")
+            .linked_message_id
+            .is_some());
+
+        let ids = vec![message_id];
+        ctx.db
+            .write(move |conn| repo::messages::delete_local(conn, &ids, true))
+            .await
+            .expect("delete message");
+
+        let reloaded = service.task_get(&task.id).await.expect("get after delete");
+        assert_eq!(reloaded.linked_message_id, None);
+        // The link is cleared in storage, not just hidden from the caller.
+        let persisted = ctx
+            .db
+            .read({
+                let id = task.id.clone();
+                move |conn| tasks_repo::get_required(conn, &id)
+            })
+            .await
+            .expect("stored task");
+        assert_eq!(persisted.linked_message_id, None);
+
+        // The list path prunes too, so a stale link cannot reach the UI via a
+        // cached row or a "Flagged email" query.
+        let task_id = task.id.clone();
+        let missing = "message-that-never-existed".to_string();
+        ctx.db
+            .write(move |conn| tasks_repo::set_linked_message(conn, &task_id, Some(&missing)))
+            .await
+            .expect("re-link");
+        let listed = service
+            .task_query(TaskQuery::list("local-tasks", "2026-11-12"))
+            .await
+            .expect("query");
+        let listed = listed
+            .iter()
+            .find(|item| item.id == task.id)
+            .expect("task in list");
+        assert_eq!(listed.linked_message_id, None);
+        let _ = folder_id;
     }
 
     #[tokio::test]

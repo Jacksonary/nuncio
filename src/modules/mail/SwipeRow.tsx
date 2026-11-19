@@ -1,25 +1,25 @@
 /**
  * Horizontal swipe gesture wrapper for message rows.
  *
- * Supports pointer input (touch, pen and — after a short hold, so it does not
- * steal drag-to-folder — mouse) plus trackpad two-finger horizontal wheel
- * deltas. A gesture only becomes a swipe once the horizontal intent exceeds
- * 24 px and clearly dominates the vertical movement; otherwise vertical
- * scrolling and native row dragging are left untouched.
+ * Touch and pen input only. A mouse or trackpad never starts a swipe: on a
+ * desktop a two-finger horizontal scroll or a held drag is easy to trigger by
+ * accident, and the action here (delete / archive) is destructive. The
+ * desktop has hover actions, the context menu, the bulk bar and shortcuts for
+ * the same operations. A touch gesture only becomes a swipe once the
+ * horizontal intent exceeds 24 px and clearly dominates the vertical movement,
+ * so vertical scrolling is left untouched.
  *
  * The action is revealed while dragging and executed on release past the
  * commit distance. `prefers-reduced-motion` disables the snap animation (CSS).
  */
 import {
   useCallback,
-  useEffect,
   useRef,
   useState,
   type DragEvent as ReactDragEvent,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
-  type WheelEvent as ReactWheelEvent,
 } from "react";
 import type { HoverAction } from "@/ipc/types";
 import { cn } from "@/lib/cn";
@@ -31,13 +31,6 @@ const HORIZONTAL_INTENT = 24;
 const COMMIT_DISTANCE = 72;
 /** Maximum offset the row content is allowed to travel. */
 const MAX_OFFSET = 112;
-/** Hold before a mouse drag becomes a swipe instead of drag-to-folder. */
-const MOUSE_HOLD_MS = 260;
-/** Accumulated wheel delta that triggers a trackpad swipe. */
-const WHEEL_THRESHOLD = 72;
-/** Ignore further wheel swipes for this long (momentum scrolling). */
-const WHEEL_LOCK_MS = 600;
-const WHEEL_IDLE_MS = 220;
 
 export type SwipeTone = "accent" | "danger" | "neutral";
 
@@ -95,31 +88,14 @@ export function SwipeableRow({
   const [dragging, setDragging] = useState(false);
   const gestureRef = useRef<GestureState | null>(null);
   const offsetRef = useRef(0);
-  const holdTimer = useRef<number | null>(null);
   const suppressDragRef = useRef(false);
   const suppressClickRef = useRef(0);
-  const wheelSum = useRef(0);
-  const wheelTimer = useRef<number | null>(null);
-  const wheelLockUntil = useRef(0);
-
-  const clearHoldTimer = useCallback(() => {
-    if (holdTimer.current !== null) {
-      window.clearTimeout(holdTimer.current);
-      holdTimer.current = null;
-    }
-  }, []);
-
-  useEffect(() => {
-    return () => {
-      clearHoldTimer();
-      if (wheelTimer.current !== null) window.clearTimeout(wheelTimer.current);
-    };
-  }, [clearHoldTimer]);
 
   const handlePointerDown = useCallback(
     (event: ReactPointerEvent<HTMLDivElement>) => {
       if (disabled) return;
-      if (event.pointerType === "mouse" && event.button !== 0) return;
+      // Touch and pen only; see the file comment.
+      if (event.pointerType !== "touch" && event.pointerType !== "pen") return;
       if (interactiveTarget(event.target)) return;
       if (gestureRef.current) return;
       gestureRef.current = {
@@ -130,11 +106,6 @@ export function SwipeableRow({
         captured: false,
         element: event.currentTarget,
       };
-      // Mouse drags normally become native drag-to-folder almost immediately.
-      // Holding briefly lets an intentional horizontal swipe win instead.
-      holdTimer.current = window.setTimeout(() => {
-        suppressDragRef.current = true;
-      }, MOUSE_HOLD_MS);
     },
     [disabled],
   );
@@ -179,7 +150,6 @@ export function SwipeableRow({
     (commit: boolean) => {
       const gesture = gestureRef.current;
       if (!gesture) return;
-      clearHoldTimer();
       // Clear the gesture first: releasing capture may synchronously deliver
       // `lostpointercapture`, which must see an already-finished gesture.
       gestureRef.current = null;
@@ -208,7 +178,7 @@ export function SwipeableRow({
         suppressDragRef.current = false;
       }, 0);
     },
-    [clearHoldTimer, onAction, swipeLeft, swipeRight],
+    [onAction, swipeLeft, swipeRight],
   );
 
   const handlePointerUp = useCallback(
@@ -246,35 +216,6 @@ export function SwipeableRow({
     event.stopPropagation();
   }, []);
 
-  const handleWheel = useCallback(
-    (event: ReactWheelEvent<HTMLDivElement>) => {
-      if (disabled) return;
-      // deltaMode: 0 = pixels, 1 = lines, 2 = pages.
-      const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? 400 : 1;
-      const dx = event.deltaX * unit;
-      const dy = event.deltaY * unit;
-      if (Math.abs(dx) <= Math.abs(dy)) return;
-      const now = Date.now();
-      if (now < wheelLockUntil.current) return;
-
-      wheelSum.current += dx;
-      if (wheelTimer.current !== null) window.clearTimeout(wheelTimer.current);
-      wheelTimer.current = window.setTimeout(() => {
-        wheelSum.current = 0;
-      }, WHEEL_IDLE_MS);
-
-      if (Math.abs(wheelSum.current) < WHEEL_THRESHOLD) return;
-      // Positive deltaX = content scrolled right = fingers swiped left.
-      const leftward = wheelSum.current > 0;
-      const descriptor = leftward ? swipeLeft : swipeRight;
-      wheelSum.current = 0;
-      if (!descriptor) return;
-      wheelLockUntil.current = now + WHEEL_LOCK_MS;
-      onAction(descriptor.action);
-    },
-    [disabled, onAction, swipeLeft, swipeRight],
-  );
-
   const descriptor = offset > 0 ? swipeRight : offset < 0 ? swipeLeft : null;
   const progress = Math.min(1, Math.abs(offset) / MAX_OFFSET);
 
@@ -288,7 +229,6 @@ export function SwipeableRow({
       onLostPointerCapture={handleLostCapture}
       onDragStartCapture={handleDragStartCapture}
       onClickCapture={handleClickCapture}
-      onWheel={handleWheel}
     >
       {descriptor ? (
         <div

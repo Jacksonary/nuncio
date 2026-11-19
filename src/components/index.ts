@@ -103,3 +103,14 @@ export type { VirtualListProps } from "./VirtualList";
 
 export { TokenInput } from "./TokenInput";
 export type { TokenInputProps } from "./TokenInput";
+
+export {
+  ModuleSyncStatus,
+  ModuleSyncDot,
+  presentationFor,
+} from "./ModuleSyncStatus";
+export type {
+  ModuleSyncStatusProps,
+  ModuleSyncDotProps,
+  SyncPresentation,
+} from "./ModuleSyncStatus";

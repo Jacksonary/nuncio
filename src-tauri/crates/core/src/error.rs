@@ -17,6 +17,11 @@ pub enum AppError {
     Auth(String),
     #[error("{0}")]
     Network(String),
+    /// A provider answered but refused the request (429 rate limit, 5xx).
+    /// Unlike `Network`, the transport worked; unlike `Unsupported`, retrying
+    /// later can succeed. Neither means the user's device is offline.
+    #[error("{0}")]
+    Service(String),
     #[error("{0}")]
     Protocol(String),
     #[error("{0}")]
@@ -42,6 +47,7 @@ impl AppError {
             Self::NotFound(_) => "notFound",
             Self::Auth(_) => "auth",
             Self::Network(_) => "network",
+            Self::Service(_) => "service",
             Self::Protocol(_) => "protocol",
             Self::InvalidInput(_) => "invalidInput",
             Self::Conflict(_) => "conflict",
@@ -71,6 +77,10 @@ impl AppError {
 
     pub fn network(message: impl Into<String>) -> Self {
         Self::Network(message.into())
+    }
+
+    pub fn service(message: impl Into<String>) -> Self {
+        Self::Service(message.into())
     }
 
     pub fn protocol(message: impl Into<String>) -> Self {
@@ -181,6 +191,7 @@ mod tests {
             (AppError::NotFound("x".into()), "notFound"),
             (AppError::Auth("x".into()), "auth"),
             (AppError::Network("x".into()), "network"),
+            (AppError::Service("x".into()), "service"),
             (AppError::Protocol("x".into()), "protocol"),
             (AppError::InvalidInput("x".into()), "invalidInput"),
             (AppError::Conflict("x".into()), "conflict"),

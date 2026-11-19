@@ -22,6 +22,7 @@ pub mod identities;
 pub mod messages;
 pub mod outbox;
 pub mod pending_ops;
+pub mod pim_maps;
 pub mod recipient_history;
 pub mod reminder_state;
 pub mod rules;

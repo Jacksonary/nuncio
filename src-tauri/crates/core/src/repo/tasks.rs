@@ -79,6 +79,19 @@ pub fn by_remote_id(conn: &Connection, list_id: &str, remote_id: &str) -> Result
     crate::repo::query_one(conn, &sql, params![list_id, remote_id], row_to_task)
 }
 
+/// Every task row, completed or not (backup export / full restore).
+pub fn list_all(conn: &Connection) -> Result<Vec<Task>> {
+    let sql =
+        format!("SELECT {COLUMNS} FROM task ORDER BY list_id ASC, sort_order ASC, created_at ASC");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    let mut tasks = Vec::new();
+    while let Some(row) = rows.next()? {
+        tasks.push(row_to_task(row)?);
+    }
+    Ok(tasks)
+}
+
 /// Query a custom list or a smart list.
 pub fn query(conn: &Connection, query: &TaskQuery) -> Result<Vec<Task>> {
     let mut clauses: Vec<String> = Vec::new();

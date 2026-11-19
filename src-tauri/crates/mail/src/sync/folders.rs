@@ -336,6 +336,60 @@ async fn reconcile(
         );
     }
 
+    // A server Drafts folder supersedes the local placeholder the composer
+    // created when the account had none. Reconcile is the only place that sees
+    // that folder appear (for IMAP and Graph alike) and it already owns folder
+    // lifecycle, while the composer may never run again. Until the migration
+    // the placeholder keeps its messages and the sidebar renders two "Drafts"
+    // rows, one of them permanently out of sync.
+    let is_server_drafts = |folder: &Folder| {
+        folder.role == FolderRole::Drafts && !folder.remote_path.starts_with(LOCAL_FOLDER_PREFIX)
+    };
+    // A partial listing leaves the server folder in `local_by_path` instead;
+    // it is still a real Drafts folder and the placeholder must yield to it.
+    let real_drafts = upserted
+        .iter()
+        .find(|folder| is_server_drafts(folder))
+        .cloned()
+        .or_else(|| {
+            local_by_path
+                .values()
+                .find(|folder| is_server_drafts(folder))
+                .cloned()
+        });
+    let orphan_drafts = local_by_path
+        .values()
+        .find(|folder| {
+            folder.role == FolderRole::Drafts && folder.remote_path.starts_with(LOCAL_FOLDER_PREFIX)
+        })
+        .cloned();
+    if let (Some(real), Some(orphan)) = (real_drafts, orphan_drafts) {
+        let real_id = real.id.clone();
+        let orphan_id = orphan.id.clone();
+        let migrated = ctx
+            .db
+            .write(move |db| {
+                let ids = nuncio_core::repo::messages::ids_in_folder(db, &orphan_id)?;
+                if !ids.is_empty() {
+                    // Both folders carry the drafts role, so the flag survives.
+                    nuncio_core::repo::messages::move_to_folder(db, &ids, &real_id)?;
+                }
+                nuncio_core::repo::folders::delete(db, &orphan_id)?;
+                Ok(ids)
+            })
+            .await?;
+        if !migrated.is_empty() {
+            events::emit_mail_changed(
+                ctx.events.as_ref(),
+                account_id.to_string(),
+                vec![real.id.clone(), orphan.id.clone()],
+                migrated,
+                events::MailChangeKind::Updated,
+            );
+        }
+        debug!(account = account_id, folder = %real.id, "migrated local Drafts into the server folder");
+    }
+
     // Stable ordering: Inbox first, then role order, then name.
     upserted.sort_by(|a, b| {
         role_rank(a.role)
@@ -1125,6 +1179,86 @@ mod reconcile_tests {
         let paths = local_paths(&ctx).await;
         assert!(paths.iter().any(|path| path == "Projects"));
         assert!(paths.iter().any(|path| path == "Projects/2026"));
+    }
+
+    /// The composer creates a `local:drafts` placeholder when an account has no
+    /// server Drafts folder. Once one appears, its drafts must move there and
+    /// the placeholder must go, otherwise its messages are counted twice and
+    /// two rows are both labelled "Drafts".
+    #[tokio::test]
+    async fn local_drafts_folder_is_reclaimed_when_the_server_provides_drafts() {
+        let ctx = test_ctx().await;
+        seed_account(&ctx).await;
+
+        let orphan = Folder {
+            id: "local-drafts".into(),
+            account_id: "acc".into(),
+            parent_id: None,
+            remote_path: "local:drafts".into(),
+            name: "Drafts".into(),
+            role: FolderRole::Drafts,
+            unread_count: 0,
+            total_count: 0,
+            is_favorite: false,
+            sync_enabled: false,
+            is_selectable: true,
+            sort_order: 2,
+            last_sync_at: None,
+        };
+        let mut summary = nuncio_core::models::MessageSummary::new(
+            "draft-1",
+            "acc",
+            "local-drafts",
+            "thread:draft-1",
+            nuncio_core::models::now(),
+        );
+        summary.seen = true;
+        summary.is_draft = true;
+        let stored = nuncio_core::models::StoredMessage::new(summary);
+        ctx.db
+            .write(move |db| {
+                nuncio_core::repo::folders::insert(db, &orphan)?;
+                nuncio_core::repo::messages::upsert(db, &stored)?;
+                Ok(())
+            })
+            .await
+            .expect("seed local drafts");
+
+        reconcile(
+            &ctx,
+            "acc",
+            vec![remote("INBOX"), remote("Drafts")],
+            false,
+            true,
+        )
+        .await
+        .expect("reconcile");
+
+        let folders = ctx
+            .db
+            .read(|db| nuncio_core::repo::folders::list(db, "acc"))
+            .await
+            .expect("folders");
+        assert!(
+            !folders.iter().any(|folder| folder.remote_path == "local:drafts"),
+            "the placeholder must be deleted"
+        );
+        let real = folders
+            .iter()
+            .find(|folder| folder.role == FolderRole::Drafts)
+            .expect("server drafts folder");
+        assert_eq!(real.remote_path, "Drafts");
+
+        let message = ctx
+            .db
+            .read(|db| nuncio_core::repo::messages::get_required(db, "draft-1"))
+            .await
+            .expect("draft message");
+        assert_eq!(message.summary.folder_id, real.id);
+        assert!(
+            message.summary.is_draft,
+            "moving between drafts folders must not demote the draft"
+        );
     }
 
     /// A complete listing must still prune, otherwise folders deleted on the

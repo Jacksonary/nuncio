@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { isTauri } from "@tauri-apps/api/core";
 import {
+  ArrowSync16Regular,
   CalendarLtr24Regular,
   ChevronLeft20Regular,
   ChevronRight20Regular,
@@ -12,6 +13,7 @@ import {
   Button,
   EmptyState,
   IconButton,
+  ModuleSyncStatus,
   Popover,
   SearchBox,
   Spinner,
@@ -113,6 +115,7 @@ export function CalendarMain() {
   const [pending, setPending] = useState<Pending | null>(null);
   const [searchText, setSearchText] = useState("");
   const [debounced, setDebounced] = useState("");
+  const [manualSync, setManualSync] = useState(false);
 
   const calendarsQuery = useQuery({
     queryKey: queryKeys.calendars(),
@@ -146,6 +149,19 @@ export function CalendarMain() {
     refetchInterval: settings.pollMinutes > 0 ? settings.pollMinutes * 60_000 : false,
   });
   const eventList = eventsQuery.data ?? [];
+
+  // Shares the cache entry with ModuleSyncStatus, so the manual button can be
+  // disabled for a background sync without a second status request.
+  const syncStatusQuery = useQuery({
+    queryKey: queryKeys.syncStatus(),
+    queryFn: sync.status,
+    staleTime: 15_000,
+  });
+  const calendarSyncing =
+    syncStatusQuery.data?.some(
+      (status) => status.module === "calendar" && status.state === "syncing",
+    ) ?? false;
+  const syncing = manualSync || calendarSyncing;
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -249,6 +265,20 @@ export function CalendarMain() {
   const changeView = (nextView: CalendarView) => {
     setPeek(null);
     setSelection("calendar", { view: nextView });
+  };
+
+  const syncNow = async () => {
+    setManualSync(true);
+    try {
+      // The module spans accounts, so its own sync targets every calendar
+      // account; passing null keeps it from touching mail.
+      await sync.now(null, "calendar");
+      toast.success(t("common.synced"));
+    } catch (error) {
+      toast.error(t("calendar.error.action"), errorMessage(error));
+    } finally {
+      setManualSync(false);
+    }
   };
 
   const openPeek = (instance: EventInstance, anchorElement: HTMLElement | null) => {
@@ -523,6 +553,18 @@ export function CalendarMain() {
         <h1 className={styles.title}>{rangeTitle}</h1>
         {eventsQuery.isFetching ? <Spinner size="tiny" /> : null}
         <span className={styles.spacer} />
+        {/* The status child renders null while healthy, so it claims no width
+            and the tight 960-1000px toolbar only yields spacer first. */}
+        <div className={styles.syncActions}>
+          <ModuleSyncStatus module="calendar" />
+          <IconButton
+            icon={syncing ? <Spinner size="tiny" /> : <ArrowSync16Regular />}
+            label={t("common.syncNow")}
+            size="small"
+            onClick={() => void syncNow()}
+            disabled={syncing}
+          />
+        </div>
         <div className={styles.searchWrap} ref={searchRef}>
           <SearchBox
             value={searchText}
@@ -626,39 +668,50 @@ export function CalendarMain() {
           className={styles.searchPopover}
         >
           <div className={styles.searchHeader}>{t("calendar.search.results")}</div>
-          {searchQuery.isLoading ? (
+          {searchQuery.isError ? (
+            <div className={styles.searchEmpty}>
+              <div role="alert">
+                {searchQuery.error ? errorMessage(searchQuery.error) : t("calendar.search.error")}
+              </div>
+              <Button size="small" onClick={() => void searchQuery.refetch()}>
+                {t("calendar.error.retry")}
+              </Button>
+            </div>
+          ) : searchQuery.isSuccess ? (
+            (searchQuery.data ?? []).length === 0 ? (
+              <div className={styles.searchEmpty}>{t("calendar.search.noResults")}</div>
+            ) : (
+              <div className={styles.searchResults}>
+                {(searchQuery.data ?? []).map((instance) => (
+                  <button
+                    key={instance.instanceKey}
+                    type="button"
+                    className={styles.searchItem}
+                    onClick={() => pickSearchResult(instance)}
+                  >
+                    <span className={styles.searchColor} style={{ background: instance.color }} />
+                    <span className={styles.searchBody}>
+                      <span className={styles.searchTitle}>
+                        {instance.title || t("calendar.untitled")}
+                      </span>
+                      <span className={styles.searchMeta}>
+                        <Clock16Regular aria-hidden="true" />
+                        {new Intl.DateTimeFormat(locale, {
+                          month: "short",
+                          day: "numeric",
+                        }).format(eventStartDate(instance))}
+                        {" · "}
+                        {formatEventChipTime(instance, t("calendar.allDay"), locale)}
+                        {instance.location ? ` · ${instance.location}` : ""}
+                      </span>
+                    </span>
+                  </button>
+                ))}
+              </div>
+            )
+          ) : (
             <div className={styles.searchEmpty}>
               <Spinner size="small" label={t("common.loading")} />
-            </div>
-          ) : (searchQuery.data ?? []).length === 0 ? (
-            <div className={styles.searchEmpty}>{t("calendar.search.noResults")}</div>
-          ) : (
-            <div className={styles.searchResults}>
-              {(searchQuery.data ?? []).map((instance) => (
-                <button
-                  key={instance.instanceKey}
-                  type="button"
-                  className={styles.searchItem}
-                  onClick={() => pickSearchResult(instance)}
-                >
-                  <span className={styles.searchColor} style={{ background: instance.color }} />
-                  <span className={styles.searchBody}>
-                    <span className={styles.searchTitle}>
-                      {instance.title || t("calendar.untitled")}
-                    </span>
-                    <span className={styles.searchMeta}>
-                      <Clock16Regular aria-hidden="true" />
-                      {new Intl.DateTimeFormat(locale, {
-                        month: "short",
-                        day: "numeric",
-                      }).format(eventStartDate(instance))}
-                      {" · "}
-                      {formatEventChipTime(instance, t("calendar.allDay"), locale)}
-                      {instance.location ? ` · ${instance.location}` : ""}
-                    </span>
-                  </span>
-                </button>
-              ))}
             </div>
           )}
         </Popover>

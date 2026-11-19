@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use nuncio_core::models::{
     Account, Address, MailFilter, MailRule, MailScope, MailSettingsPatch, MessageAction,
-    MessageListQuery, ReplyMode, RuleAction, RuleActionKind, RuleCondition, RuleField, RuleOp,
-    SearchQuery, ServerConfig, SettingsPatch, Signature,
+    MessageListQuery, MessageSummary, ReplyMode, RuleAction, RuleActionKind, RuleCondition,
+    RuleField, RuleOp, SearchQuery, ServerConfig, SettingsPatch, Signature, StoredMessage,
 };
 use nuncio_core::traits::MailAuth;
 use nuncio_core::{repo, CoreContext};
@@ -444,6 +444,143 @@ async fn message_actions_are_optimistic_and_undoable() {
         .await
         .expect("unread list");
     assert!(page.items.is_empty());
+}
+
+async fn insert_stored(
+    ctx: &CoreContext,
+    account_id: &str,
+    id: &str,
+    folder_id: &str,
+    is_draft: bool,
+) {
+    let mut summary = MessageSummary::new(
+        id,
+        account_id,
+        folder_id,
+        format!("thread-{id}"),
+        chrono::Utc::now(),
+    );
+    summary.subject = id.to_string();
+    summary.is_draft = is_draft;
+    let stored = StoredMessage::new(summary);
+    ctx.db
+        .write(move |db| repo::messages::upsert(db, &stored))
+        .await
+        .expect("insert stored message");
+}
+
+async fn stored_folder(ctx: &CoreContext, id: &str) -> Option<String> {
+    let id = id.to_string();
+    ctx.db
+        .read(move |db| Ok(repo::messages::get(db, &id)?.map(|row| row.summary.folder_id)))
+        .await
+        .expect("stored message")
+}
+
+#[tokio::test]
+async fn delete_decides_per_message_and_discards_drafts() {
+    let mock = MockImap::start_with_folders(
+        &["CONDSTORE", "MOVE", "UIDPLUS"],
+        &[
+            ("INBOX", &["\\Inbox"]),
+            ("Drafts", &["\\Drafts"]),
+            ("Trash", &["\\Trash"]),
+        ],
+    )
+    .await;
+    let ctx = context(
+        StaticCreds::password("test@example.com", "secret"),
+        Arc::new(RecordingNotifier::default()),
+    )
+    .await;
+    let account = account(
+        "acc",
+        "test@example.com",
+        Some(server(mock.addr.port())),
+        None,
+        None,
+    );
+    insert_account(&ctx, &account).await;
+    sync_once(&ctx, &account).await;
+    let service = MailService::new(ctx.clone());
+    let inbox = folder_id(&ctx, "acc", "INBOX").await;
+    let drafts = folder_id(&ctx, "acc", "Drafts").await;
+    let trash = folder_id(&ctx, "acc", "Trash").await;
+
+    insert_stored(&ctx, "acc", "inbox-msg", &inbox, false).await;
+    insert_stored(&ctx, "acc", "draft-msg", &drafts, true).await;
+
+    // One call, one `permanent` flag, two different real folders: the backend
+    // must decide per message. The inbox message moves to Trash; the draft is
+    // discarded outright instead of becoming a Trash row that still counts as
+    // a draft.
+    let undo_id = service
+        .message_act(
+            &["inbox-msg".to_string(), "draft-msg".to_string()],
+            &MessageAction::Delete { permanent: false },
+        )
+        .await
+        .expect("delete");
+    assert!(!undo_id.is_empty(), "an undo entry must be recorded");
+
+    assert_eq!(stored_folder(&ctx, "inbox-msg").await.as_deref(), Some(trash.as_str()));
+    assert_eq!(stored_folder(&ctx, "draft-msg").await, None);
+}
+
+#[tokio::test]
+async fn undo_by_id_reverts_the_action_it_names() {
+    let mock = MockImap::start_with_folders(
+        &["CONDSTORE", "MOVE", "UIDPLUS"],
+        &[
+            ("INBOX", &["\\Inbox"]),
+            ("Trash", &["\\Trash"]),
+            ("Archive", &["\\Archive"]),
+        ],
+    )
+    .await;
+    let ctx = context(
+        StaticCreds::password("test@example.com", "secret"),
+        Arc::new(RecordingNotifier::default()),
+    )
+    .await;
+    let account = account(
+        "acc",
+        "test@example.com",
+        Some(server(mock.addr.port())),
+        None,
+        None,
+    );
+    insert_account(&ctx, &account).await;
+    sync_once(&ctx, &account).await;
+    let service = MailService::new(ctx.clone());
+    let inbox = folder_id(&ctx, "acc", "INBOX").await;
+    let trash = folder_id(&ctx, "acc", "Trash").await;
+
+    insert_stored(&ctx, "acc", "delete-me", &inbox, false).await;
+    insert_stored(&ctx, "acc", "archive-me", &inbox, false).await;
+
+    let delete_undo = service
+        .message_act(
+            &["delete-me".to_string()],
+            &MessageAction::Delete { permanent: false },
+        )
+        .await
+        .expect("delete");
+    let archive_undo = service
+        .message_act(&["archive-me".to_string()], &MessageAction::Archive)
+        .await
+        .expect("archive");
+    assert_ne!(delete_undo, archive_undo);
+    assert_eq!(stored_folder(&ctx, "delete-me").await.as_deref(), Some(trash.as_str()));
+
+    // The delete's toast must revert the delete even though the archive ran
+    // afterwards and is the most recent undo entry.
+    assert!(service.message_undo(&delete_undo).await.expect("undo delete"));
+    assert_eq!(stored_folder(&ctx, "delete-me").await.as_deref(), Some(inbox.as_str()));
+    // The archive is still in effect, and its own id still works afterwards.
+    assert_ne!(stored_folder(&ctx, "archive-me").await.as_deref(), Some(inbox.as_str()));
+    assert!(service.message_undo(&archive_undo).await.expect("undo archive"));
+    assert_eq!(stored_folder(&ctx, "archive-me").await.as_deref(), Some(inbox.as_str()));
 }
 
 #[tokio::test]

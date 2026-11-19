@@ -56,23 +56,37 @@ function toggleMyDayForSelected(): void {
   })();
 }
 
+/**
+ * Modal safety: the window-level shortcut listener still runs while a dialog
+ * holds focus, so acting on the list behind it would delete or complete a task
+ * the user is not looking at. The shared Dialog component always renders with
+ * `role="dialog"` (and confirm variants with `role="alertdialog"`), which is
+ * the same check the People module uses.
+ */
+function noDialogOpen(): boolean {
+  return document.querySelector('[role="dialog"], [role="alertdialog"]') === null;
+}
+
 const hotkeys: HotkeyDefinition[] = [
   {
     id: "todo.newTask",
     keys: "Mod+N",
     handler: requestAddTask,
+    enabled: noDialogOpen,
     preventDefault: true,
   },
   {
     id: "todo.deleteTask",
     keys: "Delete",
     handler: deleteSelectedTask,
+    enabled: noDialogOpen,
     preventDefault: true,
   },
   {
     id: "todo.toggleMyDay",
     keys: "Mod+T",
     handler: toggleMyDayForSelected,
+    enabled: noDialogOpen,
     preventDefault: true,
   },
 ];

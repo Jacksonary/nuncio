@@ -665,11 +665,6 @@ export function RawHeadersDialog({ open, onClose, headers }: RawHeadersDialogPro
       onClose={onClose}
       title={tt("mail.rawHeaders.title")}
       width={720}
-      footer={
-        <Button appearance="primary" onClick={onClose}>
-          {tt("common.close")}
-        </Button>
-      }
     >
       <pre className={styles.rawHeaders}>{headers}</pre>
     </Dialog>

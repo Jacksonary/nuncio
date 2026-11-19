@@ -1,13 +1,14 @@
 /**
  * Attachment strip: chips with file name/size, inline badge, remove button and
- * a warning when the total exceeds 25 MB.
+ * a warning when the total exceeds 25 MB. Adding files stays on the composer
+ * ribbon so there is one add affordance.
  */
 import {
   Dismiss16Regular,
   DocumentText16Regular,
   Image16Regular,
 } from "@fluentui/react-icons";
-import { Badge, Button } from "@/components";
+import { Badge } from "@/components";
 import type { DraftAttachment } from "@/ipc/types";
 import { cn } from "@/lib/cn";
 import { formatFileSize } from "@/lib/format";
@@ -18,14 +19,12 @@ import styles from "./ComposeView.module.css";
 export interface AttachmentsBarProps {
   attachments: DraftAttachment[];
   onRemove: (attachment: DraftAttachment) => void;
-  onAdd: () => void;
   compact?: boolean;
 }
 
 export function AttachmentsBar({
   attachments,
   onRemove,
-  onAdd,
   compact = false,
 }: AttachmentsBarProps) {
   const t = useT();
@@ -80,14 +79,6 @@ export function AttachmentsBar({
               : t("compose.attach.total", { size: summary.formatted })}
           </span>
         ) : null}
-        <Button
-          size="small"
-          appearance="transparent"
-          icon={<DocumentText16Regular />}
-          onClick={onAdd}
-        >
-          {t("compose.attach.add")}
-        </Button>
       </div>
     </div>
   );

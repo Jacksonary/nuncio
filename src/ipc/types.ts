@@ -736,8 +736,6 @@ export interface AppSettings {
     remoteImages: "ask" | "trustedOnly" | "always";
     lightMessageBackground: boolean;
     hoverActions: HoverAction[];
-    swipeLeft: HoverAction;
-    swipeRight: HoverAction;
     confirmDelete: boolean;
     autoAdvance: "next" | "previous" | "list";
     defaultFontFamily: string;
@@ -807,7 +805,7 @@ export type SyncModule = "mail" | "calendar" | "contacts" | "tasks";
 
 /** DAV services that can carry a dedicated app password. */
 export type DavService = "calendar" | "contacts";
-export type SyncState = "idle" | "syncing" | "error" | "offline" | "needsReauth";
+export type SyncState = "idle" | "syncing" | "retrying" | "error" | "needsReauth";
 
 export interface SyncStatus {
   accountId: Id;

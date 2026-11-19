@@ -8,6 +8,7 @@ import { useQuery } from "@tanstack/react-query";
 import {
   Add20Regular,
   ArrowMove20Regular,
+  ArrowSyncRegular,
   CalendarLtr20Regular,
   CalendarLtr24Regular,
   CheckmarkCircle20Regular,
@@ -31,13 +32,16 @@ import {
   EmptyState,
   IconButton,
   Menu,
+  ModuleSyncStatus,
   Spinner,
   Splitter,
   VirtualList,
   confirm,
+  toast,
   type MenuEntry,
 } from "@/components";
-import { accounts as accountsApi, tasks as tasksApi } from "@/ipc/api";
+import { accounts as accountsApi, sync as syncApi, tasks as tasksApi } from "@/ipc/api";
+import { queryClient } from "@/lib/queryClient";
 import { queryKeys } from "@/lib/queryKeys";
 import { useLanguage, useT } from "@/lib/i18n";
 import { useAppSettings, useUpdateSettings } from "@/lib/useSettings";
@@ -91,6 +95,23 @@ type ListRow =
 interface DropTarget {
   taskId: string;
   position: "before" | "after";
+}
+
+/**
+ * Completed tasks the view is hiding. The task query leaves completed tasks
+ * out when "show completed" is off, so an empty result cannot tell an empty
+ * list from an all-completed one; `withCompleted` comes from a fallback query
+ * that only runs while the visible list is empty.
+ */
+export function hiddenCompletedCount(
+  visible: Task[],
+  withCompleted: Task[] | undefined,
+): number {
+  if (!withCompleted) return 0;
+  const visibleIds = new Set(visible.map((task) => task.id));
+  return withCompleted.filter(
+    (task) => task.status === "completed" && !visibleIds.has(task.id),
+  ).length;
 }
 
 function SmartHeaderIcon({ smart }: { smart: SmartList }) {
@@ -150,6 +171,7 @@ export function TodoMain() {
   const lastAddRequest = useRef(addRequest);
 
   const [addValue, setAddValue] = useState("");
+  const [syncBusy, setSyncBusy] = useState(false);
   const [draggedId, setDraggedId] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<DropTarget | null>(null);
   const [headerMenuAnchor, setHeaderMenuAnchor] = useState<HTMLElement | null>(null);
@@ -204,6 +226,25 @@ export function TodoMain() {
   const currentList = effectiveListId ? listsById.get(effectiveListId) ?? null : null;
   const addTargetList = effectiveListId ? currentList : defaultList(lists);
   const noLists = listsQuery.isSuccess && lists.length === 0;
+
+  // The normal query drops completed tasks, so an empty list cannot say
+  // whether anything is hidden. Ask once (only while the list is empty) how
+  // many completed tasks the view is leaving out.
+  const hiddenCompletedQuery = useQuery({
+    queryKey: queryKeys.tasks({ ...taskQueryPayload, includeCompleted: true }),
+    queryFn: () => tasksApi.query({ ...taskQueryPayload, includeCompleted: true }),
+    enabled:
+      !showCompleted &&
+      effectiveSmart !== "completed" &&
+      !noLists &&
+      taskQuery.isSuccess &&
+      tasks.length === 0,
+    staleTime: 15_000,
+    refetchInterval: pollInterval,
+    retry: false,
+  });
+  const hiddenCompleted = hiddenCompletedCount(tasks, hiddenCompletedQuery.data);
+
   const currentReadOnly = currentList?.isReadOnly ?? false;
   const smartBlocksAdd =
     effectiveSmart === "completed" || effectiveSmart === "flaggedEmail";
@@ -471,6 +512,28 @@ export function TodoMain() {
     updateSettings.mutate({ tasks: { showCompleted: !showCompleted } });
   };
 
+  /**
+   * Refresh this module only. A task provider having a bad day must not drag
+   * mail along, and the round trip should not wait for the poll timer.
+   */
+  const syncNow = async () => {
+    if (syncBusy) return;
+    setSyncBusy(true);
+    // Ask for the backend's view immediately so the header can show the
+    // in-flight state instead of waiting out the status query's stale window.
+    void queryClient.invalidateQueries({ queryKey: queryKeys.syncStatus() });
+    try {
+      await syncApi.now(null, "tasks");
+    } catch (error) {
+      toast.error(t("todo.error.action"), errorMessage(error));
+    } finally {
+      setSyncBusy(false);
+      void queryClient.invalidateQueries({ queryKey: queryKeys.syncStatus() });
+      void taskQuery.refetch();
+      void listsQuery.refetch();
+    }
+  };
+
   const removeCurrentList = async () => {
     if (!currentList) return;
     const ok = await confirm({
@@ -581,6 +644,22 @@ export function TodoMain() {
           actions={
             <Button appearance="primary" icon={<Add20Regular />} onClick={requestCreateList}>
               {t("todo.newList")}
+            </Button>
+          }
+        />
+      );
+    }
+    // Every task in view is completed and the section is hidden: an empty
+    // state would wrongly suggest there is nothing here.
+    if (hiddenCompleted > 0) {
+      return (
+        <EmptyState
+          icon={<CheckmarkCircle24Regular />}
+          title={t("todo.empty.hiddenCompleted.title")}
+          description={t("todo.empty.hiddenCompleted.description", { count: hiddenCompleted })}
+          actions={
+            <Button icon={<CheckmarkCircle20Regular />} onClick={toggleShowCompleted}>
+              {t("todo.showCompleted")}
             </Button>
           }
         />
@@ -767,6 +846,13 @@ export function TodoMain() {
                 <span className={styles.subtitle}>{subtitle}</span>
               </div>
               <span className={styles.spacer} />
+              <ModuleSyncStatus module="tasks" className={styles.headerSync} />
+              <IconButton
+                icon={syncBusy ? <Spinner size="tiny" /> : <ArrowSyncRegular />}
+                label={t("common.syncNow")}
+                disabled={syncBusy}
+                onClick={() => void syncNow()}
+              />
               {taskQuery.isFetching ? <Spinner size="tiny" /> : null}
               <IconButton
                 icon={<MoreHorizontal20Regular />}
@@ -797,11 +883,6 @@ export function TodoMain() {
                   }
                 }}
               />
-              {!canAdd && noLists ? (
-                <Button size="small" onClick={requestCreateList}>
-                  {t("todo.newList")}
-                </Button>
-              ) : null}
             </div>
 
             <div

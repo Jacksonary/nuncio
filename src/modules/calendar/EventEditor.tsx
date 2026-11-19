@@ -195,7 +195,9 @@ function initialForm(
   const start = seed?.start ?? new Date();
   const end = seed?.end ?? new Date(start.getTime() + 30 * 60_000);
   return {
-    title: "",
+    // QuickCreate's "more options" continues the same draft, so the typed
+    // title must survive the hand-off.
+    title: seed?.title ?? "",
     location: "",
     description: "",
     allDay: seed?.allDay ?? false,

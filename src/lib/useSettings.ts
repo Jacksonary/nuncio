@@ -14,9 +14,11 @@ import {
 } from "@tanstack/react-query";
 import { app, settings } from "@/ipc/api";
 import type { AppSettings, SettingsPatch, ThemeMode } from "@/ipc/types";
+import { toast } from "@/components";
 import { queryKeys } from "@/lib/queryKeys";
-import { setLanguage } from "@/lib/i18n";
+import { setLanguage, useT } from "@/lib/i18n";
 import { setPlatform } from "@/lib/platform";
+import { describeError } from "@/modules/settings/lib/errors";
 import {
   applyAccent,
   applyTheme,
@@ -47,8 +49,6 @@ export const DEFAULT_SETTINGS: AppSettings = {
     remoteImages: "always",
     lightMessageBackground: false,
     hoverActions: ["archive", "delete", "flag"],
-    swipeLeft: "delete",
-    swipeRight: "archive",
     confirmDelete: true,
     autoAdvance: "next",
     defaultFontFamily: "",
@@ -147,6 +147,7 @@ export function useUpdateSettings(): UseMutationResult<
   { previous: AppSettings | undefined }
 > {
   const client = useQueryClient();
+  const t = useT();
   return useMutation<AppSettings, unknown, SettingsPatch, { previous: AppSettings | undefined }>({
     mutationFn: (patch) => settings.update(patch),
     onMutate: async (patch) => {
@@ -156,12 +157,16 @@ export function useUpdateSettings(): UseMutationResult<
       client.setQueryData(queryKeys.settings(), optimistic);
       return { previous };
     },
-    onError: (_error, _patch, context) => {
+    onError: (error, _patch, context) => {
       if (context?.previous) {
         client.setQueryData(queryKeys.settings(), context.previous);
       } else {
         void client.invalidateQueries({ queryKey: queryKeys.settings() });
       }
+      // The rollback above is otherwise invisible: a toggle flips back with no
+      // explanation and looks like a UI glitch. Report the failure once, here,
+      // so every caller (fire-and-forget mutate and awaited mutateAsync) gets it.
+      toast.error(t("settings.account.saveFailed"), describeError(error, t));
     },
     onSuccess: (data) => {
       client.setQueryData(queryKeys.settings(), data);

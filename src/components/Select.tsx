@@ -139,7 +139,11 @@ export function Select({
         break;
       case "Escape":
       case "Tab":
+        // The dropdown owns these keys: stop them here so an enclosing Dialog
+        // or SidePanel does not also close, and preventDefault keeps Tab from
+        // moving focus into an option that is about to unmount.
         event.preventDefault();
+        event.stopPropagation();
         close();
         break;
       default:

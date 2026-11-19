@@ -30,6 +30,7 @@ pub mod ops;
 pub mod provider;
 pub mod reminders;
 pub mod service;
+mod status;
 pub mod store;
 pub mod tasks;
 pub mod util;

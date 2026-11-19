@@ -216,13 +216,13 @@ pub fn status_error(status: StatusCode, body: &str) -> AppError {
         403 => AppError::auth(format!("provider denied access: {snippet}")),
         404 | 410 => AppError::not_found(format!("provider resource missing: {snippet}")),
         409 | 412 => AppError::conflict(format!("provider conflict: {snippet}")),
-        429 => AppError::network(format!("provider rate limited: {snippet}")),
+        429 => AppError::service(format!("provider rate limited: {snippet}")),
         400 | 422 => AppError::invalid_input(format!("provider rejected request: {snippet}")),
         405 | 501 => AppError::unsupported(format!(
             "provider does not support this operation: {snippet}"
         )),
         _ if status.is_server_error() => {
-            AppError::network(format!("provider error {status}: {snippet}"))
+            AppError::service(format!("provider error {status}: {snippet}"))
         }
         _ => AppError::protocol(format!("provider returned {status}: {snippet}")),
     }
@@ -265,8 +265,24 @@ mod tests {
     #[test]
     fn status_mapping() {
         assert!(matches!(
+            status_error(StatusCode::TOO_MANY_REQUESTS, "slow down"),
+            AppError::Service(_)
+        ));
+        assert!(matches!(
+            status_error(StatusCode::SERVICE_UNAVAILABLE, "maintenance"),
+            AppError::Service(_)
+        ));
+        assert!(matches!(
+            status_error(StatusCode::BAD_REQUEST, "bad"),
+            AppError::InvalidInput(_)
+        ));
+        assert!(matches!(
             status_error(StatusCode::UNAUTHORIZED, "nope"),
             AppError::Auth(_)
+        ));
+        assert!(matches!(
+            status_error(StatusCode::METHOD_NOT_ALLOWED, "nope"),
+            AppError::Unsupported(_)
         ));
         assert!(matches!(
             status_error(StatusCode::CONFLICT, "etag"),
@@ -274,7 +290,7 @@ mod tests {
         ));
         assert!(matches!(
             status_error(StatusCode::BAD_GATEWAY, "bad"),
-            AppError::Network(_)
+            AppError::Service(_)
         ));
     }
 

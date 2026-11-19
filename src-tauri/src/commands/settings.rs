@@ -40,6 +40,11 @@ pub async fn settings_update(
         }
     }
     SettingsService::validate(&patch)?;
+    // Persist the settings first. The secret write is the side effect that
+    // cannot be rolled back, so a rejected settings update must not leave a
+    // keyring entry behind for a change the UI then reports as failed.
+    let settings = state.ctx.settings.update(patch).await?;
+    apply_side_effects(&state, &settings);
     if let Some(secret) = secret {
         match secret.as_deref().map(str::trim) {
             Some(SECRET_MASK) => {}
@@ -52,8 +57,6 @@ pub async fn settings_update(
             _ => state.auth.set_google_client_secret(None).await?,
         }
     }
-    let settings = state.ctx.settings.update(patch).await?;
-    apply_side_effects(&state, &settings);
     Ok(mask_secrets(&state, settings))
 }
 

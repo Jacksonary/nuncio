@@ -1,7 +1,7 @@
 /** Advanced: custom OAuth client ids for Google and Microsoft. */
 import { useState } from "react";
 import { Eye24Regular, EyeOff24Regular, Open24Regular } from "@fluentui/react-icons";
-import { Button, IconButton, Input, toast } from "@/components";
+import { Button, IconButton, Input, confirm, toast } from "@/components";
 import { useT } from "@/lib/i18n";
 import { useSettings } from "@/lib/useSettings";
 import { openExternal } from "../lib/desktop";
@@ -11,7 +11,6 @@ import {
   hasStoredClientSecret,
 } from "../lib/clientSecret";
 import { Banner, Card, Hint, Section, SettingsPage, StackRow } from "../components/SettingsUI";
-import { describeError } from "../lib/errors";
 import styles from "../settings.module.css";
 
 const GOOGLE_CREDENTIALS_URL = "https://console.cloud.google.com/apis/credentials";
@@ -58,22 +57,30 @@ export function AdvancedPage({ onBack }: { onBack: () => void }) {
       await updateAsync({ advanced });
       setGoogleClientSecret("");
       toast.success(t("settings.advanced.saved"));
-    } catch (error) {
-      toast.error(t("settings.advanced.saveFailed"), describeError(error, t));
+    } catch {
+      // useUpdateSettings already reverted the optimistic value and reported
+      // the failure in a toast.
     } finally {
       setSaving(false);
     }
   };
 
   const clearSecret = async () => {
+    const ok = await confirm({
+      title: t("settings.advanced.clearSecret"),
+      message: `${t("settings.advanced.secretStoredHint")} ${t("settings.rules.deleteMessage")}`,
+      confirmLabel: t("settings.advanced.clearSecret"),
+      danger: true,
+    });
+    if (!ok) return;
     // "" tells the backend to remove the keyring entry.
     setSaving(true);
     try {
       await updateAsync({ advanced: { googleClientSecret: "" } });
       setGoogleClientSecret("");
       toast.success(t("settings.advanced.secretCleared"));
-    } catch (error) {
-      toast.error(t("settings.advanced.saveFailed"), describeError(error, t));
+    } catch {
+      // Reported by useUpdateSettings; the stored secret is still there.
     } finally {
       setSaving(false);
     }
@@ -138,7 +145,7 @@ export function AdvancedPage({ onBack }: { onBack: () => void }) {
                 {t("settings.advanced.openGoogleConsole")}
               </Button>
               {storedSecret ? (
-                <Button appearance="subtle" size="small" onClick={clearSecret} disabled={saving}>
+                <Button appearance="danger" size="small" onClick={clearSecret} disabled={saving}>
                   {t("settings.advanced.clearSecret")}
                 </Button>
               ) : null}

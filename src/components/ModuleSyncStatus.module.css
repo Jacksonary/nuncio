@@ -1,0 +1,140 @@
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  min-width: 0;
+  height: 22px;
+  padding: 0 var(--sp-2) 0 var(--sp-1);
+  border: none;
+  border-radius: var(--radius-round);
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 14px;
+  white-space: nowrap;
+}
+
+.interactive {
+  cursor: pointer;
+}
+
+.interactive:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.interactive:focus-visible {
+  outline: 2px solid var(--focus-outline);
+  outline-offset: -2px;
+}
+
+.danger {
+  color: var(--danger);
+}
+
+.warning {
+  color: var(--warning);
+}
+
+.label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-variant-numeric: tabular-nums;
+}
+
+.dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: none;
+}
+
+.railDot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.railDotWarning {
+  background: var(--warning);
+}
+
+.railDotDanger {
+  background: var(--danger);
+}
+
+.popover {
+  max-width: 320px;
+  min-width: 220px;
+}
+
+.detail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+}
+
+.detailHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+}
+
+.detailTitle {
+  font-size: var(--font-caption);
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+}
+
+.copy {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  padding: 2px var(--sp-1);
+  border: none;
+  border-radius: var(--radius-s);
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 14px;
+  cursor: pointer;
+}
+
+.copy:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.copy:focus-visible {
+  outline: 2px solid var(--focus-outline);
+  outline-offset: -2px;
+}
+
+.detailText {
+  margin: 0;
+  padding: var(--sp-2);
+  max-height: 180px;
+  overflow: auto;
+  border-radius: var(--radius-s);
+  background: var(--surface-alt);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 16px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.noDetail {
+  margin: 0;
+  color: var(--text-tertiary);
+  font-size: var(--font-caption);
+  line-height: var(--line-caption);
+}

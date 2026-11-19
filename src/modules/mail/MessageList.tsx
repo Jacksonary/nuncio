@@ -53,6 +53,7 @@ import {
   Input,
   Menu,
   MenuButton,
+  ModuleSyncStatus,
   SearchBox,
   Spinner,
   Switch,
@@ -86,10 +87,10 @@ import { formatShortcut } from "@/lib/hotkeys";
 import { t, useT } from "@/lib/i18n";
 import { queryKeys } from "@/lib/queryKeys";
 import { useShellStore } from "@/lib/store";
-import { useUpdateSettings } from "@/lib/useSettings";
 import {
-  isPermanentDelete,
+  deletePlan,
   messageActionToast,
+  needsDeleteConfirmation,
   undoLastMessageAction,
   useMessageActions,
 } from "./actions";
@@ -100,9 +101,10 @@ import {
   EMPTY_SELECTION,
   actionTargets,
   buildMessageRows,
+  constrainToResultSet,
+  emptyStateCopy,
   messageIds,
   nextAfterRemoval,
-  isSupportedSwipeAction,
   parseUnifiedFolderId,
   safeFilename,
   selectionReducer,
@@ -118,6 +120,7 @@ import {
   useMailSyncing,
   useUnifiedAccounts,
 } from "./queries";
+import { useConversationView } from "./conversationPrefs";
 import { isOutboxMessageId, outboxItemId, outboxStatusKey, parseOutboxStatus } from "./outbox";
 import { SwipeableRow, type SwipeActionDescriptor } from "./SwipeRow";
 import styles from "./mail.module.css";
@@ -249,7 +252,6 @@ export function MessageList() {
   const folders = useAllFolders(accounts);
   const folderChoices = useFolderChoices(accounts, folders);
   const mailSettings = useMailSettings();
-  const updateSettings = useUpdateSettings();
   const { apply } = useMessageActions();
   const compose = useMailCompose();
   const queryClient = useQueryClient();
@@ -262,7 +264,6 @@ export function MessageList() {
 
   const [searchInput, setSearchInput] = useState("");
   const [searchText, setSearchText] = useState("");
-  const [searchScope, setSearchScope] = useState<"folder" | "all">("folder");
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [advanced, setAdvanced] = useState({
     from: "",
@@ -291,7 +292,12 @@ export function MessageList() {
   const searchRef = useRef<HTMLInputElement | null>(null);
   const listWrapRef = useRef<HTMLDivElement | null>(null);
 
-  const conversation = mailSettings.conversationView;
+  // Per mailbox: a real folder uses its account's choice, the unified views
+  // share one. The global setting is only the default.
+  const [conversation, setConversation] = useConversationView(
+    folder?.accountId ?? null,
+    mailSettings.conversationView,
+  );
   const density = mailSettings.density;
 
   useEffect(() => {
@@ -304,15 +310,30 @@ export function MessageList() {
     return () => window.clearTimeout(timer);
   }, [searchInput]);
 
-  const canScopeFolder = folder !== null;
-  const effectiveSearchScope: "folder" | "all" = canScopeFolder ? searchScope : "all";
-  const effectiveFolder = effectiveSearchScope === "folder" ? folder : null;
+  // Where you are is what gets searched: inside a real folder the search stays
+  // in that folder; the unified "all accounts" views (no single folder) search
+  // every account. There is deliberately no switch between the two — widening
+  // a search is what the unified views are for.
+  const effectiveFolder = folder;
   const subscriptionAccounts = useMemo(() => {
     if (folder) return [folder.accountId];
     if (unifiedRole) return unifiedAccounts.map((account) => account.id);
     return accounts.map((account) => account.id);
   }, [accounts, folder, unifiedAccounts, unifiedRole]);
   const syncing = useMailSyncing(subscriptionAccounts);
+  // Manual sync follows the view, not a null fallback: a folder syncs its own
+  // account, a unified view syncs exactly the accounts it covers, and a
+  // cross-account search syncs every mail account it searched. With no view
+  // resolved yet there is nothing honest to sync, so stay empty instead of
+  // quietly syncing every account.
+  const syncAccountIds = useMemo(() => {
+    if (searchText && folder === null) {
+      return accounts.map((account) => account.id);
+    }
+    if (folder) return [folder.accountId];
+    if (unifiedRole) return unifiedAccounts.map((account) => account.id);
+    return [];
+  }, [accounts, folder, searchText, unifiedAccounts, unifiedRole]);
 
   const scope = useMemo<MailScope | null>(() => {
     if (searchText) {
@@ -347,6 +368,26 @@ export function MessageList() {
     }),
     [conversation, filter, scope],
   );
+
+  // The selection is component state, so switching folder, unified role,
+  // search or filter leaves ids from the previous list behind and the bulk bar
+  // keeps showing the old count. The query *is* the scope: when its identity
+  // changes, drop the selection in one place. Stringifying keeps object
+  // identity churn (a folder refetch) from firing the reset for no reason.
+  const scopeKey = useMemo(() => JSON.stringify({ scope, filter }), [filter, scope]);
+  useEffect(() => {
+    dispatchSelection({ type: "clear" });
+  }, [scopeKey]);
+
+  // Selection mode and the filter belong to the mailbox being looked at. This
+  // component stays mounted across folder/account switches, so without this
+  // they leak: ticking boxes in one account left every other account in
+  // selection mode too. `folderId` covers real folders and the unified views;
+  // searching or filtering inside one folder deliberately does not reset them.
+  useEffect(() => {
+    setSelectionMode(false);
+    setFilter("all");
+  }, [folderId]);
 
   const list = useInfiniteQuery({
     queryKey: queryKeys.messages(listQuery),
@@ -457,22 +498,25 @@ export function MessageList() {
       action: Parameters<typeof apply>[0]["action"],
       threadMeta?: { threadId: string; accountId: string; count: number } | null,
     ) => {
-      if (ids.length === 0) return false;
+      // Defence in depth: even if a future refactor loses the scope reset, a
+      // stale id must never reach the backend.
+      const targets = constrainToResultSet(ids, orderedIds);
+      if (targets.length === 0) return false;
       try {
         await apply({
-          ids,
+          ids: targets,
           action,
           ...(threadMeta
             ? { threadIds: [threadMeta.threadId], accountId: threadMeta.accountId }
             : {}),
         });
-        messageActionToast(action, threadMeta?.count ?? ids.length);
+        messageActionToast(action, threadMeta?.count ?? targets.length);
         return true;
       } catch {
         return false;
       }
     },
-    [apply],
+    [apply, orderedIds],
   );
 
   // Bulk actions are one-shot: a successful action puts the list back into its
@@ -486,7 +530,10 @@ export function MessageList() {
   }, []);
 
   const deleteMessages = useCallback(
-    async (ids: string[]): Promise<boolean> => {
+    async (requested: string[]): Promise<boolean> => {
+      // The queued-message path below calls the API directly instead of going
+      // through runAction, so guard here as well.
+      const ids = constrainToResultSet(requested, orderedIds);
       if (ids.length === 0) return false;
       // Queued messages are not real rows: deleting one discards it from the
       // outbox (and is never undoable).
@@ -515,18 +562,33 @@ export function MessageList() {
           return false;
         }
       }
-      const permanent = isPermanentDelete(folder?.role ?? unifiedRole);
-      if (mailSettings.confirmDelete || permanent) {
+      // Decide per message, from each message's OWN folder: a global search can
+      // mix Trash rows with Inbox rows, so the sidebar's folder says nothing
+      // about what a given id will become. The backend reaches the same verdict
+      // independently, which is what makes the confirmation honest.
+      const plan = deletePlan(
+        ids.map((id) => summaryById.get(id)).filter(Boolean) as MessageSummary[],
+        (id) => folders.byId.get(id)?.role,
+      );
+      const permanent = plan.move === 0;
+      // A permanent delete is never silent, whatever the preference says; a
+      // plain move to Trash is undoable and honours "confirm before delete".
+      if (needsDeleteConfirmation(mailSettings.confirmDelete, plan)) {
         const ok = await confirm({
           title: permanent ? tt("mail.list.deletePermanentTitle") : tt("mail.list.deleteTitle"),
           message:
-            ids.length > 1
-              ? permanent
-                ? tt("mail.list.deletePermanentMessageMany", { count: ids.length })
-                : tt("mail.list.deleteMessageMany", { count: ids.length })
-              : permanent
-                ? tt("mail.list.deletePermanentMessage")
-                : tt("mail.list.deleteMessage"),
+            plan.move > 0 && plan.permanent > 0
+              ? tt("mail.list.deleteMixedMessage", {
+                  move: plan.move,
+                  permanent: plan.permanent,
+                })
+              : plan.permanent > 1
+                ? tt("mail.list.deletePermanentMessageMany", { count: plan.permanent })
+                : plan.permanent === 1
+                  ? tt("mail.list.deletePermanentMessage")
+                  : plan.move > 1
+                    ? tt("mail.list.deleteMessageMany", { count: plan.move })
+                    : tt("mail.list.deleteMessage"),
           confirmLabel: tt("common.delete"),
           danger: true,
         });
@@ -543,6 +605,7 @@ export function MessageList() {
     },
     [
       folder?.role,
+      folders.byId,
       invalidateOutbox,
       mailSettings.autoAdvance,
       mailSettings.confirmDelete,
@@ -551,6 +614,7 @@ export function MessageList() {
       runAction,
       scrollToMessage,
       setActive,
+      summaryById,
       threadMetaFor,
       tt,
       unifiedRole,
@@ -674,41 +738,24 @@ export function MessageList() {
     [invalidateOutbox, messageId, setActive, tt],
   );
 
-  const swipeDescriptor = useCallback(
-    (action: HoverAction, summary: MessageSummary): SwipeActionDescriptor | null => {
-      switch (action) {
-        case "archive":
-          return {
-            action,
-            label: tt("mail.action.archive"),
-            icon: <Archive16Regular />,
-            tone: "accent",
-          };
-        case "delete":
-          return {
-            action,
-            label: tt("mail.action.delete"),
-            icon: <Delete16Regular />,
-            tone: "danger",
-          };
-        case "flag":
-          return {
-            action,
-            label: summary.flagged ? tt("mail.action.unflag") : tt("mail.action.flag"),
-            icon: <Flag16Regular />,
-            tone: "accent",
-          };
-        case "read":
-          return {
-            action,
-            label: summary.seen ? tt("mail.action.markUnread") : tt("mail.action.markRead"),
-            icon: summary.seen ? <MailUnread16Regular /> : <MailRead16Regular />,
-            tone: "neutral",
-          };
-        default:
-          return null;
-      }
-    },
+  // Swipe actions are fixed (see SwipeRow: touch/pen only): right = archive,
+  // left = delete. They no longer depend on the row or on a setting.
+  const swipeArchive = useMemo<SwipeActionDescriptor>(
+    () => ({
+      action: "archive",
+      label: tt("mail.action.archive"),
+      icon: <Archive16Regular />,
+      tone: "accent",
+    }),
+    [tt],
+  );
+  const swipeDelete = useMemo<SwipeActionDescriptor>(
+    () => ({
+      action: "delete",
+      label: tt("mail.action.delete"),
+      icon: <Delete16Regular />,
+      tone: "danger",
+    }),
     [tt],
   );
 
@@ -847,13 +894,16 @@ export function MessageList() {
   ]);
 
   const syncNow = useCallback(async () => {
+    if (syncAccountIds.length === 0) return;
     try {
-      await syncApi.now(folder?.accountId ?? null, "mail");
+      for (const accountId of syncAccountIds) {
+        await syncApi.now(accountId, "mail");
+      }
       toast.success(tt("mail.list.syncStarted"));
     } catch (error) {
       toast.error(tt("mail.toast.actionFailed"), errorText(error));
     }
-  }, [folder?.accountId, tt]);
+  }, [syncAccountIds, tt]);
 
   const moveMenuEntries = useMemo<MenuEntry[]>(() => {
     const targetAccounts = new Set(
@@ -1211,46 +1261,29 @@ export function MessageList() {
         ? accountById.get(folder.accountId)?.displayName ?? ""
         : "";
 
-  const emptyState = (() => {
-    if (searchText) {
-      return (
-        <EmptyState
-          icon={<Search16Regular />}
-          title={tt("mail.list.emptySearchTitle")}
-          description={tt("mail.list.emptySearchHint")}
-          actions={
-            <Button size="small" onClick={clearSearch}>
-              {tt("mail.list.clearSearch")}
-            </Button>
-          }
-        />
-      );
-    }
-    const key =
-      filter === "unread"
-        ? "mail.list.emptyUnread"
-        : filter === "flagged"
-          ? "mail.list.emptyFlagged"
-          : filter === "attachments"
-            ? "mail.list.emptyAttachments"
-            : filter === "mentionsMe"
-              ? "mail.list.emptyMentions"
-              : "mail.list.emptyFolder";
-    return (
-      <EmptyState
-        icon={<Mail16Regular />}
-        title={tt(key)}
-        description={tt("mail.list.emptyHint")}
-        actions={
-          filter !== "all" ? (
-            <Button size="small" onClick={() => setFilter("all")}>
-              {tt("mail.filter.all")}
-            </Button>
-          ) : undefined
-        }
-      />
-    );
-  })();
+  const emptyCopy = emptyStateCopy({
+    searching: Boolean(searchText),
+    filter,
+    role: folder?.role ?? unifiedRole,
+  });
+  const emptyState = (
+    <EmptyState
+      icon={searchText ? <Search16Regular /> : <Mail16Regular />}
+      title={tt(emptyCopy.titleKey)}
+      description={tt(emptyCopy.descriptionKey)}
+      actions={
+        emptyCopy.clearFilter ? (
+          <Button size="small" onClick={() => setFilter("all")}>
+            {tt("mail.filter.all")}
+          </Button>
+        ) : searchText ? (
+          <Button size="small" onClick={clearSearch}>
+            {tt("mail.list.clearSearch")}
+          </Button>
+        ) : undefined
+      }
+    />
+  );
 
   const filterItems: MenuEntry[] = useMemo(
     () =>
@@ -1292,6 +1325,12 @@ export function MessageList() {
               </Button>
             ) : (
               <>
+                {/* Renders null while mail is healthy, so the controls never
+                    shift; this answers "is mail syncing/failing?", whereas the
+                    button below only triggers a manual sync. Scoped to the
+                    accounts this view covers: a background failure on another
+                    account is not this folder's problem. */}
+                <ModuleSyncStatus module="mail" accountIds={subscriptionAccounts} />
                 {/* No Tooltip wrapper here: IconButton already renders one from
                     `label`, so wrapping it produced two bubbles for one button. */}
                 <IconButton
@@ -1299,14 +1338,12 @@ export function MessageList() {
                   label={tt("mail.list.sync")}
                   size="small"
                   onClick={() => void syncNow()}
-                  disabled={syncing}
+                  disabled={syncing || syncAccountIds.length === 0}
                 />
                 <Tooltip content={tt("mail.list.conversation")}>
                   <ToggleButton
                     pressed={conversation}
-                    onPressedChange={(pressed) =>
-                      updateSettings.mutate({ mail: { conversationView: pressed } })
-                    }
+                    onPressedChange={setConversation}
                     icon={<ChatMultiple16Regular />}
                     size="small"
                     aria-label={tt("mail.list.conversation")}
@@ -1419,26 +1456,6 @@ export function MessageList() {
             onClick={() => setAdvancedOpen((open) => !open)}
           />
         </div>
-        <div className={styles.scopeRow}>
-            <span className={styles.scopeLabel}>{tt("mail.list.searchScope")}</span>
-            <div className={styles.scopeChips} role="group" aria-label={tt("mail.list.searchScope")}>
-              <ToggleButton
-                pressed={effectiveSearchScope === "folder"}
-                onPressedChange={() => setSearchScope("folder")}
-                disabled={!canScopeFolder}
-                size="small"
-              >
-                {tt("mail.list.scopeFolder")}
-              </ToggleButton>
-              <ToggleButton
-                pressed={effectiveSearchScope === "all"}
-                onPressedChange={() => setSearchScope("all")}
-                size="small"
-              >
-                {tt("mail.list.scopeAll")}
-              </ToggleButton>
-            </div>
-          </div>
         {advancedOpen ? (
           <div className={styles.advancedPanel}>
             <div className={styles.advancedGrid}>
@@ -1563,7 +1580,7 @@ export function MessageList() {
               const isSelected = selected.ids.includes(summary.id);
               const isCurrent = summary.id === messageId;
               const account = accountById.get(summary.accountId);
-              const showAccountStripe = unifiedRole !== null || (searchText && searchScope === "all");
+              const showAccountStripe = unifiedRole !== null;
               const expanded = expandedThreads.has(summary.threadId);
               const threadToggleLabel = expanded
                 ? tt("mail.list.threadCollapse")
@@ -1571,12 +1588,6 @@ export function MessageList() {
               const hoverActions = hoverActionButtons(summary);
               const outboxItem = isOutboxMessageId(summary.id);
               const outboxStatus = outboxItem ? parseOutboxStatus(summary.preview) : null;
-              const swipeRightDescriptor = isSupportedSwipeAction(mailSettings.swipeRight)
-                ? swipeDescriptor(mailSettings.swipeRight, summary)
-                : null;
-              const swipeLeftDescriptor = isSupportedSwipeAction(mailSettings.swipeLeft)
-                ? swipeDescriptor(mailSettings.swipeLeft, summary)
-                : null;
               const handleSwipe = (action: HoverAction) => {
                 if (outboxItem) {
                   // Only discard makes sense for a queued message.
@@ -1603,10 +1614,10 @@ export function MessageList() {
               return (
                 <div className={styles.messageRowWrap}>
                   <SwipeableRow
-                    swipeLeft={swipeLeftDescriptor}
-                    swipeRight={swipeRightDescriptor}
+                    swipeLeft={swipeDelete}
+                    swipeRight={swipeArchive}
                     onAction={handleSwipe}
-                    disabled={selectionMode || (!swipeLeftDescriptor && !swipeRightDescriptor)}
+                    disabled={selectionMode}
                   >
                   <div
                     data-message-id={summary.id}

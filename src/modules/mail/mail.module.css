@@ -298,28 +298,6 @@
   min-width: 0;
 }
 
-.scopeRow {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-2);
-  min-width: 0;
-}
-
-.scopeLabel {
-  font-size: 11px;
-  color: var(--text-tertiary);
-  white-space: nowrap;
-}
-
-.scopeChips {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-  padding: 1px;
-  border-radius: var(--radius-round);
-  background: var(--surface-alt);
-}
-
 .batchBar {
   display: flex;
   align-items: center;

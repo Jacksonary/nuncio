@@ -264,6 +264,19 @@ pub fn list_for_calendar(conn: &Connection, calendar_id: &str) -> Result<Vec<Sto
     Ok(events)
 }
 
+/// Every event row (backup export / full restore).
+pub fn list_all(conn: &Connection) -> Result<Vec<StoredEvent>> {
+    let sql =
+        format!("SELECT {COLUMNS} FROM event ORDER BY calendar_id ASC, start_utc ASC, id ASC");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    let mut events = Vec::new();
+    while let Some(row) = rows.next()? {
+        events.push(row_to_stored(row)?);
+    }
+    Ok(events)
+}
+
 /// Events overlapping `[from, to)` plus every recurring master.
 ///
 /// `calendar_ids = None` means "all visible calendars".

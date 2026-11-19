@@ -8,21 +8,23 @@ import {
   HardDrive24Regular,
   Open24Regular,
 } from "@fluentui/react-icons";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Button,
   Checkbox,
   Dialog,
   Input,
   ProgressBar,
+  Select,
   Spinner,
   confirm,
   toast,
 } from "@/components";
 import { useT } from "@/lib/i18n";
-import { app } from "@/ipc/api";
+import { app, calendars as calendarsApi, contacts as contactsApi } from "@/ipc/api";
 import { formatFileSize } from "@/lib/format";
-import { queryKeyPrefixes } from "@/lib/queryKeys";
+import { queryKeyPrefixes, queryKeys } from "@/lib/queryKeys";
+import { collectContactIds } from "@/modules/people/actions";
 import { describeError } from "../lib/errors";
 import { isDesktop, pickOpenPath, pickSavePath, relaunchApp } from "../lib/desktop";
 import { useInvalidateAllData, useStorageUsage } from "../lib/hooks";
@@ -45,6 +47,19 @@ export function DataPage({
   const [backupMode, setBackupMode] = useState<BackupMode | null>(null);
   const [busy, setBusy] = useState(false);
   const [openLogBusy, setOpenLogBusy] = useState(false);
+  const [exportingContacts, setExportingContacts] = useState(false);
+  const [exportingCalendar, setExportingCalendar] = useState(false);
+  const [selectedCalendarId, setSelectedCalendarId] = useState<string | null>(null);
+
+  const calendarsQuery = useQuery({
+    queryKey: queryKeys.calendars(),
+    queryFn: calendarsApi.list,
+  });
+  const calendarOptions = (calendarsQuery.data ?? []).map((calendar) => ({
+    value: calendar.id,
+    label: calendar.name,
+  }));
+  const activeCalendarId = selectedCalendarId ?? calendarsQuery.data?.[0]?.id ?? null;
 
   const total = usage.data
     ? usage.data.databaseBytes + usage.data.mimeCacheBytes + usage.data.attachmentBytes
@@ -84,6 +99,65 @@ export function DataPage({
       toast.error(t("settings.data.openLogsFailed"), describeError(error, t));
     } finally {
       setOpenLogBusy(false);
+    }
+  };
+
+  const exportAllContacts = async () => {
+    if (!isDesktop()) {
+      toast.info(t("settings.data.desktopOnly"));
+      return;
+    }
+    setExportingContacts(true);
+    try {
+      // Same collection path as the People sidebar export: page through the
+      // contact list and hand the ids to the backend, which writes the vCard.
+      const ids = await collectContactIds({
+        addressBookId: null,
+        groupId: null,
+        query: null,
+        favoritesOnly: false,
+        cursor: null,
+        limit: 500,
+      });
+      if (ids.length === 0) {
+        toast.info(t("settings.data.exportVcfEmpty"));
+        return;
+      }
+      const path = await pickSavePath(`${new Date().toISOString().slice(0, 10)}-contacts.vcf`, t("settings.data.exportVcf"), [
+        { name: "vCard", extensions: ["vcf"] },
+      ]);
+      if (!path) return;
+      await contactsApi.exportVcf(ids, path);
+      toast.success(t("settings.data.exportVcfDone", { count: ids.length }));
+    } catch (error) {
+      toast.error(t("settings.data.exportFailed"), describeError(error, t));
+    } finally {
+      setExportingContacts(false);
+    }
+  };
+
+  const exportCalendar = async () => {
+    if (!isDesktop()) {
+      toast.info(t("settings.data.desktopOnly"));
+      return;
+    }
+    const calendar = calendarsQuery.data?.find((item) => item.id === activeCalendarId);
+    if (!calendar) {
+      toast.info(t("settings.data.exportNoCalendars"));
+      return;
+    }
+    setExportingCalendar(true);
+    try {
+      const path = await pickSavePath(`${calendar.name}.ics`, t("settings.data.exportIcs"), [
+        { name: "iCalendar", extensions: ["ics"] },
+      ]);
+      if (!path) return;
+      await calendarsApi.exportIcs(calendar.id, path);
+      toast.success(t("settings.data.exportIcsDone"), calendar.name);
+    } catch (error) {
+      toast.error(t("settings.data.exportFailed"), describeError(error, t));
+    } finally {
+      setExportingCalendar(false);
     }
   };
 
@@ -156,6 +230,44 @@ export function DataPage({
           </SettingRow>
         </Card>
         <Banner tone="info">{t("settings.data.backupEncryption")}</Banner>
+      </Section>
+
+      <Section title={t("settings.data.exchange")} hint={t("settings.data.exchangeHint")}>
+        <Card>
+          <SettingRow
+            label={t("settings.data.exportVcf")}
+            description={t("settings.data.exportVcfDesc")}
+          >
+            <Button
+              icon={<ArrowDownload24Regular />}
+              loading={exportingContacts}
+              onClick={() => void exportAllContacts()}
+            >
+              {t("settings.data.exportVcfAction")}
+            </Button>
+          </SettingRow>
+          <SettingRow
+            label={t("settings.data.exportIcs")}
+            description={t("settings.data.exportIcsDesc")}
+          >
+            <Select
+              ariaLabel={t("settings.data.calendarSelect")}
+              placeholder={t("settings.data.calendarSelect")}
+              value={activeCalendarId}
+              onChange={setSelectedCalendarId}
+              options={calendarOptions}
+              disabled={calendarOptions.length === 0}
+            />
+            <Button
+              icon={<ArrowDownload24Regular />}
+              loading={exportingCalendar}
+              disabled={!activeCalendarId}
+              onClick={() => void exportCalendar()}
+            >
+              {t("settings.data.exportIcsAction")}
+            </Button>
+          </SettingRow>
+        </Card>
       </Section>
 
       <Section title={t("settings.data.diagnostics")}>
