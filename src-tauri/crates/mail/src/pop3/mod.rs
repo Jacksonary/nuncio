@@ -4,6 +4,7 @@
 //! a local `INBOX` folder and remain there. `UIDL` provides the incremental
 //! key; downloaded messages are kept on the server by default.
 
+pub mod body;
 pub mod sync;
 
 use std::fmt;
@@ -284,6 +285,17 @@ impl Pop3Client {
     /// `RETR` a message; CRLF normalized and dot-unstuffed.
     pub async fn retr(&mut self, number: u32) -> Result<Vec<u8>> {
         self.command_ok(&format!("RETR {number}")).await?;
+        self.read_multiline().await
+    }
+
+    /// `TOP <number> <lines>` (RFC 1939, optional command).
+    ///
+    /// `0` returns the header block plus the blank separator line, which is all
+    /// the listing path needs. Servers without the TOP capability answer
+    /// `-ERR`; that surfaces as an `AppError::protocol`, which the caller turns
+    /// into a `RETR` fallback.
+    pub async fn top(&mut self, number: u32, lines: u32) -> Result<Vec<u8>> {
+        self.command_ok(&format!("TOP {number} {lines}")).await?;
         self.read_multiline().await
     }
 

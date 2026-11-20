@@ -26,6 +26,7 @@ import {
 import { accounts, isIpcError, sync as syncApi } from "@/ipc/api";
 import type { AppModule, SyncModule } from "@/ipc/types";
 import { shouldShowFirstRun } from "@/lib/accounts";
+import { cn } from "@/lib/cn";
 import { installEventBridge } from "@/lib/eventBridge";
 import { installHotkeys, registerHotkeys } from "@/lib/hotkeys";
 import { useT } from "@/lib/i18n";
@@ -129,16 +130,21 @@ export function Shell() {
     });
   }, [activeModule]);
 
+  const [syncBusy, setSyncBusy] = useState(false);
   const syncNow = useCallback(async () => {
+    if (syncBusy) return;
     const module = syncTargetFor(activeModule);
     const moduleName = t(moduleDef.labelKey);
+    setSyncBusy(true);
     try {
       await syncApi.now(null, module);
       toast.success(t("shell.syncDone", { module: moduleName }));
     } catch (error) {
       toast.error(t("shell.syncError", { module: moduleName }), errorMessage(error));
+    } finally {
+      setSyncBusy(false);
     }
-  }, [activeModule, moduleDef.labelKey, t]);
+  }, [activeModule, moduleDef.labelKey, syncBusy, t]);
 
   useEffect(() => {
     return registerHotkeys([
@@ -255,9 +261,10 @@ export function Shell() {
             <div className={styles.footerRow}>
               <button
                 type="button"
-                className={styles.syncNow}
+                className={cn(styles.syncNow, syncBusy && styles.syncNowBusy)}
                 onClick={() => void syncNow()}
                 aria-label={syncNowLabel}
+                aria-busy={syncBusy || undefined}
                 title={syncNowLabel}
               >
                 <span className={styles.syncNowIcon} aria-hidden="true">

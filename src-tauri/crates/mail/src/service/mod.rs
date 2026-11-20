@@ -116,6 +116,11 @@ pub(crate) struct MailServiceInner {
     pub ctx: CoreContext,
     pub engine: Engine,
     pub external: Mutex<ExternalStore>,
+    /// Cancel flag of the in-flight header-scan search; a new search sets the
+    /// previous flag so a superseded scan stops at the next batch.
+    pub scan_cancel: Mutex<Arc<std::sync::atomic::AtomicBool>>,
+    /// Last server-search result, reused while paging the same query.
+    pub search_cache: Mutex<Option<messages::SearchCacheEntry>>,
 }
 
 /// Cloneable handle to the mail command service.
@@ -138,6 +143,8 @@ impl MailService {
                 ctx,
                 engine,
                 external: Mutex::new(ExternalStore::default()),
+                scan_cancel: Mutex::new(Arc::default()),
+                search_cache: Mutex::new(None),
             }),
         }
     }
@@ -438,6 +445,17 @@ impl MailService {
         }
         let account = self.account(&stored.summary.account_id).await?;
         if account.imap.is_none() {
+            // POP3 listing is header-first: materialise this one body over POP3
+            // and cache it like an IMAP body. A message already gone from the
+            // server reports a stable "body unavailable" error.
+            if account.provider == nuncio_core::models::ProviderKind::Pop3 {
+                let path =
+                    crate::pop3::body::fetch_body(&self.inner.ctx, &account, &stored.summary.id)
+                        .await?;
+                return tokio::fs::read(&path).await.map_err(|error| {
+                    AppError::io(format!("cannot read cached message body: {error}"))
+                });
+            }
             return Err(AppError::not_found(format!(
                 "message {} has no cached body",
                 stored.summary.id

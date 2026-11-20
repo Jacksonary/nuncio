@@ -96,6 +96,11 @@ impl GraphMailClient {
         }
     }
 
+    /// Client pointed at another base URL (tests use a loopback mock server).
+    pub fn with_base(base: impl Into<String>) -> Self {
+        Self { base: base.into() }
+    }
+
     /// Join the configured base URL with a Graph-relative path.
     pub fn url(&self, path: &str) -> String {
         format!("{}{}", self.base, path)

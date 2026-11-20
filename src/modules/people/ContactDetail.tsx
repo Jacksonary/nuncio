@@ -35,7 +35,6 @@ import {
 import type { ContactField, PostalAddress } from "@/ipc/types";
 import { formatRelativeTime } from "@/lib/format";
 import { getLocale, useT } from "@/lib/i18n";
-import { useAppSettings } from "@/lib/useSettings";
 import { useShellStore } from "@/lib/store";
 import {
   addressLines,
@@ -70,7 +69,6 @@ function typeLabel(
 
 export function ContactDetail() {
   const t = useT();
-  const settings = useAppSettings();
   const contactId = useShellStore((state) => state.selection.people.contactId);
   const openEdit = usePeopleUiStore((state) => state.openEdit);
   const query = useContactQuery(contactId);
@@ -131,8 +129,7 @@ export function ContactDetail() {
     );
   }
 
-  const displayOrder = settings.contacts.displayOrder;
-  const displayName = formatContactName(contact, displayOrder) || t("people.detail.noName");
+  const displayName = formatContactName(contact) || t("people.detail.noName");
   const subtitle = [contact.company, contact.jobTitle].filter(Boolean).join(" · ");
   const emails = contact.emails.filter((field) => field.value.trim());
   const phones = contact.phones.filter((field) => field.value.trim());
@@ -194,7 +191,7 @@ export function ContactDetail() {
               appearance="primary"
               icon={<Mail16Regular />}
               disabled={!email}
-              onClick={() => void composeToContact(contact, displayOrder)}
+              onClick={() => void composeToContact(contact)}
             >
               {t("people.detail.sendEmail")}
             </Button>
@@ -202,7 +199,7 @@ export function ContactDetail() {
               appearance="outline"
               icon={<CalendarLtr16Regular />}
               disabled={!email}
-              onClick={() => void scheduleMeetingWithContact(contact, displayOrder)}
+              onClick={() => void scheduleMeetingWithContact(contact)}
             >
               {t("people.detail.scheduleMeeting")}
             </Button>

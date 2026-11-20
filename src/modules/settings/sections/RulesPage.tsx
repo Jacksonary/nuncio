@@ -34,7 +34,6 @@ import {
   RULE_OPS_BY_FIELD,
   createAction,
   createCondition,
-  createRule,
   serializeRule,
   validateRule,
   withActionKind,
@@ -43,7 +42,13 @@ import {
 import { Card, Section, SettingsPage, SettingRow, StackRow, Banner } from "../components/SettingsUI";
 import styles from "../settings.module.css";
 
-export function RulesPage({ onBack }: { onBack: () => void }) {
+/** Rule list; embedded by the Mail page, which hosts the editor as a sub-page. */
+export function RulesContent({
+  onEdit,
+}: {
+  /** null creates a new rule. */
+  onEdit: (rule: MailRule | null) => void;
+}) {
   const t = useT();
   const rulesQuery = useRules();
   const accountsQuery = useAccounts();
@@ -54,7 +59,6 @@ export function RulesPage({ onBack }: { onBack: () => void }) {
     [accountsQuery.data],
   );
   const { folders: allFolders } = useFolderCollection(accountIds);
-  const [draft, setDraft] = useState<{ rule: MailRule; isNew: boolean } | null>(null);
   const [runTarget, setRunTarget] = useState<MailRule | null>(null);
 
   const rules = useMemo(() => {
@@ -88,31 +92,14 @@ export function RulesPage({ onBack }: { onBack: () => void }) {
     }
   };
 
-  if (draft) {
-    return (
-      <RuleEditor
-        rule={draft.rule}
-        isNew={draft.isNew}
-        accounts={accountsQuery.data ?? []}
-        folders={allFolders}
-        onCancel={() => setDraft(null)}
-        onSaved={() => setDraft(null)}
-        onDeleted={() => setDraft(null)}
-      />
-    );
-  }
-
   return (
-    <SettingsPage
-      title={t("settings.rules.title")}
-      subtitle={t("settings.rules.subtitle")}
-      onBack={onBack}
+    <Section
       actions={
         <Button
-          appearance="primary"
+          appearance="subtle"
           size="small"
           icon={<Add24Regular />}
-          onClick={() => setDraft({ rule: createRule(), isNew: true })}
+          onClick={() => onEdit(null)}
         >
           {t("settings.rules.new")}
         </Button>
@@ -157,7 +144,7 @@ export function RulesPage({ onBack }: { onBack: () => void }) {
                     label={t("common.edit")}
                     size="small"
                     appearance="subtle"
-                    onClick={() => setDraft({ rule, isNew: false })}
+                    onClick={() => onEdit(rule)}
                   />
                   <IconButton
                     icon={<Delete24Regular />}
@@ -187,7 +174,37 @@ export function RulesPage({ onBack }: { onBack: () => void }) {
         folders={allFolders}
         onClose={() => setRunTarget(null)}
       />
-    </SettingsPage>
+    </Section>
+  );
+}
+
+/** Rule editor sub-page, hosted by the Mail page. */
+export function RuleEditorPage({
+  rule,
+  isNew,
+  onBack,
+}: {
+  rule: MailRule;
+  isNew: boolean;
+  onBack: () => void;
+}) {
+  const accountsQuery = useAccounts();
+  const accountIds = useMemo(
+    () => (accountsQuery.data ?? []).map((account) => account.id),
+    [accountsQuery.data],
+  );
+  const { folders } = useFolderCollection(accountIds);
+
+  return (
+    <RuleEditor
+      rule={rule}
+      isNew={isNew}
+      accounts={accountsQuery.data ?? []}
+      folders={folders}
+      onCancel={onBack}
+      onSaved={onBack}
+      onDeleted={onBack}
+    />
   );
 }
 

@@ -21,7 +21,6 @@ import {
   canOfferUndo,
   deletePlan,
   mergeMessageIds,
-  needsDeleteConfirmation,
   normalizeAction,
   resolveActionIds,
   threadRefsFromSummaries,
@@ -206,18 +205,6 @@ describe("thread expansion", () => {
     await expect(
       resolveActionIds({ ids: ["a"], action: { kind: "delete", permanent: false } }, summaries),
     ).resolves.toEqual(["a"]);
-  });
-});
-
-describe("needsDeleteConfirmation", () => {
-  it("honours the preference for a plain move to Trash", () => {
-    expect(needsDeleteConfirmation(false, { move: 3, permanent: 0 })).toBe(false);
-    expect(needsDeleteConfirmation(true, { move: 3, permanent: 0 })).toBe(true);
-  });
-
-  it("never goes silent when anything is deleted permanently", () => {
-    expect(needsDeleteConfirmation(false, { move: 0, permanent: 2 })).toBe(true);
-    expect(needsDeleteConfirmation(false, { move: 2, permanent: 1 })).toBe(true);
   });
 });
 

@@ -109,6 +109,8 @@ export const folders = {
   /** Permanently delete everything in a trash/junk folder. */
   empty: (id: T.Id) => call<void>("folder_empty", { id }),
   sync: (id: T.Id) => call<void>("folder_sync", { id }),
+  /** Pull the next batch of older mail from the server (IMAP / Graph only). */
+  loadOlder: (id: T.Id) => call<T.LoadOlderResult>("folder_load_older", { id }),
 };
 
 export const messages = {
@@ -116,7 +118,12 @@ export const messages = {
   /** Conversation members, oldest first. */
   thread: (accountId: T.Id, threadId: string) => call<T.MessageSummary[]>("message_thread", { accountId, threadId }),
   /** Downloads the body if not cached. allowRemote overrides the remote-content policy for this call. */
-  get: (id: T.Id, allowRemote: boolean) => call<T.MessageDetail>("message_get", { id, allowRemote }),
+  /**
+   * `lightBackground` renders the body on white even under a dark theme. It is a
+   * one-off choice for the current view and is never stored.
+   */
+  get: (id: T.Id, allowRemote: boolean, lightBackground = false) =>
+    call<T.MessageDetail>("message_get", { id, allowRemote, lightBackground }),
   /**
    * Optimistic: updates locally, queues server ops, emits mail://changed.
    * Returns the undo id to pass to `undoLast`.

@@ -18,7 +18,8 @@ use crate::pending::{self, PendingOpen};
 use crate::state::AppState;
 
 /// Window state persisted by the plugin (visibility is intentionally excluded:
-/// a cold start must follow the start-minimized setting, not the last close).
+/// a cold start decides visibility from the `--minimized` argument, not from
+/// how the window was left at the last close).
 pub fn window_state_flags() -> tauri_plugin_window_state::StateFlags {
     use tauri_plugin_window_state::StateFlags;
     let flags = StateFlags::SIZE

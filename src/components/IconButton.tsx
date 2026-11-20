@@ -11,6 +11,12 @@ export interface IconButtonProps
   appearance?: "subtle" | "transparent" | "primary";
   size?: "small" | "medium" | "large";
   selected?: boolean;
+  /**
+   * An action is in flight. The icon keeps its look and turns on the spot, and
+   * clicks are ignored until it clears. Unlike `disabled` the icon is not dimmed,
+   * so the motion stays readable.
+   */
+  busy?: boolean;
   /** Override the tooltip; `false` disables it. */
   tooltip?: ReactNode | false;
 }
@@ -22,9 +28,11 @@ export const IconButton = forwardRef<HTMLButtonElement, IconButtonProps>(functio
     appearance = "transparent",
     size = "medium",
     selected,
+    busy = false,
     tooltip,
     className,
     disabled,
+    onClick,
     type = "button",
     ...rest
   },
@@ -43,9 +51,12 @@ export const IconButton = forwardRef<HTMLButtonElement, IconButtonProps>(functio
             ? styles["appearance-primary"]
             : undefined,
         selected && styles.selected,
+        busy && styles.busy,
         className,
       )}
       aria-label={label}
+      aria-busy={busy || undefined}
+      onClick={busy ? undefined : onClick}
       aria-pressed={selected === undefined ? undefined : selected}
       disabled={disabled}
       {...rest}

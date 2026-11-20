@@ -338,15 +338,6 @@ export function deletePlan(
 }
 
 /**
- * Whether a delete must ask first. A permanent delete never goes silent, even
- * with "confirm before delete" off; a plain move to Trash is undoable and
- * follows the preference.
- */
-export function needsDeleteConfirmation(confirmPreference: boolean, plan: DeletePlan): boolean {
-  return confirmPreference || plan.permanent > 0;
-}
-
-/**
  * Undo is only offered when the action recorded something reversible. An empty
  * id would fall through to the global "undo last" and revert something else.
  */

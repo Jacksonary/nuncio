@@ -3,8 +3,7 @@
  * with A–Z/# section headers, Ctrl/⌘ and Shift multi-selection, and the bulk
  * action bar. The whole (filtered) contact set is loaded through
  * `contact_list` before sorting, because sections are built client-side from
- * the last-name/pinyin sort key rather than the backend's `display_name`
- * order.
+ * the pinyin-aware sort key rather than the backend's `display_name` order.
  */
 import {
   useCallback,
@@ -123,12 +122,8 @@ export function ContactList() {
       : settings.language;
 
   const listOptions: ContactListOptions = useMemo(
-    () => ({
-      sortBy: settings.contacts.sortBy,
-      displayOrder: settings.contacts.displayOrder,
-      locale: effectiveLocale,
-    }),
-    [settings.contacts.sortBy, settings.contacts.displayOrder, effectiveLocale],
+    () => ({ locale: effectiveLocale }),
+    [effectiveLocale],
   );
 
   const listQuery = useMemo(
@@ -226,7 +221,7 @@ export function ContactList() {
       // Contacts are shown across accounts, so the list header can only offer
       // the module-wide sync; a per-account scope would not match what is shown.
       await syncApi.now(null, "contacts");
-      toast.success(t("people.list.syncStarted"));
+      toast.success(t("people.list.synced"));
     } catch (error) {
       toast.error(t("people.list.sync"), peopleErrorText(error));
     } finally {
@@ -397,8 +392,7 @@ export function ContactList() {
     const selected = selectedIds.includes(contact.id);
     const isCurrent = selection.contactId === contact.id;
     const displayName =
-      formatSummaryName(contact.displayName, listOptions.displayOrder) ||
-      t("people.detail.noName");
+      formatSummaryName(contact.displayName) || t("people.detail.noName");
     const meta = [contact.company, contact.primaryEmail].filter(Boolean).join(" · ");
     return (
       <div
@@ -465,11 +459,11 @@ export function ContactList() {
             </span>
             <ModuleSyncStatus module="contacts" />
             <IconButton
-              icon={syncing ? <Spinner size="tiny" /> : <ArrowSync16Regular />}
+              icon={<ArrowSync16Regular />}
               label={t("people.list.sync")}
               size="small"
               onClick={() => void syncNow()}
-              disabled={syncing}
+              busy={syncing}
             />
           </div>
         </div>

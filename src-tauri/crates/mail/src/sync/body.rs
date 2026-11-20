@@ -11,7 +11,7 @@ use async_imap::imap_proto::SectionPath;
 use async_imap::types::Fetch;
 use chrono::Utc;
 use futures::TryStreamExt;
-use nuncio_core::models::{Account, Attachment, Folder, ProviderKind, StoredMessage};
+use nuncio_core::models::{Account, Attachment, ProviderKind, StoredMessage};
 use nuncio_core::{repo, AppError, CoreContext, Result};
 use tracing::{debug, warn};
 
@@ -521,45 +521,6 @@ fn attachment_section(part: &str) -> Option<SectionPath> {
         .map(|segment| segment.parse::<u32>().ok())
         .collect();
     parts.map(|parts| SectionPath::Part(parts, None))
-}
-
-/// Prefetch the newest `limit` unread bodies of a folder.
-pub async fn prefetch_unread(
-    ctx: &CoreContext,
-    conn: &mut ImapConnection,
-    account_id: &str,
-    folder: &Folder,
-    limit: u32,
-) -> Result<usize> {
-    if limit == 0 {
-        return Ok(0);
-    }
-    let folder_id = folder.id.clone();
-    let ids = ctx
-        .db
-        .read(move |db| {
-            let mut statement = db.prepare(
-                "SELECT id FROM message
-                 WHERE folder_id = ?1 AND seen = 0 AND is_deleted_local = 0 AND body_path IS NULL
-                 ORDER BY date DESC LIMIT ?2",
-            )?;
-            let mut rows = statement.query(rusqlite::params![folder_id, limit as i64])?;
-            let mut ids = Vec::new();
-            while let Some(row) = rows.next()? {
-                ids.push(row.get::<_, String>(0)?);
-            }
-            Ok(ids)
-        })
-        .await?;
-
-    let mut fetched = 0;
-    for id in ids {
-        match fetch_body(ctx, conn, account_id, &id).await {
-            Ok(_) => fetched += 1,
-            Err(error) => debug!(%error, message = %id, "body prefetch skipped"),
-        }
-    }
-    Ok(fetched)
 }
 
 /// Drop least-recently cached bodies until the MIME cache is under the limit.

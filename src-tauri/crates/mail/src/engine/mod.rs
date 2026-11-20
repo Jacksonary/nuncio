@@ -276,6 +276,13 @@ impl Engine {
                     .ok_or_else(|| {
                         AppError::not_found(format!("message {message_id} not found"))
                     })?;
+                // POP3 bodies are resolved by UIDL against the live server; a
+                // missing one is gone for good, so refreshing the folder would
+                // only repeat the same failure.
+                let account = self.load_account(&stored.summary.account_id).await?;
+                if account.provider == ProviderKind::Pop3 {
+                    return Err(error);
+                }
                 self.sync_folder(&stored.summary.folder_id).await?;
                 self.fetch_body_once(message_id).await
             }
@@ -302,9 +309,9 @@ impl Engine {
         }
         let account = self.load_account(&stored.summary.account_id).await?;
         if account.provider == ProviderKind::Pop3 {
-            return Err(AppError::not_found(
-                "POP3 message body is not cached locally",
-            ));
+            // Listing stores headers only; the body is fetched here, on first
+            // use, and cached exactly like an IMAP body.
+            return crate::pop3::body::fetch_body(&self.inner.ctx, &account, message_id).await;
         }
         let (sender, receiver) = oneshot::channel();
         let sent = self
@@ -343,7 +350,16 @@ impl Engine {
             Some(path) => tokio::fs::metadata(path).await.is_ok(),
             None => false,
         };
-        if wants_index && !cached_file {
+        // POP3 has no per-part FETCH: every attachment comes from the cached
+        // `.eml`, so the body is materialised first whichever part form was
+        // asked for. Without this the `FetchPart` command below would be sent
+        // to an actor that does not serve it.
+        let pop3 = self
+            .load_account(&stored.summary.account_id)
+            .await?
+            .provider
+            == ProviderKind::Pop3;
+        if !cached_file && (wants_index || pop3) {
             self.fetch_body(message_id).await?;
             stored = self
                 .inner
@@ -364,6 +380,13 @@ impl Engine {
                     return nuncio_mime::extract_part_by_index(&raw, index);
                 }
             }
+        }
+        if pop3 {
+            // Nothing left to ask the server: POP3 has no per-part FETCH and
+            // the cached body above is the only source of the part.
+            return Err(AppError::not_found(format!(
+                "attachment {part} is not present in the cached POP3 message"
+            )));
         }
         let (sender, receiver) = oneshot::channel();
         let sender_tx = self.sender_for_message(message_id).await?;
@@ -424,6 +447,57 @@ impl Engine {
             .send(AccountCommand::Search {
                 folder_id: folder_id.map(str::to_string),
                 criteria: criteria.to_string(),
+                reply: sender,
+            })
+            .await
+            .map_err(|_| AppError::internal("mail worker stopped"))?;
+        receiver
+            .await
+            .map_err(|_| AppError::internal("mail worker dropped the reply"))?
+    }
+
+    /// Header-scan search fallback (read-only `EXAMINE` + header fetch);
+    /// matching metadata is cached locally.
+    pub async fn server_scan(
+        &self,
+        account_id: &str,
+        folder_id: &str,
+        query: &nuncio_core::models::SearchQuery,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<sync::messages::ScanOutcome> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender(account_id)
+            .await?
+            .send(AccountCommand::Scan {
+                folder_id: folder_id.to_string(),
+                query: query.clone(),
+                cancel,
+                reply: sender,
+            })
+            .await
+            .map_err(|_| AppError::internal("mail worker stopped"))?;
+        receiver
+            .await
+            .map_err(|_| AppError::internal("mail worker dropped the reply"))?
+    }
+
+    /// Pull the next batch of mail older than anything stored for a folder.
+    /// POP3 lists every message locally and local accounts have no server, so
+    /// both are a no-op.
+    pub async fn load_older(
+        &self,
+        folder_id: &str,
+    ) -> Result<nuncio_core::models::LoadOlderResult> {
+        let folder = self.load_folder(folder_id).await?;
+        let account = self.load_account(&folder.account_id).await?;
+        if account.provider == ProviderKind::Pop3 || account.provider.is_local() {
+            return Ok(nuncio_core::models::LoadOlderResult::default());
+        }
+        let (sender, receiver) = oneshot::channel();
+        self.sender(&folder.account_id)
+            .await?
+            .send(AccountCommand::LoadOlder {
+                folder_id: folder.id.clone(),
                 reply: sender,
             })
             .await

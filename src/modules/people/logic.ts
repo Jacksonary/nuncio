@@ -1,8 +1,11 @@
 /**
  * Pure helpers for the People module: alphabetical sectioning (including a
- * lightweight pinyin-initial heuristic for Chinese names), sorting according
- * to the contacts settings, contact name formatting, draft conversion and
- * validation. No React and no IPC here so everything is unit-testable.
+ * lightweight pinyin-initial heuristic for Chinese names), contact name
+ * formatting, draft conversion and validation. No React and no IPC here so
+ * everything is unit-testable.
+ *
+ * Sorting is fixed: contacts sort by first name and names display in
+ * "First Last" order.
  */
 import type {
   Address,
@@ -17,23 +20,15 @@ import type {
 /** How many contacts are requested per page from `contact_list`. */
 export const CONTACTS_PAGE_SIZE = 200;
 
-export type ContactSortBy = "firstName" | "lastName";
-export type ContactDisplayOrder = "firstLast" | "lastFirst";
+/** Name order used to compose a contact's name from its structured fields. */
+type ContactDisplayOrder = "firstLast" | "lastFirst";
 
 export interface PeopleListOptions {
-  sortBy: ContactSortBy;
-  displayOrder: ContactDisplayOrder;
   locale: string;
 }
 
 /** Alias used by the list component. */
 export type ContactListOptions = PeopleListOptions;
-
-export const DEFAULT_PEOPLE_OPTIONS: PeopleListOptions = {
-  sortBy: "firstName",
-  displayOrder: "firstLast",
-  locale: "zh-CN",
-};
 
 export const CONTACT_FIELD_TYPES: ContactFieldType[] = [
   "home",
@@ -53,28 +48,12 @@ export function isCjk(value: string | null | undefined): boolean {
   return Boolean(value && CJK_RE.test(value));
 }
 
-/** Split a display name into words, respecting CJK (no spaces needed). */
-function words(value: string): string[] {
-  return value
-    .trim()
-    .split(/\s+/u)
-    .filter(Boolean);
-}
-
 /**
- * name used for sorting and sectioning. `lastName` moves the last word to the
- * front ("John Smith" -> "Smith John"); CJK names have no spaces and are left
- * untouched (surname already comes first).
+ * Sort key used for sorting and sectioning: the display name as stored. CJK
+ * names carry no spaces and are already surname-first, so no reordering
+ * happens; Latin names are compared first-word-first.
  */
-export function nameSortKey(
-  displayName: string,
-  sortBy: ContactSortBy = "firstName",
-): string {
-  const parts = words(displayName);
-  if (sortBy === "lastName" && parts.length > 1) {
-    const last = parts[parts.length - 1];
-    return [last, ...parts.slice(0, -1)].join(" ");
-  }
+export function nameSortKey(displayName: string): string {
   return displayName.trim();
 }
 
@@ -121,18 +100,15 @@ export function isCustomDisplayName(contact: {
   );
 }
 
-export function formatContactName(
-  contact: {
-    displayName: string;
-    givenName: string;
-    familyName: string;
-    middleName?: string;
-    company?: string;
-    emails?: ContactField[];
-  },
-  displayOrder: ContactDisplayOrder = "firstLast",
-): string {
-  const structured = composeStructuredName(contact, displayOrder);
+export function formatContactName(contact: {
+  displayName: string;
+  givenName: string;
+  familyName: string;
+  middleName?: string;
+  company?: string;
+  emails?: ContactField[];
+}): string {
+  const structured = composeStructuredName(contact, "firstLast");
   if (structured) {
     // An explicitly different display name wins over the composed one.
     return isCustomDisplayName(contact) ? contact.displayName.trim() : structured;
@@ -145,17 +121,9 @@ export function formatContactName(
   return email ?? "";
 }
 
-/** List rows only know `displayName`; reorder the words when requested. */
-export function formatSummaryName(
-  displayName: string,
-  displayOrder: ContactDisplayOrder = "firstLast",
-): string {
-  const trimmed = displayName.trim();
-  if (displayOrder !== "lastFirst") return trimmed;
-  const parts = words(trimmed);
-  if (parts.length < 2) return trimmed;
-  const joined = [parts[parts.length - 1], ...parts.slice(0, -1)].join(" ");
-  return isCjk(trimmed) ? trimmed : joined;
+/** List rows only know `displayName`, shown as stored. */
+export function formatSummaryName(displayName: string): string {
+  return displayName.trim();
 }
 
 /* ─────────────────────── Alphabetical sectioning ───────────────────── */
@@ -249,11 +217,8 @@ export function firstMeaningfulChar(value: string): string {
  * Section label for a contact name: A–Z for Latin and (when the runtime
  * supports it) pinyin initials of Chinese names, "#" for everything else.
  */
-export function sectionLetter(
-  displayName: string,
-  sortBy: ContactSortBy = "firstName",
-): string {
-  const key = nameSortKey(displayName, sortBy);
+export function sectionLetter(displayName: string): string {
+  const key = nameSortKey(displayName);
   const char = firstMeaningfulChar(key);
   if (!char) return OTHER_SECTION;
   // Strip diacritics so "Émile" lands under E, like Windows Contacts.
@@ -281,11 +246,11 @@ export function getCollator(locale: string): Intl.Collator {
 export function compareContacts(
   a: ContactSummary,
   b: ContactSummary,
-  options: Pick<PeopleListOptions, "sortBy" | "locale">,
+  options: PeopleListOptions,
 ): number {
   const collator = getCollator(options.locale);
-  const keyA = nameSortKey(a.displayName, options.sortBy);
-  const keyB = nameSortKey(b.displayName, options.sortBy);
+  const keyA = nameSortKey(a.displayName);
+  const keyB = nameSortKey(b.displayName);
   const primary = collator.compare(keyA, keyB);
   if (primary !== 0) return primary;
   return collator.compare(a.displayName, b.displayName);
@@ -302,7 +267,7 @@ export function buildPeopleRows(
 ): PeopleRow[] {
   const labels = new Map<string, string>();
   for (const contact of contacts) {
-    labels.set(contact.id, sectionLetter(contact.displayName, options.sortBy));
+    labels.set(contact.id, sectionLetter(contact.displayName));
   }
   const sorted = [...contacts].sort((a, b) => {
     const rankA = sectionRank(labels.get(a.id) ?? OTHER_SECTION);
@@ -315,7 +280,7 @@ export function buildPeopleRows(
   let header: Extract<PeopleRow, { kind: "header" }> | null = null;
   let contactIndex = 0;
   for (const contact of sorted) {
-    const label = sectionLetter(contact.displayName, options.sortBy);
+    const label = sectionLetter(contact.displayName);
     if (label !== currentLabel) {
       currentLabel = label;
       header = { kind: "header", key: `h:${label}`, label, count: 0 };
@@ -352,11 +317,10 @@ export function primaryPhone(contact: Pick<Contact, "phones">): string | null {
 /** Recipient for composing a mail to this contact, or null without e-mail. */
 export function contactRecipient(
   contact: Pick<Contact, "displayName" | "givenName" | "familyName" | "emails">,
-  displayOrder: ContactDisplayOrder = "firstLast",
 ): Address | null {
   const email = primaryEmail(contact);
   if (!email) return null;
-  const name = formatContactName(contact, displayOrder).trim();
+  const name = formatContactName(contact).trim();
   return { name: name || null, email };
 }
 
@@ -683,16 +647,13 @@ export function draftToContact(draft: ContactDraft): Contact {
   const emails = cleanFields(draft.emails);
   const phones = cleanFields(draft.phones);
   const websites = draft.websites.map((value) => value.trim()).filter(Boolean);
-  const composed = formatContactName(
-    {
-      displayName: draft.displayName,
-      givenName: draft.givenName,
-      familyName: draft.familyName,
-      middleName: draft.middleName,
-      company: draft.company,
-    },
-    "firstLast",
-  );
+  const composed = formatContactName({
+    displayName: draft.displayName,
+    givenName: draft.givenName,
+    familyName: draft.familyName,
+    middleName: draft.middleName,
+    company: draft.company,
+  });
   const displayName =
     draft.displayName.trim() ||
     composed ||

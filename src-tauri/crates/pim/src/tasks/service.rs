@@ -630,7 +630,6 @@ impl TasksService {
             return Err(invalid("task title must not be empty"));
         }
         let list_id = list_id.to_string();
-        let new_tasks_on_top = self.ctx.settings.current().tasks.new_tasks_on_top;
         let (task, account_id) = self
             .ctx
             .db
@@ -641,16 +640,8 @@ impl TasksService {
                     if list.is_read_only {
                         return Err(invalid("task list is read-only"));
                     }
+                    // New tasks are prepended (sort_order = MIN - 1).
                     let task = tasks_repo::create(conn, &list_id, &input)?;
-                    if !new_tasks_on_top {
-                        // Append instead of prepending.
-                        conn.execute(
-                            "UPDATE task SET sort_order =
-                                 (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM task WHERE list_id = ?1)
-                             WHERE id = ?2",
-                            rusqlite::params![list_id, task.id],
-                        )?;
-                    }
                     let task = tasks_repo::get_required(conn, &task.id)?;
                     Ok((task, list.account_id))
                 }

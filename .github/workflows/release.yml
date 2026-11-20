@@ -26,12 +26,9 @@ jobs:
           - platform: macos-latest
             target: aarch64-apple-darwin
             bundles: dmg,app
-          # GitHub retired the macos-13 image in December 2025; macos-15-intel
-          # is the official x86_64 macOS runner and builds the Intel DMG
-          # natively (no cross-compilation needed).
-          - platform: macos-15-intel
-            target: x86_64-apple-darwin
-            bundles: dmg,app
+          # No Intel (x86_64) macOS build: Apple Silicon is the supported Mac
+          # target. Re-add a `macos-15-intel` / `x86_64-apple-darwin` entry here
+          # if Intel support is ever needed again.
           - platform: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             bundles: deb,appimage
@@ -156,6 +153,10 @@ jobs:
             下载对应平台的安装包即可。macOS 未公证的构建请右键打开，或执行 `xattr -cr /Applications/Nuncio.app`。
 
             Download the installer for your platform. Unsigned macOS builds may require right-click → Open, or `xattr -cr /Applications/Nuncio.app`.
+
+            Windows 安装包需要管理员权限，会安装到 Program Files。如果之前安装过 v0.1.4 及更早版本（安装在当前用户目录），请先卸载旧版本再安装，否则会同时存在两份。
+
+            Windows: the installer needs administrator rights and installs to Program Files. If you installed v0.1.4 or earlier (per-user install), uninstall it first, or you will end up with two copies.
           releaseDraft: false
           prerelease: false
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --config src-tauri/ci.config.json
@@ -242,7 +243,7 @@ jobs:
           if [ -z "${RELEASE_ID}" ]; then
             BODY=$(jq -n --arg t "${GITEE_TOKEN}" --arg tag "${TAG}" --arg sha "${GITHUB_SHA}" \
               '{access_token: $t, tag_name: $tag, target_commitish: $sha, name: ("Nuncio " + $tag),
-                body: "下载对应平台的安装包即可。macOS 未公证的构建请执行 `xattr -cr /Applications/Nuncio.app`。\n\nDownload the installer for your platform.",
+                body: "下载对应平台的安装包即可。macOS 未公证的构建请执行 `xattr -cr /Applications/Nuncio.app`。\n\nWindows 安装包需要管理员权限，会安装到 Program Files。如果之前安装过 v0.1.4 及更早版本（安装在当前用户目录），请先卸载旧版本再安装，否则会同时存在两份。\n\nDownload the installer for your platform. Windows: the installer needs administrator rights and installs to Program Files. If you installed v0.1.4 or earlier (per-user install), uninstall it first, or you will end up with two copies.",
                 prerelease: false}')
             RESPONSE=$(curl -s -X POST "${API}/releases" -H "Content-Type: application/json" -d "${BODY}")
             RELEASE_ID=$(echo "${RESPONSE}" | jq -r '.id // empty')

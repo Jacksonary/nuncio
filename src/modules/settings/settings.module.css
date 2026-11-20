@@ -181,6 +181,137 @@
   color: var(--text-secondary);
 }
 
+/* A group hosts several sections under one heading on merged pages. */
+
+.group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.groupHeader {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-2);
+}
+
+.groupHeading {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.groupHint {
+  color: var(--text-secondary);
+  font-size: var(--font-caption);
+  line-height: var(--line-caption);
+}
+
+.groupTitle {
+  margin: 0;
+  font-size: var(--font-body);
+  line-height: var(--line-body);
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+}
+
+.groupBody {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding-left: var(--sp-3);
+  border-left: 2px solid var(--border-subtle);
+}
+
+/* Collapsed block inside a page (advanced options at the bottom of a page). */
+
+.disclosure {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.disclosureToggle {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  align-self: flex-start;
+  padding: var(--sp-2) var(--sp-2);
+  border: none;
+  border-radius: var(--radius-m);
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-weight: var(--weight-medium);
+  cursor: pointer;
+}
+
+.disclosureToggle:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.disclosureToggle:focus-visible {
+  outline: var(--focus-outline);
+  outline-offset: -2px;
+}
+
+.disclosureChevron {
+  display: inline-flex;
+  transition: transform var(--duration-fast) var(--ease);
+}
+
+.disclosureChevronOpen {
+  transform: rotate(90deg);
+}
+
+.disclosureBody {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+}
+
+/* A row that navigates to a sub-page rather than hosting a control. */
+
+.navRow {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  width: 100%;
+  padding: var(--sp-3);
+  border: none;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.navRow:hover {
+  background: var(--surface-hover);
+}
+
+.navRow:focus-visible {
+  outline: var(--focus-outline);
+  outline-offset: -2px;
+}
+
+.navRowText {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.navRowChevron {
+  flex: none;
+  color: var(--text-tertiary);
+  display: inline-flex;
+}
+
 .card {
   display: flex;
   flex-direction: column;

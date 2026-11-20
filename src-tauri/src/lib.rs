@@ -250,9 +250,8 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_notification::init())
-        // Do not append `--minimized`: the `start_minimized` setting is the
-        // single source of truth, otherwise enabling autostart would silently
-        // override a disabled "start minimized" preference.
+        // Do not append `--minimized` to the autostart command: a login launch
+        // should behave like a normal start and show the window.
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,

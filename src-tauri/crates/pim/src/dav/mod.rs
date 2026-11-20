@@ -721,18 +721,23 @@ impl DavClient {
         hrefs: &[String],
     ) -> Result<Vec<(String, Option<String>, String)>> {
         let mut out = Vec::new();
+        let mut missing = 0usize;
         for batch in hrefs.chunks(50) {
             let headers = vec![(
                 "Content-Type".to_string(),
                 "application/xml; charset=utf-8".to_string(),
             )];
             let method = method("REPORT")?;
+            let requested: Vec<String> = batch
+                .iter()
+                .map(|href| request_href(collection, href))
+                .collect();
             let response = self
                 .send(
                     &method,
                     collection,
                     &headers,
-                    Some(&multiget_body(kind.home_kind(), batch)),
+                    Some(&multiget_body(kind.home_kind(), &requested)),
                 )
                 .await?;
             if !response.status().is_success() {
@@ -745,14 +750,26 @@ impl DavClient {
             let multistatus = parse_multistatus(&text)?;
             for item in multistatus.responses {
                 if item.not_found {
+                    missing += 1;
                     continue;
                 }
                 let href = self.resolve_url(collection, &item.href);
                 let Some(data) = item.prop.data else {
+                    missing += 1;
                     continue;
                 };
                 out.push((href, item.prop.etag, data));
             }
+        }
+        // A server that answers every reference with "not found" is not telling
+        // us the resources are gone, it is refusing the request form. Returning
+        // an empty list here made the caller record the collection tag as if the
+        // sync had worked, and nothing was ever fetched again.
+        if out.is_empty() && !hrefs.is_empty() {
+            return Err(protocol(format!(
+                "the server returned no data for any of the {} requested resources ({missing} reported missing)",
+                hrefs.len()
+            )));
         }
         Ok(out)
     }
@@ -778,7 +795,9 @@ impl DavClient {
             })
             .or_else(|| multistatus.responses.first());
         let ctag = collection_response.and_then(|response| response.prop.ctag.clone());
-        let sync_token = collection_response.and_then(|response| response.prop.sync_token.clone());
+        let sync_token = collection_response
+            .and_then(|response| response.prop.sync_token.clone())
+            .filter(|token| !token.trim().is_empty());
         let mut etags = Vec::new();
         for response in &multistatus.responses {
             let Some(etag) = response.prop.etag.clone() else {
@@ -807,7 +826,7 @@ impl DavClient {
         let collection_url = ensure_trailing_slash(&collection);
         let mut delta = ResourceDelta::default();
 
-        if let Some(token) = cursor.sync_token.clone() {
+        if let Some(token) = cursor.sync_token.clone().filter(|token| !token.is_empty()) {
             let headers = vec![(
                 "Content-Type".to_string(),
                 "application/xml; charset=utf-8".to_string(),
@@ -862,7 +881,7 @@ impl DavClient {
         }
 
         let (new_ctag, new_sync_token, etags) = self.collection_etags(kind, &collection).await?;
-        if cursor.ctag.is_some() && cursor.ctag == new_ctag {
+        if ctag_proves_unchanged(cursor, new_ctag.as_deref()) {
             delta.ctag = new_ctag;
             delta.sync_token = new_sync_token.or_else(|| cursor.sync_token.clone());
             delta.full_sync = false;
@@ -1413,6 +1432,68 @@ mod origin_tests {
     }
 
     #[test]
+    fn multiget_references_use_the_path_form_for_same_origin_urls() {
+        let collection = "https://contacts.163.com/carddav/abc/contacts/";
+        assert_eq!(
+            request_href(
+                collection,
+                "https://contacts.163.com/carddav/abc/contacts/one.vcf"
+            ),
+            "/carddav/abc/contacts/one.vcf"
+        );
+        // A path the server gave us stays exactly as it is.
+        assert_eq!(
+            request_href(collection, "/carddav/abc/contacts/one.vcf"),
+            "/carddav/abc/contacts/one.vcf"
+        );
+        // Query strings are part of the reference.
+        assert_eq!(
+            request_href(collection, "https://contacts.163.com/carddav/x.vcf?a=1"),
+            "/carddav/x.vcf?a=1"
+        );
+    }
+
+    #[test]
+    fn multiget_references_to_other_origins_are_left_alone() {
+        let collection = "https://contacts.163.com/carddav/abc/contacts/";
+        let other_host = "https://evil.example.com/carddav/abc/contacts/one.vcf";
+        assert_eq!(request_href(collection, other_host), other_host);
+        let other_scheme = "http://contacts.163.com/carddav/abc/contacts/one.vcf";
+        assert_eq!(request_href(collection, other_scheme), other_scheme);
+        let other_port = "https://contacts.163.com:8443/carddav/abc/contacts/one.vcf";
+        assert_eq!(request_href(collection, other_port), other_port);
+    }
+
+    fn cursor(ctag: Option<&str>, etags: &[(&str, &str)]) -> CalendarCursor {
+        CalendarCursor {
+            local_calendar_id: "book".into(),
+            sync_token: None,
+            ctag: ctag.map(str::to_string),
+            etags: etags
+                .iter()
+                .map(|(href, etag)| (href.to_string(), etag.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn an_unchanged_tag_only_proves_anything_when_we_hold_the_resources() {
+        let held = cursor(Some("42"), &[("/a.vcf", "\"1\"")]);
+        assert!(ctag_proves_unchanged(&held, Some("42")));
+        assert!(!ctag_proves_unchanged(&held, Some("43")));
+        assert!(!ctag_proves_unchanged(&held, None));
+    }
+
+    #[test]
+    fn an_unchanged_tag_with_nothing_stored_does_not_short_circuit() {
+        // The state a failed first sync leaves behind: tag recorded, no resources.
+        let stuck = cursor(Some("-1889622814"), &[]);
+        assert!(!ctag_proves_unchanged(&stuck, Some("-1889622814")));
+        // A first sync has no tag at all.
+        assert!(!ctag_proves_unchanged(&cursor(None, &[]), Some("1")));
+    }
+
+    #[test]
     fn accepts_same_origin_and_relative_hrefs() {
         let base = "https://dav.example.com/cal/";
         assert_eq!(
@@ -1519,6 +1600,38 @@ fn ensure_trailing_slash(value: &str) -> String {
     } else {
         format!("{value}/")
     }
+}
+
+/// The form of a resource reference to put in a `*-multiget` request.
+///
+/// Servers list members as path references (`/carddav/…/x.vcf`). We resolve
+/// those to absolute URLs internally, but some servers answer a multiget for an
+/// absolute URL with 404 for every resource: NetEase's `contacts.163.com`
+/// returns 200 for the path and 404 for the very same resource as a full URL.
+/// Same-origin absolute URLs are therefore sent as their path (and query);
+/// anything else is passed through untouched.
+fn request_href(collection: &str, href: &str) -> String {
+    let (Ok(base), Ok(target)) = (Url::parse(collection), Url::parse(href)) else {
+        return href.to_string();
+    };
+    if base.scheme() != target.scheme()
+        || base.host_str() != target.host_str()
+        || base.port_or_known_default() != target.port_or_known_default()
+    {
+        return href.to_string();
+    }
+    match target.query() {
+        Some(query) => format!("{}?{}", target.path(), query),
+        None => target.path().to_string(),
+    }
+}
+
+/// A matching collection tag proves "nothing changed" only if we actually hold
+/// what we saw. An unchanged tag with an empty local set is the signature of an
+/// earlier sync that fetched nothing and still recorded the tag; trusting it
+/// would leave the collection empty forever.
+fn ctag_proves_unchanged(cursor: &CalendarCursor, new_ctag: Option<&str>) -> bool {
+    cursor.ctag.is_some() && cursor.ctag.as_deref() == new_ctag && !cursor.etags.is_empty()
 }
 
 fn same_href(left: &str, right: &str) -> bool {

@@ -371,3 +371,26 @@
     transition: none;
   }
 }
+
+/* A manual sync is running: same icon, turning, not clickable. */
+.syncNowBusy {
+  pointer-events: none;
+  cursor: default;
+}
+
+.syncNowBusy .syncNowIcon {
+  animation: syncNowSpin 0.9s linear infinite;
+}
+
+@keyframes syncNowSpin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .syncNowBusy .syncNowIcon {
+    animation: none;
+    opacity: 0.5;
+  }
+}

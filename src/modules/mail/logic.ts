@@ -7,6 +7,7 @@ import type {
   FolderRole,
   MailFilter,
   MessageSummary,
+  SearchCoverage,
 } from "@/ipc/types";
 import { addDays, isSameDay, isThisWeek, startOfWeek } from "@/lib/format";
 
@@ -189,36 +190,42 @@ export function constrainToResultSet(
 }
 
 /**
- * Pick the message that should be opened after deleting `removed` from the
- * ordered id list, honouring the auto-advance preference.
+ * Pick the message that should be open after `removed` leaves `ordered`.
+ *
+ * Positions are taken from the removed rows themselves, never from the open
+ * message: removing a row that is not the open one (hover button, context
+ * menu, multi-select) must not change what is open, and a removed open message
+ * is replaced by the nearest survivor below the lowest removed row, else above
+ * the highest one. Nothing open stays nothing open.
  */
 export function nextAfterRemoval(
   ordered: string[],
   removed: Set<string>,
   current: string | null,
-  mode: "next" | "previous" | "list",
 ): string | null {
-  if (mode === "list") return null;
-  const currentIndex = current ? ordered.indexOf(current) : -1;
-  const remaining = ordered.filter((id) => !removed.has(id) && id !== current);
-  if (remaining.length === 0) return null;
-  if (currentIndex < 0) return remaining[0];
-  if (mode === "previous") {
-    for (let index = currentIndex - 1; index >= 0; index -= 1) {
-      const id = ordered[index];
-      if (id && !removed.has(id)) return id;
-    }
-    return remaining[remaining.length - 1] ?? null;
-  }
-  for (let index = currentIndex + 1; index < ordered.length; index += 1) {
+  if (!current) return null;
+  if (!removed.has(current)) return ordered.includes(current) ? current : null;
+  const lowest = ordered.findIndex((id) => removed.has(id));
+  for (let index = lowest + 1; index < ordered.length; index += 1) {
     const id = ordered[index];
     if (id && !removed.has(id)) return id;
   }
-  for (let index = currentIndex - 1; index >= 0; index -= 1) {
+  // Nothing survives below the lowest removed row, so every row from there
+  // down is removed too: the nearest survivor above is the one before it.
+  for (let index = lowest - 1; index >= 0; index -= 1) {
     const id = ordered[index];
     if (id && !removed.has(id)) return id;
   }
-  return remaining[0] ?? null;
+  return null;
+}
+
+/**
+ * Row to reveal once "load older" has appended rows below a list that was
+ * `previousCount` rows long; null while nothing was appended. Older rows sort
+ * after every existing one, so the first appended row sits at `previousCount`.
+ */
+export function firstAppendedRowIndex(previousCount: number, nextCount: number): number | null {
+  return previousCount > 0 && nextCount > previousCount ? previousCount : null;
 }
 
 /* ───────────────────────────── Empty states ──────────────────────────── */
@@ -635,4 +642,41 @@ export function safeFilename(subject: string, fallback: string): string {
 
 export function isDraftSummary(summary: Pick<MessageSummary, "folderId" | "isDraft">): boolean {
   return summary.isDraft;
+}
+
+/* ───────────────────────────── Search coverage ────────────────────────── */
+
+export interface CoverageNotice {
+  key: string;
+  params?: Record<string, string | number>;
+}
+
+/**
+ * The one quiet line shown above search results. It states how the results
+ * were produced so an empty or short list is never read as "nothing matches"
+ * when only part of the mailbox was looked at.
+ */
+export function searchCoverageNotice(
+  coverage: SearchCoverage | null | undefined,
+): CoverageNotice | null {
+  if (!coverage) return null;
+  switch (coverage.kind) {
+    case "localOnly":
+      return { key: "mail.search.coverage.localOnly" };
+    case "server":
+      return { key: "mail.search.coverage.server" };
+    case "scanned":
+      return {
+        key:
+          coverage.scanned < coverage.total
+            ? "mail.search.coverage.scannedPartial"
+            : "mail.search.coverage.scanned",
+        params: { scanned: coverage.scanned, total: coverage.total },
+      };
+    case "serverUnavailable":
+      return {
+        key: "mail.search.coverage.unavailable",
+        params: { message: coverage.message },
+      };
+  }
 }

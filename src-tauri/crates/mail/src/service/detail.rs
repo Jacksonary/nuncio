@@ -5,8 +5,7 @@ use std::path::PathBuf;
 
 use nuncio_core::events::MailChangeKind;
 use nuncio_core::models::{
-    Account, Address, Attachment, CalendarEvent, InvitePreview, MarkReadMode, MessageDetail,
-    MessageSummary,
+    Account, Address, Attachment, CalendarEvent, InvitePreview, MessageDetail, MessageSummary,
 };
 use nuncio_core::{events, repo, AppError, Result};
 use nuncio_mime::{
@@ -22,6 +21,20 @@ impl MailService {
     /// Full message detail. Downloads the body when needed, applies the
     /// remote-content policy, renders sanitized HTML and detects invitations.
     pub async fn message_get(&self, id: &str, allow_remote: bool) -> Result<MessageDetail> {
+        self.message_get_with(id, allow_remote, false).await
+    }
+
+    /// Same as [`Self::message_get`], with an explicit rendering choice.
+    ///
+    /// `light_background` forces a white message body even under a dark theme.
+    /// It is a per-request, per-view choice made from the reader toolbar and is
+    /// never stored: by default the body follows the app theme.
+    pub async fn message_get_with(
+        &self,
+        id: &str,
+        allow_remote: bool,
+        light_background: bool,
+    ) -> Result<MessageDetail> {
         if let Some(item) = self.outbox_item(id).await? {
             return self.outbox_detail(&item, allow_remote).await;
         }
@@ -30,7 +43,10 @@ impl MailService {
         // A body download refreshes headers/attachments/preview in the DB.
         stored = self.stored(id).await?;
 
-        if self.inner.ctx.settings.current().mail.mark_read_mode == MarkReadMode::OnOpen {
+        // A re-render on a white background is a view-only request for a message
+        // that is already open. Marking it read again would silently undo a
+        // "mark as unread" the user made after opening it.
+        if !light_background {
             self.mark_seen_on_open(&mut stored).await?;
         }
 
@@ -67,14 +83,13 @@ impl MailService {
                 None
             });
 
-        let settings = self.inner.ctx.settings.current();
         let rendered = nuncio_mime::render_document(RenderInput {
             html: parsed.html.clone(),
             text: parsed.text.clone(),
             message_id: summary.id.clone(),
             allow_remote: allow,
             cid_base: self.cid_base().to_string(),
-            light_background: settings.mail.light_message_background,
+            light_background,
         });
         let text = parsed
             .text
@@ -170,14 +185,13 @@ impl MailService {
         let allow = self
             .remote_content_allowed(allow_remote, summary.r#from.as_ref())
             .await?;
-        let settings = self.inner.ctx.settings.current();
         let rendered = nuncio_mime::render_document(RenderInput {
             html: parsed.html.clone(),
             text: parsed.text.clone(),
             message_id: message_id.clone(),
             allow_remote: allow,
             cid_base: self.cid_base().to_string(),
-            light_background: settings.mail.light_message_background,
+            light_background: false,
         });
         let text = parsed
             .text
@@ -288,14 +302,13 @@ impl MailService {
         let allow = self
             .remote_content_allowed(false, summary.r#from.as_ref())
             .await?;
-        let settings = self.inner.ctx.settings.current();
         let rendered = nuncio_mime::render_document(RenderInput {
             html: parsed.html.clone(),
             text: parsed.text.clone(),
             message_id: message_id.clone(),
             allow_remote: allow,
             cid_base: self.cid_base().to_string(),
-            light_background: settings.mail.light_message_background,
+            light_background: false,
         });
         let text = parsed
             .text

@@ -2,12 +2,18 @@
  * Thin wrapper around @tanstack/react-virtual. Handles the scroll container,
  * absolute row positioning and an optional end-reached callback for paging.
  */
-import { useEffect, useRef, type ReactNode } from "react";
+import { useEffect, useImperativeHandle, useRef, type ReactNode, type Ref } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { cn } from "@/lib/cn";
 import styles from "./VirtualList.module.css";
 
+/** Imperative API; uses the virtualizer's measured row positions. */
+export interface VirtualListHandle {
+  scrollToIndex: (index: number, options?: { align?: "start" | "center" | "end" | "auto" }) => void;
+}
+
 export interface VirtualListProps<T> {
+  handleRef?: Ref<VirtualListHandle>;
   items: T[];
   renderItem: (item: T, index: number) => ReactNode;
   /** Estimated row height; rows are measured after mount. */
@@ -30,6 +36,7 @@ export interface VirtualListProps<T> {
 }
 
 export function VirtualList<T>({
+  handleRef,
   items,
   renderItem,
   estimateSize = 56,
@@ -55,6 +62,17 @@ export function VirtualList<T>({
       return getKey && item !== undefined ? getKey(item, index) : index;
     },
   });
+
+  useImperativeHandle(
+    handleRef,
+    () => ({
+      scrollToIndex: (index, options) => {
+        if (index < 0 || index >= items.length) return;
+        virtualizer.scrollToIndex(index, { align: options?.align ?? "auto" });
+      },
+    }),
+    [virtualizer, items.length],
+  );
 
   const virtualItems = virtualizer.getVirtualItems();
   const lastIndex = virtualItems.length > 0 ? virtualItems[virtualItems.length - 1].index : -1;

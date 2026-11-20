@@ -37,6 +37,13 @@ pub(crate) enum AccountCommand {
         criteria: String,
         reply: oneshot::Sender<Result<Vec<String>>>,
     },
+    /// Header-scan fallback for servers whose content SEARCH is broken.
+    Scan {
+        folder_id: String,
+        query: nuncio_core::models::SearchQuery,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        reply: oneshot::Sender<Result<sync::messages::ScanOutcome>>,
+    },
     Append {
         folder_id: String,
         bytes: Vec<u8>,
@@ -74,6 +81,11 @@ pub(crate) enum AccountCommand {
     },
     ExecuteOps {
         reply: Option<oneshot::Sender<Result<()>>>,
+    },
+    /// User-driven "load older mail" batch for one folder.
+    LoadOlder {
+        folder_id: String,
+        reply: oneshot::Sender<Result<nuncio_core::models::LoadOlderResult>>,
     },
     Reconnect,
     /// NOOP keepalive for accounts whose server has no IDLE support.
@@ -647,6 +659,29 @@ async fn handle_command(worker: &mut Worker, command: AccountCommand) {
                 .await;
             let _ = reply.send(result);
         }
+        AccountCommand::Scan {
+            folder_id,
+            query,
+            cancel,
+            reply,
+        } => {
+            let result = worker
+                .run_conn_read(move |conn, account, ctx| {
+                    let folder_id = folder_id.clone();
+                    let query = query.clone();
+                    let cancel = cancel.clone();
+                    Box::pin(async move {
+                        let folder = ctx
+                            .db
+                            .read(move |db| repo::folders::get_required(db, &folder_id))
+                            .await?;
+                        sync::messages::server_scan(&ctx, conn, account, &folder, &query, &cancel)
+                            .await
+                    })
+                })
+                .await;
+            let _ = reply.send(result);
+        }
         AccountCommand::Append {
             folder_id,
             bytes,
@@ -848,6 +883,27 @@ async fn handle_command(worker: &mut Worker, command: AccountCommand) {
                                 Ok(())
                             })
                             .await
+                    })
+                })
+                .await;
+            let _ = reply.send(result);
+        }
+        AccountCommand::LoadOlder { folder_id, reply } => {
+            let result = worker
+                .run_conn_read(move |conn, account, ctx| {
+                    let folder_id = folder_id.clone();
+                    Box::pin(async move {
+                        let id = folder_id.clone();
+                        let folder = ctx
+                            .db
+                            .read(move |db| repo::folders::get_required(db, &id))
+                            .await?;
+                        if folder.account_id != account.id {
+                            return Err(AppError::invalid_input(
+                                "folder belongs to another account",
+                            ));
+                        }
+                        sync::messages::load_older_imap(&ctx, conn, account, &folder).await
                     })
                 })
                 .await;
@@ -1420,6 +1476,11 @@ async fn handle_graph_command(ctx: &CoreContext, account_id: &str, command: Acco
                 "attachment download is not yet implemented for Microsoft Graph accounts",
             )));
         }
+        AccountCommand::Scan { reply, .. } => {
+            let _ = reply.send(Err(AppError::unsupported(
+                "header scan is not available for Microsoft Graph accounts",
+            )));
+        }
         AccountCommand::Search { reply, .. } => {
             // Graph `$search` is not wired; the caller already falls back to
             // the local full-text index.
@@ -1507,6 +1568,20 @@ async fn handle_graph_command(ctx: &CoreContext, account_id: &str, command: Acco
                 "emptying a folder is not supported for Microsoft Graph accounts",
             )));
         }
+        AccountCommand::LoadOlder { folder_id, reply } => {
+            let result = async {
+                let folder = ctx
+                    .db
+                    .read(move |db| repo::folders::get_required(db, &folder_id))
+                    .await?;
+                if folder.account_id != account.id {
+                    return Err(AppError::invalid_input("folder belongs to another account"));
+                }
+                sync::messages::load_older_graph(ctx, &account, &folder).await
+            }
+            .await;
+            let _ = reply.send(result);
+        }
         AccountCommand::ExecuteOps { reply } => {
             let result = async {
                 let outcome = ops::executor::run_due_graph(ctx, &account).await?;
@@ -1571,6 +1646,9 @@ fn respond_graph_error(command: AccountCommand, error: &AppError) {
         AccountCommand::Search { reply, .. } => {
             let _ = reply.send(Err(AppError::internal(message)));
         }
+        AccountCommand::Scan { reply, .. } => {
+            let _ = reply.send(Err(AppError::internal(message)));
+        }
         AccountCommand::Append { reply, .. } => {
             let _ = reply.send(Err(AppError::internal(message)));
         }
@@ -1593,6 +1671,9 @@ fn respond_graph_error(command: AccountCommand, error: &AppError) {
             let _ = reply.send(Err(AppError::internal(message)));
         }
         AccountCommand::Expunge { reply, .. } => {
+            let _ = reply.send(Err(AppError::internal(message)));
+        }
+        AccountCommand::LoadOlder { reply, .. } => {
             let _ = reply.send(Err(AppError::internal(message)));
         }
         AccountCommand::ExecuteOps { reply } => {

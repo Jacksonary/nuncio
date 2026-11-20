@@ -2,11 +2,13 @@
 //! mail-rule execution.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use nuncio_core::events::MailChangeKind;
 use nuncio_core::models::{
     Address, Attachment, Folder, FolderRole, Importance, MailFilter, MailRule, MailScope,
     MessageAction, MessageListQuery, MessagePage, MessageSummary, PageCursor, ProviderKind,
+    SearchCoverage,
     SearchQuery, StoredMessage,
 };
 use nuncio_core::{events, repo, AppError, Result};
@@ -140,6 +142,17 @@ pub(crate) struct UndoPayload {
     pub op_ids: Vec<String>,
 }
 
+/// How long a paged search may reuse its server result.
+const SEARCH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Cached outcome of the last server search (see `cached_server_search`).
+pub(crate) struct SearchCacheEntry {
+    key: String,
+    stored: std::time::Instant,
+    ids: Vec<String>,
+    coverage: SearchCoverage,
+}
+
 #[derive(Debug, Clone)]
 struct Target {
     message: StoredMessage,
@@ -179,11 +192,24 @@ impl MailService {
         }
 
         let mut server_ids: Vec<String> = Vec::new();
+        let mut coverage = None;
         if let MailScope::Search { query: search } = &query.scope {
+            coverage = Some(SearchCoverage::LocalOnly);
             if search.include_server {
-                match self.server_search(search).await {
-                    Ok(ids) => server_ids = ids,
-                    Err(error) => debug!(%error, "server-side search fallback failed"),
+                match self
+                    .cached_server_search(search, query.cursor.is_some())
+                    .await
+                {
+                    Ok((ids, found)) => {
+                        server_ids = ids;
+                        coverage = Some(found);
+                    }
+                    Err(error) => {
+                        warn!(%error, "server-side search failed");
+                        coverage = Some(SearchCoverage::ServerUnavailable {
+                            message: error.to_string(),
+                        });
+                    }
                 }
             }
         }
@@ -191,15 +217,56 @@ impl MailService {
         if !server_ids.is_empty() {
             if let MailScope::Search { query: search } = &query.scope {
                 if !search.text.trim().is_empty() {
-                    return self.merged_search_page(&query, &server_ids, search).await;
+                    let mut page = self.merged_search_page(&query, &server_ids, search).await?;
+                    page.coverage = coverage;
+                    return Ok(page);
                 }
             }
         }
-        self.inner
+        let mut page = self
+            .inner
             .ctx
             .db
             .read(move |db| repo::messages::list(db, &query))
-            .await
+            .await?;
+        page.coverage = coverage;
+        Ok(page)
+    }
+
+    /// [`Self::server_search`], reusing the previous result while the same
+    /// query is paged (a header scan costs many round trips).
+    async fn cached_server_search(
+        &self,
+        search: &SearchQuery,
+        paging: bool,
+    ) -> Result<(Vec<String>, SearchCoverage)> {
+        let key = serde_json::to_string(search).unwrap_or_default();
+        if paging {
+            let cache = self.inner.search_cache.lock().expect("search cache lock");
+            if let Some(entry) = cache.as_ref() {
+                if entry.key == key && entry.stored.elapsed() < SEARCH_CACHE_TTL {
+                    return Ok((entry.ids.clone(), entry.coverage.clone()));
+                }
+            }
+        }
+        let cancel = {
+            let mut current = self.inner.scan_cancel.lock().expect("scan cancel lock");
+            current.store(true, std::sync::atomic::Ordering::Relaxed);
+            let next = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            *current = next.clone();
+            next
+        };
+        let (ids, coverage) = self.server_search(search, &cancel).await?;
+        if !cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            *self.inner.search_cache.lock().expect("search cache lock") =
+                Some(SearchCacheEntry {
+                    key,
+                    stored: std::time::Instant::now(),
+                    ids: ids.clone(),
+                    coverage: coverage.clone(),
+                });
+        }
+        Ok((ids, coverage))
     }
 
     /// Outbox rows for a unified outbox or the virtual per-account folder.
@@ -216,6 +283,7 @@ impl MailService {
                 items: Vec::new(),
                 next_cursor: None,
                 total: 0,
+                coverage: None,
             });
         }
         let account_ids: Vec<String> = match folder {
@@ -315,6 +383,7 @@ impl MailService {
             items: summaries,
             next_cursor,
             total,
+            coverage: None,
         })
     }
 
@@ -334,11 +403,19 @@ impl MailService {
     }
 
     /// Run `UID SEARCH` on the relevant account/folder(s) and cache results.
-    /// Returns the local ids of every server hit.
-    async fn server_search(&self, query: &nuncio_core::models::SearchQuery) -> Result<Vec<String>> {
+    /// Accounts whose server cannot search content are header-scanned instead.
+    /// Returns the local ids of every server hit and how they were produced.
+    async fn server_search(
+        &self,
+        query: &nuncio_core::models::SearchQuery,
+        cancel: &Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<(Vec<String>, SearchCoverage)> {
         let Some(criteria) = crate::sync::messages::imap_search_criteria(query) else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), SearchCoverage::LocalOnly));
         };
+        let scan_terms = crate::sync::messages::ScanTerms::from_query(query);
+        let (mut scanned_total, mut scanned_of, mut scanned_any, mut native_any) =
+            (0u32, 0u32, false, false);
         let accounts = match query.account_id.as_deref() {
             Some(account_id) => vec![self.account(account_id).await?],
             None => {
@@ -357,13 +434,10 @@ impl MailService {
             }
             // Some servers accept UID SEARCH but cannot answer it: QQ and
             // NetEase return no hits, 139 ignores the criteria and returns
-            // every message. Leave those accounts to the local index rather
-            // than losing body matches or flooding the result set.
-            if !nuncio_core::providers::server_text_search(&account) {
-                debug!(
-                    account = %account.id,
-                    "provider text search is unreliable; using the local index"
-                );
+            // every message. Those accounts get a header scan below (content
+            // terms only) instead of a SEARCH.
+            let scan_instead = !nuncio_core::providers::server_text_search(&account);
+            if scan_instead && scan_terms.is_empty() {
                 continue;
             }
             let folder = match query.folder_id.as_deref() {
@@ -387,6 +461,55 @@ impl MailService {
                 }
             };
             let Some(folder) = folder else { continue };
+            if scan_instead {
+                let scan = match self
+                    .inner
+                    .engine
+                    .server_scan(&account.id, &folder.id, query, cancel.clone())
+                    .await
+                {
+                    Err(error) if matches!(error.code(), "notFound" | "internal") => {
+                        match crate::imap::connect_account(&self.inner.ctx, &account).await {
+                            Ok(mut connection) => {
+                                crate::sync::messages::server_scan(
+                                    &self.inner.ctx,
+                                    &mut connection,
+                                    &account,
+                                    &folder,
+                                    query,
+                                    cancel,
+                                )
+                                .await
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                    other => other,
+                };
+                match scan {
+                    Ok(outcome) => {
+                        debug!(
+                            account = %account.id,
+                            folder = %folder.id,
+                            scanned = outcome.scanned,
+                            total = outcome.total,
+                            found = outcome.ids.len(),
+                            "header scan finished"
+                        );
+                        scanned_any = true;
+                        scanned_total += outcome.scanned;
+                        scanned_of += outcome.total;
+                        all_ids.extend(outcome.ids);
+                    }
+                    Err(error) => {
+                        warn!(account = %account.id, %error, "header scan failed");
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
+                }
+                continue;
+            }
             let result = match self
                 .inner
                 .engine
@@ -416,6 +539,7 @@ impl MailService {
                         found = ids.len(),
                         "server search cached messages"
                     );
+                    native_any = true;
                     all_ids.extend(ids);
                 }
                 Err(error) => {
@@ -426,14 +550,23 @@ impl MailService {
                 }
             }
         }
-        match first_error {
-            Some(error) if all_ids.is_empty() => Err(error),
-            _ => {
-                all_ids.sort();
-                all_ids.dedup();
-                Ok(all_ids)
+        all_ids.sort();
+        all_ids.dedup();
+        let coverage = if let Some(error) = first_error {
+            SearchCoverage::ServerUnavailable {
+                message: error.to_string(),
             }
-        }
+        } else if scanned_any {
+            SearchCoverage::Scanned {
+                scanned: scanned_total,
+                total: scanned_of,
+            }
+        } else if native_any {
+            SearchCoverage::Server
+        } else {
+            SearchCoverage::LocalOnly
+        };
+        Ok((all_ids, coverage))
     }
 
     /// Merge server search hits with local FTS hits. Used when the local
@@ -540,6 +673,7 @@ impl MailService {
                         items: representatives,
                         next_cursor,
                         total,
+                        coverage: None,
                     })
                 } else {
                     if let Some(cursor) = &cursor {
@@ -559,6 +693,7 @@ impl MailService {
                         items,
                         next_cursor,
                         total,
+                        coverage: None,
                     })
                 }
             })
@@ -580,7 +715,7 @@ impl MailService {
             .await
     }
 
-    /// Mark a message as seen when it is opened (`markReadMode = onOpen`).
+    /// Mark a message as seen when it is opened.
     pub(crate) async fn mark_seen_on_open(&self, stored: &mut StoredMessage) -> Result<()> {
         if stored.summary.seen {
             return Ok(());
@@ -1746,6 +1881,7 @@ fn list_label_messages(
         items,
         next_cursor,
         total,
+        coverage: None,
     })
 }
 

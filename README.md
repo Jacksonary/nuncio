@@ -72,7 +72,7 @@ Grab the installer from [GitHub Releases](https://github.com/Jacksonary/nuncio/r
 | Platform | Format |
 |---|---|
 | Windows 10/11 x64 | `.exe` (NSIS) |
-| macOS (Apple Silicon / Intel) | `.dmg` |
+| macOS (Apple Silicon) | `.dmg` |
 | Linux x64 | `.deb` / `.AppImage` |
 
 > Unsigned Windows builds trigger SmartScreen on first run. macOS builds are not notarized either: right-click → Open, or allow the app under System Settings → Privacy & Security. Removing the quarantine flag also works, but only for an installer you downloaded from the official Releases page and trust — it bypasses Gatekeeper's first-run check:

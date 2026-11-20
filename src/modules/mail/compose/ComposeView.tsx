@@ -54,7 +54,6 @@ import { formatTime } from "@/lib/format";
 import { useT } from "@/lib/i18n";
 import { queryKeys, queryKeyPrefixes } from "@/lib/queryKeys";
 import { useShellStore } from "@/lib/store";
-import { useAppSettings } from "@/lib/useSettings";
 import { AttachmentsBar } from "./AttachmentsBar";
 import { ComposeHeader } from "./ComposeHeader";
 import { ComposeRibbon } from "./ComposeRibbon";
@@ -281,12 +280,13 @@ interface ComposerProps {
   onSent?: () => void;
 }
 
+/** Fixed compose defaults: system font family (empty) at 14px. */
+const DEFAULT_FONT_FAMILY = "";
+const DEFAULT_FONT_SIZE = 14;
+
 function Composer({ initialDraft, mode, onClose, onSent }: ComposerProps) {
   const t = useT();
   const queryClient = useQueryClient();
-  const settings = useAppSettings();
-  const fontFamily = settings.mail.defaultFontFamily;
-  const fontSize = settings.mail.defaultFontSize;
 
   const accountsQuery = useQuery({
     queryKey: queryKeys.accounts(),
@@ -308,8 +308,6 @@ function Composer({ initialDraft, mode, onClose, onSent }: ComposerProps) {
   const [draft, setDraftState] = useState<Draft>(initialDraft);
   const draftRef = useRef<Draft>(initialDraft);
   const lastSyncedRef = useRef<Draft>(initialDraft);
-  const fontRef = useRef({ fontFamily, fontSize });
-  fontRef.current = { fontFamily, fontSize };
   const [savePhase, setSavePhase] = useState<SavePhase>("idle");
   const [savedAt, setSavedAt] = useState<Date | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
@@ -536,12 +534,12 @@ function Composer({ initialDraft, mode, onClose, onSent }: ComposerProps) {
     const activeEditor = editorRef.current;
     if (activeEditor && !activeEditor.isDestroyed) {
       html = finalizeHtml(activeEditor.getHTML(), {
-        fontFamily,
-        fontSize,
+        fontFamily: DEFAULT_FONT_FAMILY,
+        fontSize: DEFAULT_FONT_SIZE,
       });
     }
     return { ...current, html };
-  }, [fontFamily, fontSize]);
+  }, []);
 
   const markDirty = useCallback(() => {
     if (sentRef.current || discardingRef.current) return;
@@ -1322,14 +1320,13 @@ function Composer({ initialDraft, mode, onClose, onSent }: ComposerProps) {
       // the editor fell back here the send still has the payload it built.
       if (sendingRef.current) return;
       const current = draftRef.current;
-      const { fontFamily: family, fontSize: size } = fontRef.current;
       let html = current.html;
       const activeEditor = editorRef.current;
       try {
         if (activeEditor && !activeEditor.isDestroyed) {
           html = finalizeHtml(activeEditor.getHTML(), {
-            fontFamily: family,
-            fontSize: size,
+            fontFamily: DEFAULT_FONT_FAMILY,
+            fontSize: DEFAULT_FONT_SIZE,
           });
         }
       } catch {
@@ -1427,8 +1424,8 @@ function Composer({ initialDraft, mode, onClose, onSent }: ComposerProps) {
       <ComposeRibbon
         editor={locked ? null : editor}
         revision={revision}
-        defaultFontFamily={fontFamily}
-        defaultFontSize={fontSize}
+        defaultFontFamily={DEFAULT_FONT_FAMILY}
+        defaultFontSize={DEFAULT_FONT_SIZE}
         signatures={signatures}
         signaturesLoading={signaturesQuery.isLoading}
         importance={draft.importance}
@@ -1447,7 +1444,7 @@ function Composer({ initialDraft, mode, onClose, onSent }: ComposerProps) {
         <EditorContent
           editor={editor}
           className={styles.editorContent}
-          style={{ fontFamily, fontSize: `${fontSize}px` }}
+          style={{ fontFamily: DEFAULT_FONT_FAMILY, fontSize: `${DEFAULT_FONT_SIZE}px` }}
         />
         {dragOver ? (
           <div className={styles.dropOverlay}>

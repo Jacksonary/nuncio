@@ -117,9 +117,9 @@ pub fn apply_startup(state: &AppState) {
     apply_side_effects(state, &settings);
     if let Some(window) = state.app.get_webview_window("main") {
         // The window is created visible=false to avoid a flash; show it here
-        // unless the user asked to start minimized.
-        let minimized =
-            settings.start_minimized || std::env::args().any(|argument| argument == "--minimized");
+        // unless the process was launched with `--minimized` (used by the
+        // autostart entry and by any external launcher).
+        let minimized = std::env::args().any(|argument| argument == "--minimized");
         if !minimized {
             let _ = window.show();
             let _ = window.set_focus();

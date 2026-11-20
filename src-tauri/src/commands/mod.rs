@@ -76,6 +76,7 @@ macro_rules! nuncio_commands {
             $crate::commands::mail::folder_mark_all_read,
             $crate::commands::mail::folder_empty,
             $crate::commands::mail::folder_sync,
+            $crate::commands::mail::folder_load_older,
             $crate::commands::mail::message_list,
             $crate::commands::mail::message_thread,
             $crate::commands::mail::message_get,

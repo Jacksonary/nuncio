@@ -1,6 +1,6 @@
 /** Small layout primitives shared by every settings page. */
-import type { ReactNode } from "react";
-import { ArrowLeft24Regular, Info24Regular, Warning24Regular, ErrorCircle24Regular, CheckmarkCircle24Regular } from "@fluentui/react-icons";
+import { useState, type ReactNode } from "react";
+import { ArrowLeft24Regular, ChevronRight24Regular, Info24Regular, Warning24Regular, ErrorCircle24Regular, CheckmarkCircle24Regular } from "@fluentui/react-icons";
 import { IconButton } from "@/components";
 import { cn } from "@/lib/cn";
 import { useT } from "@/lib/i18n";
@@ -61,6 +61,95 @@ export function Section({ title, hint, actions, children, className }: SectionPr
       ) : null}
       {children}
     </section>
+  );
+}
+
+/**
+ * A named group that hosts several sections. Merged pages (Mail, Calendar &
+ * contacts & tasks) put one group per former page, so the module keeps its own
+ * heading while its settings stay plain `Section`s underneath.
+ */
+export interface SectionGroupProps {
+  title: ReactNode;
+  hint?: ReactNode;
+  actions?: ReactNode;
+  children: ReactNode;
+}
+
+export function SectionGroup({ title, hint, actions, children }: SectionGroupProps) {
+  return (
+    <section className={styles.group}>
+      <div className={styles.groupHeader}>
+        <div className={styles.groupHeading}>
+          <h2 className={styles.groupTitle}>{title}</h2>
+          {hint ? <div className={styles.groupHint}>{hint}</div> : null}
+        </div>
+        {actions ? <div className={styles.listActions}>{actions}</div> : null}
+      </div>
+      <div className={styles.groupBody}>{children}</div>
+    </section>
+  );
+}
+
+/** A collapsed block that reveals its content on demand. */
+export function Disclosure({
+  label,
+  defaultOpen = false,
+  children,
+}: {
+  label: ReactNode;
+  defaultOpen?: boolean;
+  children: ReactNode;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <div className={styles.disclosure}>
+      <button
+        type="button"
+        className={styles.disclosureToggle}
+        aria-expanded={open}
+        onClick={() => setOpen((value) => !value)}
+      >
+        <span
+          className={cn(styles.disclosureChevron, open && styles.disclosureChevronOpen)}
+          aria-hidden="true"
+        >
+          <ChevronRight24Regular />
+        </span>
+        <span>{label}</span>
+      </button>
+      {open ? <div className={styles.disclosureBody}>{children}</div> : null}
+    </div>
+  );
+}
+
+/** A card row that navigates to a sub-page instead of hosting a control. */
+export function LinkRow({
+  label,
+  description,
+  icon,
+  onClick,
+}: {
+  label: ReactNode;
+  description?: ReactNode;
+  icon?: ReactNode;
+  onClick: () => void;
+}) {
+  return (
+    <button type="button" className={styles.navRow} onClick={onClick}>
+      {icon ? (
+        <span className={styles.homeIcon} aria-hidden="true">
+          {icon}
+        </span>
+      ) : null}
+      <span className={styles.navRowText}>
+        <span className={styles.rowLabel}>{label}</span>
+        {description ? <span className={styles.rowDesc}>{description}</span> : null}
+      </span>
+      <span className={styles.navRowChevron} aria-hidden="true">
+        <ChevronRight24Regular />
+      </span>
+    </button>
   );
 }
 

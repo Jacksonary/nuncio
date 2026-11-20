@@ -96,9 +96,8 @@ describe("alphabetical sectioning", () => {
     expect(sectionLetter("陈晨")).toBe("C");
   });
 
-  it("uses the last name for the section when sorting by last name", () => {
-    expect(sectionLetter("John Smith", "firstName")).toBe("J");
-    expect(sectionLetter("John Smith", "lastName")).toBe("S");
+  it("sections by the first word of the stored display name", () => {
+    expect(sectionLetter("John Smith")).toBe("J");
   });
 
   it("builds ordered, counted rows with headers", () => {
@@ -110,7 +109,7 @@ describe("alphabetical sectioning", () => {
         summary("4", "Bob"),
         summary("5", "李雷"),
       ],
-      { sortBy: "firstName", displayOrder: "firstLast", locale: "zh-CN" },
+      { locale: "zh-CN" },
     );
     const headers = rows.filter((row) => row.kind === "header");
     expect(headers.map((row) => (row.kind === "header" ? row.label : ""))).toEqual([
@@ -130,14 +129,14 @@ describe("alphabetical sectioning", () => {
     expect(contactRows.map((row) => row.index)).toEqual([0, 1, 2, 3, 4]);
   });
 
-  it("sorts by the last name once the full contact set is loaded", () => {
+  it("sorts by the first name of the stored display name", () => {
     const rows = buildPeopleRows(
       [
         summary("1", "John Smith"),
         summary("2", "Zoe Adams"),
         summary("3", "Alice Brown"),
       ],
-      { sortBy: "lastName", displayOrder: "firstLast", locale: "en-US" },
+      { locale: "en-US" },
     );
     const names = rows
       .filter(
@@ -145,23 +144,22 @@ describe("alphabetical sectioning", () => {
           row.kind === "contact",
       )
       .map((row) => row.contact.displayName);
-    expect(names).toEqual(["Zoe Adams", "Alice Brown", "John Smith"]);
+    expect(names).toEqual(["Alice Brown", "John Smith", "Zoe Adams"]);
     const headers = rows
       .filter((row) => row.kind === "header")
       .map((row) => (row.kind === "header" ? row.label : ""));
-    expect(headers).toEqual(["A", "B", "S"]);
+    expect(headers).toEqual(["A", "J", "Z"]);
   });
 });
 
 describe("name formatting", () => {
-  it("composes names in both display orders", () => {
+  it("composes names in first-last order", () => {
     const contact = baseContact({
       givenName: "Ada",
       familyName: "Lovelace",
       displayName: "",
     });
-    expect(formatContactName(contact, "firstLast")).toBe("Ada Lovelace");
-    expect(formatContactName(contact, "lastFirst")).toBe("Lovelace Ada");
+    expect(formatContactName(contact)).toBe("Ada Lovelace");
   });
 
   it("honors a custom display name but ignores an auto-composed one", () => {
@@ -170,18 +168,20 @@ describe("name formatting", () => {
       familyName: "Lovelace",
       displayName: "Ada L.",
     });
-    expect(formatContactName(custom, "firstLast")).toBe("Ada L.");
+    expect(formatContactName(custom)).toBe("Ada L.");
+    // A stored last-first name is still recognized as auto-composed, so the
+    // contact is displayed as first-last.
     const auto = baseContact({
       givenName: "Ada",
       familyName: "Lovelace",
       displayName: "Lovelace Ada",
     });
-    expect(formatContactName(auto, "firstLast")).toBe("Ada Lovelace");
+    expect(formatContactName(auto)).toBe("Ada Lovelace");
   });
 
   it("joins CJK name parts without a space", () => {
     const contact = baseContact({ givenName: "伟", familyName: "张" });
-    expect(formatContactName(contact, "firstLast")).toBe("张伟");
+    expect(formatContactName(contact)).toBe("张伟");
   });
 
   it("falls back to display name, company, then e-mail", () => {
@@ -196,16 +196,15 @@ describe("name formatting", () => {
     ).toBe("a@example.com");
   });
 
-  it("reorders summary names for last-first display", () => {
-    expect(formatSummaryName("John Smith", "firstLast")).toBe("John Smith");
-    expect(formatSummaryName("John Smith", "lastFirst")).toBe("Smith John");
-    expect(formatSummaryName("张伟", "lastFirst")).toBe("张伟");
+  it("shows summary names as stored", () => {
+    expect(formatSummaryName("John Smith")).toBe("John Smith");
+    expect(formatSummaryName("  John Smith  ")).toBe("John Smith");
+    expect(formatSummaryName("张伟")).toBe("张伟");
   });
 
-  it("builds last-name sort keys", () => {
-    expect(nameSortKey("John Smith", "lastName")).toBe("Smith John");
-    expect(nameSortKey("John Smith", "firstName")).toBe("John Smith");
-    expect(nameSortKey("张伟", "lastName")).toBe("张伟");
+  it("uses the display name as the sort key", () => {
+    expect(nameSortKey("John Smith")).toBe("John Smith");
+    expect(nameSortKey(" 张伟 ")).toBe("张伟");
   });
 });
 
@@ -385,7 +384,6 @@ describe("detail helpers", () => {
     expect(primaryField(fields)?.value).toBe("work@example.com");
     const recipient = contactRecipient(
       baseContact({ displayName: "Ada", emails: fields }),
-      "firstLast",
     );
     expect(recipient).toEqual({ name: "Ada", email: "work@example.com" });
     expect(contactRecipient(baseContact())).toBeNull();

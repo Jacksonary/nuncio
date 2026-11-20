@@ -21,6 +21,13 @@ export interface TodoUiState {
   completedCollapsed: boolean;
   setCompletedCollapsed: (collapsed: boolean) => void;
 
+  /**
+   * Whether completed tasks are mixed into the active list (persisted).
+   * Defaults to hidden; the Completed smart list always shows them.
+   */
+  showCompleted: boolean;
+  setShowCompleted: (show: boolean) => void;
+
   /** Incremented to focus the "add task" input from the header button. */
   addRequest: number;
   requestAdd: () => void;
@@ -42,6 +49,9 @@ export const useTodoUiStore = create<TodoUiState>()(
 
       completedCollapsed: false,
       setCompletedCollapsed: (completedCollapsed) => set({ completedCollapsed }),
+
+      showCompleted: false,
+      setShowCompleted: (showCompleted) => set({ showCompleted }),
 
       addRequest: 0,
       requestAdd: () => set((state) => ({ addRequest: state.addRequest + 1 })),
@@ -65,6 +75,7 @@ export const useTodoUiStore = create<TodoUiState>()(
       partialize: (state) => ({
         sortMode: state.sortMode,
         completedCollapsed: state.completedCollapsed,
+        showCompleted: state.showCompleted,
       }),
     },
   ),

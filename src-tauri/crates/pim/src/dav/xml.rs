@@ -72,6 +72,21 @@ fn local_name(raw: &str) -> String {
     }
 }
 
+/// Decode the body of a numeric character reference (`#xD`, `#13`).
+///
+/// Servers escape the carriage returns of a CRLF-terminated vCard/iCalendar as
+/// `&#xD;`. Left undecoded, the literal text ends up at the end of every field
+/// (a contact shown as "Name&#xD;"). Only valid Unicode scalar values decode;
+/// anything else stays as written.
+fn numeric_char_reference(name: &str) -> Option<char> {
+    let digits = name.strip_prefix('#')?;
+    let code = match digits.strip_prefix(['x', 'X']) {
+        Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+        None => digits.parse::<u32>().ok()?,
+    };
+    char::from_u32(code)
+}
+
 /// Parse an XML document into a lightweight tree.
 pub fn parse_node(xml: &str) -> Result<Node> {
     let mut reader = Reader::from_str(xml);
@@ -151,13 +166,14 @@ pub fn parse_node(xml: &str) -> Result<Node> {
             Ok(Event::GeneralRef(reference)) => {
                 if let Some(node) = stack.last_mut() {
                     let name = reference.as_ref();
-                    match resolve_predefined_entity(name) {
-                        Some(value) => node.text.push_str(value),
-                        None => {
-                            node.text.push('&');
-                            node.text.push_str(name);
-                            node.text.push(';');
-                        }
+                    if let Some(value) = resolve_predefined_entity(name) {
+                        node.text.push_str(value);
+                    } else if let Some(ch) = numeric_char_reference(name) {
+                        node.text.push(ch);
+                    } else {
+                        node.text.push('&');
+                        node.text.push_str(name);
+                        node.text.push(';');
                     }
                 }
             }
@@ -649,6 +665,35 @@ END:VCALENDAR</cal:calendar-data>
         assert_eq!(response.prop.etag.as_deref(), Some("abc"));
         let data = response.prop.data.as_deref().expect("calendar data");
         assert!(data.contains("SUMMARY:Test & Coffee"));
+    }
+
+    #[test]
+    fn numeric_character_references_decode() {
+        assert_eq!(numeric_char_reference("#xD"), Some('\r'));
+        assert_eq!(numeric_char_reference("#xd"), Some('\r'));
+        assert_eq!(numeric_char_reference("#13"), Some('\r'));
+        assert_eq!(numeric_char_reference("#10"), Some('\n'));
+        assert_eq!(numeric_char_reference("#x4E2D"), Some('中'));
+        // Not a reference, not a number, or not a valid scalar value.
+        assert_eq!(numeric_char_reference("amp"), None);
+        assert_eq!(numeric_char_reference("#"), None);
+        assert_eq!(numeric_char_reference("#xZZ"), None);
+        assert_eq!(numeric_char_reference("#xD800"), None);
+        assert_eq!(numeric_char_reference("#x110000"), None);
+    }
+
+    #[test]
+    fn carriage_return_references_in_address_data_do_not_leak_into_fields() {
+        // The shape contacts.163.com returns: CRLF lines escaped as &#xD;.
+        let xml = "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:carddav\">\
+<d:response><d:href>/a.vcf</d:href><d:propstat><d:status>HTTP/1.1 200 OK</d:status><d:prop>\
+<d:getetag>\"1\"</d:getetag>\
+<c:address-data>BEGIN:VCARD&#xD;\nVERSION:3.0&#xD;\nFN:Alice&#xD;\nEMAIL:alice@example.com&#xD;\nEND:VCARD&#xD;\n</c:address-data>\
+</d:prop></d:propstat></d:response></d:multistatus>";
+        let parsed = parse_multistatus(xml).expect("parse");
+        let data = parsed.responses[0].prop.data.as_deref().expect("data");
+        assert!(!data.contains("&#"), "{data:?}");
+        assert!(data.contains("FN:Alice\r\n"), "{data:?}");
     }
 
     #[test]

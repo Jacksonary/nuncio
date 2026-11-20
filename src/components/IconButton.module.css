@@ -82,3 +82,26 @@
   align-items: center;
   justify-content: center;
 }
+
+/* An action is running: same icon, turning, not clickable. */
+.busy {
+  pointer-events: none;
+  cursor: default;
+}
+
+.busy .icon {
+  animation: iconButtonSpin 0.9s linear infinite;
+}
+
+@keyframes iconButtonSpin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .busy .icon {
+    animation: none;
+    opacity: 0.5;
+  }
+}

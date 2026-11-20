@@ -99,7 +99,7 @@ export { Kbd } from "./Kbd";
 export type { KbdProps } from "./Kbd";
 
 export { VirtualList } from "./VirtualList";
-export type { VirtualListProps } from "./VirtualList";
+export type { VirtualListHandle, VirtualListProps } from "./VirtualList";
 
 export { TokenInput } from "./TokenInput";
 export type { TokenInputProps } from "./TokenInput";

@@ -281,6 +281,21 @@ export interface MessagePage {
   items: MessageSummary[];
   nextCursor: string | null;
   total: number;
+  /** How a search page was produced; absent for non-search listings. */
+  coverage?: SearchCoverage | null;
+}
+
+/** How much of the mailbox a search actually covered. */
+export type SearchCoverage =
+  | { kind: "localOnly" }
+  | { kind: "server" }
+  | { kind: "scanned"; scanned: number; total: number }
+  | { kind: "serverUnavailable"; message: string };
+
+/** Result of one "load older mail" batch (IMAP / Microsoft Graph folders). */
+export interface LoadOlderResult {
+  loaded: number;
+  hasMore: boolean;
 }
 
 export interface SearchQuery {
@@ -725,26 +740,11 @@ export interface AppSettings {
   language: Language;
   closeToTray: boolean;
   launchAtStartup: boolean;
-  startMinimized: boolean;
   mail: {
     conversationView: boolean;
-    previewLines: number;
-    density: "compact" | "normal" | "spacious";
-    showAvatars: boolean;
-    markReadMode: "onOpen" | "afterDelay" | "manual";
-    markReadDelaySeconds: number;
     remoteImages: "ask" | "trustedOnly" | "always";
-    lightMessageBackground: boolean;
-    hoverActions: HoverAction[];
-    confirmDelete: boolean;
-    autoAdvance: "next" | "previous" | "list";
-    defaultFontFamily: string;
-    defaultFontSize: number;
-    prefetchUnreadBodies: number;
     bodyCacheLimitMb: number;
     otherFoldersPollMinutes: number;
-    /** Include the original message when replying. */
-    quoteOriginal: boolean;
   };
   calendar: {
     defaultView: CalendarView;
@@ -758,14 +758,10 @@ export interface AppSettings {
     pollMinutes: number;
   };
   contacts: {
-    sortBy: "firstName" | "lastName";
-    displayOrder: "firstLast" | "lastFirst";
     pollMinutes: number;
   };
   tasks: {
-    showCompleted: boolean;
     pollMinutes: number;
-    newTasksOnTop: boolean;
   };
   notifications: {
     enabled: boolean;

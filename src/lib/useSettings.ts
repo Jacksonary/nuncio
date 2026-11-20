@@ -5,7 +5,7 @@
  * language. `useThemeSync()` is mounted by `App` so that every window — the
  * shell plus the message / compose windows — follows the theme.
  */
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   useMutation,
   useQuery,
@@ -13,7 +13,7 @@ import {
   type UseMutationResult,
 } from "@tanstack/react-query";
 import { app, settings } from "@/ipc/api";
-import type { AppSettings, SettingsPatch, ThemeMode } from "@/ipc/types";
+import type { AppSettings, Language, SettingsPatch, ThemeMode } from "@/ipc/types";
 import { toast } from "@/components";
 import { queryKeys } from "@/lib/queryKeys";
 import { setLanguage, useT } from "@/lib/i18n";
@@ -38,25 +38,11 @@ export const DEFAULT_SETTINGS: AppSettings = {
   language: "system",
   closeToTray: true,
   launchAtStartup: false,
-  startMinimized: false,
   mail: {
     conversationView: true,
-    previewLines: 1,
-    density: "normal",
-    showAvatars: true,
-    markReadMode: "onOpen",
-    markReadDelaySeconds: 5,
     remoteImages: "always",
-    lightMessageBackground: false,
-    hoverActions: ["archive", "delete", "flag"],
-    confirmDelete: true,
-    autoAdvance: "next",
-    defaultFontFamily: "",
-    defaultFontSize: 14,
-    prefetchUnreadBodies: 50,
     bodyCacheLimitMb: 500,
     otherFoldersPollMinutes: 15,
-    quoteOriginal: true,
   },
   calendar: {
     defaultView: "week",
@@ -70,14 +56,10 @@ export const DEFAULT_SETTINGS: AppSettings = {
     pollMinutes: 15,
   },
   contacts: {
-    sortBy: "firstName",
-    displayOrder: "firstLast",
     pollMinutes: 60,
   },
   tasks: {
-    showCompleted: false,
     pollMinutes: 30,
-    newTasksOnTop: true,
   },
   notifications: {
     enabled: true,
@@ -175,6 +157,28 @@ export function useUpdateSettings(): UseMutationResult<
 }
 
 /**
+ * Whether the app is currently showing its dark theme. Reads the resolved theme
+ * `applyTheme` writes to `<html data-theme>`, so it is right for "system" mode
+ * too, and follows later changes through a MutationObserver.
+ */
+export function useIsDarkTheme(): boolean {
+  const read = () =>
+    typeof document !== "undefined" && document.documentElement.dataset.theme === "dark";
+  const [dark, setDark] = useState(read);
+  useEffect(() => {
+    if (typeof document === "undefined" || typeof MutationObserver === "undefined") return;
+    const observer = new MutationObserver(() => setDark(read()));
+    observer.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["data-theme"],
+    });
+    setDark(read());
+    return () => observer.disconnect();
+  }, []);
+  return dark;
+}
+
+/**
  * Theme part of the settings sync: applies the palette, mirrors the mode into
  * the native window and, for "system", keeps following the OS.
  *
@@ -230,8 +234,29 @@ export function useThemeSync(mode: ThemeMode | undefined): void {
 }
 
 /**
- * Apply the accent color, language and platform of the current settings.
- * Theme lives in `useThemeSync` so it can be mounted by every window.
+ * Apply the configured language, in every window.
+ *
+ * Language is not Shell-only state: a secondary window is its own webview with
+ * its own copy of the i18n module, so it starts from
+ * `localStorage["nuncio.language"]` (or `navigator.language`) and would keep
+ * that guess forever if nothing re-applied the setting there. Mounted by `App`
+ * next to `useThemeSync`, exactly like the theme, so the settings flyout and
+ * the message/compose windows always follow the configured language.
+ *
+ * `language === undefined` means "settings not loaded yet": the bootstrap value
+ * from the cache read at module load is left alone.
+ */
+export function useLanguageSync(language: Language | undefined): void {
+  useEffect(() => {
+    if (language === undefined) return;
+    setLanguage(language);
+  }, [language]);
+}
+
+/**
+ * Apply the accent color and platform of the current settings.
+ * Theme and language live in `useThemeSync` / `useLanguageSync` so they can be
+ * mounted by every window.
  * Mount once (Shell). Returns the query for loading/error handling.
  */
 export function useSettingsSync() {
@@ -243,7 +268,6 @@ export function useSettingsSync() {
     // the previous run instead of overwriting them with defaults.
     if (!data) return;
     applyAccent(data.accentColor);
-    setLanguage(data.language);
   }, [data]);
 
   useEffect(() => {

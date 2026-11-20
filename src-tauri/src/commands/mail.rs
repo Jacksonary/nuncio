@@ -100,6 +100,14 @@ pub async fn folder_sync(state: State<'_, AppState>, id: String) -> nuncio_core:
     state.mail.folder_sync(&id).await
 }
 
+#[tauri::command]
+pub async fn folder_load_older(
+    state: State<'_, AppState>,
+    id: String,
+) -> nuncio_core::Result<nuncio_core::models::LoadOlderResult> {
+    state.mail.folder_load_older(&id).await
+}
+
 /* ───────────────────────────── messages ──────────────────────────── */
 
 #[tauri::command]
@@ -124,8 +132,12 @@ pub async fn message_get(
     state: State<'_, AppState>,
     id: String,
     allow_remote: bool,
+    light_background: Option<bool>,
 ) -> nuncio_core::Result<MessageDetail> {
-    state.mail.message_get(&id, allow_remote).await
+    state
+        .mail
+        .message_get_with(&id, allow_remote, light_background.unwrap_or(false))
+        .await
 }
 
 #[tauri::command]

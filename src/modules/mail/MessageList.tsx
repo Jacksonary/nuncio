@@ -60,12 +60,14 @@ import {
   ToggleButton,
   Tooltip,
   VirtualList,
+  type VirtualListHandle,
   confirm,
   toast,
   type MenuEntry,
 } from "@/components";
 import {
   app,
+  folders as foldersApi,
   isIpcError,
   messages as messagesApi,
   outbox as outboxApi,
@@ -90,7 +92,6 @@ import { useShellStore } from "@/lib/store";
 import {
   deletePlan,
   messageActionToast,
-  needsDeleteConfirmation,
   undoLastMessageAction,
   useMessageActions,
 } from "./actions";
@@ -104,9 +105,11 @@ import {
   constrainToResultSet,
   emptyStateCopy,
   messageIds,
+  firstAppendedRowIndex,
   nextAfterRemoval,
   parseUnifiedFolderId,
   safeFilename,
+  searchCoverageNotice,
   selectionReducer,
   type DateGroupKey,
   type MessageRow,
@@ -154,11 +157,9 @@ function senderName(summary: MessageSummary): string {
   return from.name?.trim() || from.email;
 }
 
-function summaryStyle(density: "compact" | "normal" | "spacious"): CSSProperties {
-  if (density === "compact") return { ["--row-min" as string]: "52px" };
-  if (density === "spacious") return { ["--row-min" as string]: "92px" };
-  return { ["--row-min" as string]: "70px" };
-}
+/** Row height of the fixed list density, used for scroll/virtual-list estimates. */
+const ROW_ESTIMATE = 76;
+const ROW_STYLE: CSSProperties = { ["--row-min" as string]: "70px" };
 
 function openMessageWindow(messageId: string, subject: string, print = false): void {
   const route = print ? `/message/${messageId}?print=1` : `/message/${messageId}`;
@@ -177,10 +178,9 @@ interface ThreadMembersProps {
   threadId: string;
   selectedId: string | null;
   onSelect: (summary: MessageSummary) => void;
-  showAvatars: boolean;
 }
 
-function ThreadMembers({ accountId, threadId, selectedId, onSelect, showAvatars }: ThreadMembersProps) {
+function ThreadMembers({ accountId, threadId, selectedId, onSelect }: ThreadMembersProps) {
   const tt = useT();
   const query = useQuery({
     queryKey: queryKeys.thread(accountId, threadId),
@@ -217,14 +217,12 @@ function ThreadMembers({ accountId, threadId, selectedId, onSelect, showAvatars 
             onSelect(member);
           }}
         >
-          {showAvatars ? (
-            <Avatar
-              name={member.from?.name}
-              email={member.from?.email}
-              size={20}
-              className={styles.threadAvatar}
-            />
-          ) : null}
+          <Avatar
+            name={member.from?.name}
+            email={member.from?.email}
+            size={20}
+            className={styles.threadAvatar}
+          />
           <span className={styles.threadSender}>{senderName(member)}</span>
           <span className={styles.threadSubject}>
             {member.subject || tt("mail.list.noSubject")}
@@ -298,7 +296,6 @@ export function MessageList() {
     folder?.accountId ?? null,
     mailSettings.conversationView,
   );
-  const density = mailSettings.density;
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(new Date()), 60_000);
@@ -442,25 +439,44 @@ export function MessageList() {
   }, [queryClient]);
 
 
-  const scrollToMessage = useCallback(
-    (id: string) => {
-      const rowIndex = rows.findIndex(
-        (row) => row.kind === "message" && row.summary.id === id,
-      );
-      if (rowIndex < 0) return;
-      const container = listWrapRef.current?.firstElementChild as HTMLElement | null;
-      const scroller =
-        container && container.scrollHeight > container.clientHeight ? container : null;
-      if (scroller) {
-        const estimate = density === "compact" ? 56 : density === "spacious" ? 96 : 76;
-        scroller.scrollTo({
-          top: Math.max(0, rowIndex * estimate - scroller.clientHeight / 3),
-          behavior: "smooth",
-        });
-      }
-    },
-    [density, rows],
+  // Scroll through the virtualizer (measured row positions) rather than a
+  // hand-estimated pixel offset: real rows are taller than ROW_ESTIMATE, so an
+  // estimate lands dozens of rows away in a long list.
+  const listHandleRef = useRef<VirtualListHandle | null>(null);
+  const rowsRef = useRef(rows);
+  rowsRef.current = rows;
+  const [settleScroll, setSettleScroll] = useState<{ id: string; rows: MessageRow[] } | null>(
+    null,
   );
+
+  const scrollToRows = useCallback((id: string, source: MessageRow[]) => {
+    const rowIndex = source.findIndex((row) => row.kind === "message" && row.summary.id === id);
+    if (rowIndex >= 0) listHandleRef.current?.scrollToIndex(rowIndex, { align: "auto" });
+  }, []);
+
+  /**
+   * `settle` is for rows about to change (delete/move): the target is scrolled
+   * to now and again once the next rows render, because the callers run before
+   * the list has re-rendered without the removed rows.
+   */
+  const scrollToMessage = useCallback(
+    (id: string, settle = false) => {
+      if (settle) setSettleScroll({ id, rows: rowsRef.current });
+      else scrollToRows(id, rowsRef.current);
+    },
+    [scrollToRows],
+  );
+
+  useEffect(() => {
+    if (!settleScroll) return;
+    scrollToRows(settleScroll.id, rows);
+    if (rows !== settleScroll.rows) {
+      setSettleScroll(null);
+      return;
+    }
+    const timer = window.setTimeout(() => setSettleScroll(null), 3000);
+    return () => window.clearTimeout(timer);
+  }, [rows, scrollToRows, settleScroll]);
 
   const navigate = useCallback(
     (delta: 1 | -1) => {
@@ -571,44 +587,40 @@ export function MessageList() {
         (id) => folders.byId.get(id)?.role,
       );
       const permanent = plan.move === 0;
-      // A permanent delete is never silent, whatever the preference says; a
-      // plain move to Trash is undoable and honours "confirm before delete".
-      if (needsDeleteConfirmation(mailSettings.confirmDelete, plan)) {
-        const ok = await confirm({
-          title: permanent ? tt("mail.list.deletePermanentTitle") : tt("mail.list.deleteTitle"),
-          message:
-            plan.move > 0 && plan.permanent > 0
-              ? tt("mail.list.deleteMixedMessage", {
-                  move: plan.move,
-                  permanent: plan.permanent,
-                })
-              : plan.permanent > 1
-                ? tt("mail.list.deletePermanentMessageMany", { count: plan.permanent })
-                : plan.permanent === 1
-                  ? tt("mail.list.deletePermanentMessage")
-                  : plan.move > 1
-                    ? tt("mail.list.deleteMessageMany", { count: plan.move })
-                    : tt("mail.list.deleteMessage"),
-          confirmLabel: tt("common.delete"),
-          danger: true,
-        });
-        if (!ok) return false;
-      }
+      // Deleting always asks first, with wording that matches what will happen.
+      const confirmed = await confirm({
+        title: permanent ? tt("mail.list.deletePermanentTitle") : tt("mail.list.deleteTitle"),
+        message:
+          plan.move > 0 && plan.permanent > 0
+            ? tt("mail.list.deleteMixedMessage", {
+                move: plan.move,
+                permanent: plan.permanent,
+              })
+            : plan.permanent > 1
+              ? tt("mail.list.deletePermanentMessageMany", { count: plan.permanent })
+              : plan.permanent === 1
+                ? tt("mail.list.deletePermanentMessage")
+                : plan.move > 1
+                  ? tt("mail.list.deleteMessageMany", { count: plan.move })
+                  : tt("mail.list.deleteMessage"),
+        confirmLabel: tt("common.delete"),
+        danger: true,
+      });
+      if (!confirmed) return false;
       const removed = new Set(ids);
-      const next = nextAfterRemoval(orderedIds, removed, messageId, mailSettings.autoAdvance);
+      const next = nextAfterRemoval(orderedIds, removed, messageId);
       const ok = await runAction(ids, { kind: "delete", permanent }, threadMetaFor(ids));
       if (!ok) return false;
       dispatchSelection({ type: "remove", ids });
       setActive(next);
-      if (next) scrollToMessage(next);
+      // The open message survives a removal elsewhere: leave the scroll alone.
+      if (next && next !== messageId) scrollToMessage(next, true);
       return true;
     },
     [
       folder?.role,
       folders.byId,
       invalidateOutbox,
-      mailSettings.autoAdvance,
-      mailSettings.confirmDelete,
       messageId,
       orderedIds,
       runAction,
@@ -625,14 +637,15 @@ export function MessageList() {
     async (ids: string[]): Promise<boolean> => {
       if (ids.length === 0 || ids.some(isOutboxMessageId)) return false;
       const removed = new Set(ids);
-      const next = nextAfterRemoval(orderedIds, removed, messageId, mailSettings.autoAdvance);
+      const next = nextAfterRemoval(orderedIds, removed, messageId);
       const ok = await runAction(ids, { kind: "archive" }, threadMetaFor(ids));
       if (!ok) return false;
       dispatchSelection({ type: "remove", ids });
       setActive(next);
+      if (next && next !== messageId) scrollToMessage(next, true);
       return true;
     },
-    [mailSettings.autoAdvance, messageId, orderedIds, runAction, setActive, threadMetaFor],
+    [messageId, orderedIds, runAction, scrollToMessage, setActive, threadMetaFor],
   );
 
   const setSeen = useCallback(
@@ -651,7 +664,7 @@ export function MessageList() {
     async (ids: string[], targetFolderId: string): Promise<boolean> => {
       if (ids.length === 0 || ids.some(isOutboxMessageId)) return false;
       const removed = new Set(ids);
-      const next = nextAfterRemoval(orderedIds, removed, messageId, mailSettings.autoAdvance);
+      const next = nextAfterRemoval(orderedIds, removed, messageId);
       const ok = await runAction(
         ids,
         { kind: "move", folderId: targetFolderId },
@@ -660,9 +673,10 @@ export function MessageList() {
       if (!ok) return false;
       dispatchSelection({ type: "remove", ids });
       if (next) setActive(next);
+      if (next && next !== messageId) scrollToMessage(next, true);
       return true;
     },
-    [mailSettings.autoAdvance, messageId, orderedIds, runAction, setActive, threadMetaFor],
+    [messageId, orderedIds, runAction, scrollToMessage, setActive, threadMetaFor],
   );
 
   const markJunk = useCallback(
@@ -893,17 +907,69 @@ export function MessageList() {
     targets,
   ]);
 
+  // "Load older mail": the server holds mail older than the sync window. Offered
+  // for a real IMAP/Graph folder once the local list has no further page.
+  const [older, setOlder] = useState<{ folderId: string; busy: boolean; exhausted: boolean } | null>(
+    null,
+  );
+  const olderAccount = folder ? accountById.get(folder.accountId) : undefined;
+  const canLoadOlder =
+    folder !== null &&
+    !searchText &&
+    !outboxView &&
+    folder.isSelectable &&
+    olderAccount !== undefined &&
+    olderAccount.provider !== "pop3" &&
+    olderAccount.provider !== "local" &&
+    (olderAccount.imap !== null || olderAccount.oauthProvider === "microsoft");
+  const olderState = older && folder && older.folderId === folder.id ? older : null;
+  // Row count before "load older"; once rows grow past it the first new row is
+  // scrolled into view so the new mail is reachable without scrolling back up.
+  const revealOlderFrom = useRef<number | null>(null);
+  useEffect(() => {
+    if (revealOlderFrom.current === null) return;
+    const index = firstAppendedRowIndex(revealOlderFrom.current, rows.length);
+    if (index === null) return;
+    revealOlderFrom.current = null;
+    listHandleRef.current?.scrollToIndex(index, { align: "auto" });
+  }, [rows]);
+  const loadOlder = useCallback(async () => {
+    if (!folder || olderState?.busy) return;
+    const target = folder.id;
+    setOlder({ folderId: target, busy: true, exhausted: false });
+    try {
+      const result = await foldersApi.loadOlder(target);
+      setOlder({ folderId: target, busy: false, exhausted: !result.hasMore });
+      if (result.loaded > 0) {
+        revealOlderFrom.current = rowsRef.current.length;
+        window.setTimeout(() => {
+          revealOlderFrom.current = null;
+        }, 5000);
+        await list.refetch();
+      }
+    } catch (error) {
+      setOlder({ folderId: target, busy: false, exhausted: false });
+      toast.error(tt("mail.list.loadOlderFailed"), errorText(error));
+    }
+  }, [folder, list, olderState?.busy, tt]);
+
+  // The manual sync's own in-flight flag. The sync status events only cover the
+  // part the backend reports as "syncing", so the button also tracks the call.
+  const [syncBusy, setSyncBusy] = useState(false);
   const syncNow = useCallback(async () => {
-    if (syncAccountIds.length === 0) return;
+    if (syncAccountIds.length === 0 || syncBusy) return;
+    setSyncBusy(true);
     try {
       for (const accountId of syncAccountIds) {
         await syncApi.now(accountId, "mail");
       }
-      toast.success(tt("mail.list.syncStarted"));
+      toast.success(tt("mail.list.synced"));
     } catch (error) {
       toast.error(tt("mail.toast.actionFailed"), errorText(error));
+    } finally {
+      setSyncBusy(false);
     }
-  }, [syncAccountIds, tt]);
+  }, [syncAccountIds, syncBusy, tt]);
 
   const moveMenuEntries = useMemo<MenuEntry[]>(() => {
     const targetAccounts = new Set(
@@ -1138,61 +1204,26 @@ export function MessageList() {
           },
         ];
       }
-      for (const action of mailSettings.hoverActions ?? []) {
-        switch (action) {
-          case "archive":
-            actions.push({
-              key: "archive",
-              label: tt("mail.action.archive"),
-              icon: <Archive16Regular />,
-              run: () => void archiveMessages([summary.id]),
-            });
-            break;
-          case "delete":
-            actions.push({
-              key: "delete",
-              label: tt("mail.action.delete"),
-              icon: <Delete16Regular />,
-              run: () => void deleteMessages([summary.id]),
-            });
-            break;
-          case "flag":
-            actions.push({
-              key: "flag",
-              label: summary.flagged ? tt("mail.action.unflag") : tt("mail.action.flag"),
-              icon: <Flag16Regular />,
-              run: () => setFlagged([summary.id], !summary.flagged),
-            });
-            break;
-          case "read":
-            actions.push({
-              key: "read",
-              label: summary.seen ? tt("mail.action.markUnread") : tt("mail.action.markRead"),
-              icon: summary.seen ? <MailUnread16Regular /> : <MailRead16Regular />,
-              run: () => setSeen([summary.id], !summary.seen),
-            });
-            break;
-          case "move":
-            actions.push({
-              key: "move",
-              label: tt("mail.action.move"),
-              icon: <ArrowMove20Regular />,
-              run: () => {
-                const element = document.activeElement as HTMLElement | null;
-                const rect = element?.getBoundingClientRect();
-                setHoverMenu({
-                  summary,
-                  point: rect
-                    ? { x: rect.right, y: rect.bottom }
-                    : { x: window.innerWidth / 2, y: 120 },
-                });
-              },
-            });
-            break;
-          default:
-            break;
-        }
-      }
+      actions.push(
+        {
+          key: "archive",
+          label: tt("mail.action.archive"),
+          icon: <Archive16Regular />,
+          run: () => void archiveMessages([summary.id]),
+        },
+        {
+          key: "delete",
+          label: tt("mail.action.delete"),
+          icon: <Delete16Regular />,
+          run: () => void deleteMessages([summary.id]),
+        },
+        {
+          key: "flag",
+          label: summary.flagged ? tt("mail.action.unflag") : tt("mail.action.flag"),
+          icon: <Flag16Regular />,
+          run: () => setFlagged([summary.id], !summary.flagged),
+        },
+      );
       return actions;
     },
     [
@@ -1200,7 +1231,6 @@ export function MessageList() {
       cancelOutbox,
       deleteMessages,
       deleteOutbox,
-      mailSettings.hoverActions,
       retryOutbox,
       setFlagged,
       setSeen,
@@ -1260,6 +1290,14 @@ export function MessageList() {
       : folder
         ? accountById.get(folder.accountId)?.displayName ?? ""
         : "";
+
+  // One quiet line saying how the search was produced (or that it is still
+  // running), so a short or empty list is never read as "no matches".
+  const coverageNotice = searchText
+    ? list.isFetching && !list.isFetchingNextPage && scope?.kind === "search" && scope.query.includeServer
+      ? { key: "mail.search.coverage.searching" }
+      : searchCoverageNotice(list.data?.pages[0]?.coverage)
+    : null;
 
   const emptyCopy = emptyStateCopy({
     searching: Boolean(searchText),
@@ -1334,11 +1372,12 @@ export function MessageList() {
                 {/* No Tooltip wrapper here: IconButton already renders one from
                     `label`, so wrapping it produced two bubbles for one button. */}
                 <IconButton
-                  icon={syncing ? <Spinner size="tiny" /> : <ArrowSync16Regular />}
+                  icon={<ArrowSync16Regular />}
                   label={tt("mail.list.sync")}
                   size="small"
                   onClick={() => void syncNow()}
-                  disabled={syncing || syncAccountIds.length === 0}
+                  busy={syncing || syncBusy}
+                  disabled={syncAccountIds.length === 0}
                 />
                 <Tooltip content={tt("mail.list.conversation")}>
                   <ToggleButton
@@ -1536,6 +1575,12 @@ export function MessageList() {
         ) : null}
       </header>
 
+      {coverageNotice ? (
+        <div className={styles.coverageNote} role="status">
+          {tt(coverageNotice.key, coverageNotice.params)}
+        </div>
+      ) : null}
+
       <div className={styles.listBody} ref={listWrapRef}>
         {list.isLoading ? (
           <div className={styles.listLoading}>
@@ -1555,8 +1600,9 @@ export function MessageList() {
         ) : (
           <VirtualList
             items={rows}
-            estimateSize={density === "compact" ? 56 : density === "spacious" ? 96 : 76}
+            estimateSize={ROW_ESTIMATE}
             getKey={(row) => row.key}
+            handleRef={listHandleRef}
             onEndReached={() => {
               if (list.hasNextPage && !list.isFetchingNextPage) void list.fetchNextPage();
             }}
@@ -1632,7 +1678,7 @@ export function MessageList() {
                     ]
                       .filter(Boolean)
                       .join(" ")}
-                    style={summaryStyle(density)}
+                    style={ROW_STYLE}
                     role="option"
                     aria-selected={isSelected}
                     tabIndex={isSelected ? 0 : -1}
@@ -1682,14 +1728,14 @@ export function MessageList() {
                           aria-label={tt("mail.list.selectMessage", { subject: summary.subject || tt("mail.list.noSubject") })}
                         />
                       </span>
-                    ) : mailSettings.showAvatars ? (
+                    ) : (
                       <Avatar
                         className={styles.rowAvatar}
                         name={summary.from?.name}
                         email={summary.from?.email}
                         size={32}
                       />
-                    ) : null}
+                    )}
 
                     <div className={styles.rowBody}>
                       <div className={styles.rowTop}>
@@ -1790,11 +1836,8 @@ export function MessageList() {
                             <span className={styles.rowOutboxError}>{outboxStatus.error}</span>
                           ) : null}
                         </div>
-                      ) : mailSettings.previewLines > 0 && summary.preview ? (
-                        <div
-                          className={styles.rowPreview}
-                          style={{ WebkitLineClamp: mailSettings.previewLines }}
-                        >
+                      ) : summary.preview ? (
+                        <div className={styles.rowPreview} style={{ WebkitLineClamp: 1 }}>
                           {summary.preview}
                         </div>
                       ) : null}
@@ -1830,7 +1873,6 @@ export function MessageList() {
                         setActive(member.id);
                         closeInlineCompose();
                       }}
-                      showAvatars={mailSettings.showAvatars}
                     />
                   ) : null}
                 </div>
@@ -1843,6 +1885,26 @@ export function MessageList() {
       {list.isFetchingNextPage ? (
         <div className={styles.listFooter} role="status">
           <Spinner size="tiny" /> {tt("common.loading")}
+        </div>
+      ) : null}
+
+      {canLoadOlder &&
+      !list.isLoading &&
+      !list.isError &&
+      !list.hasNextPage &&
+      !list.isFetchingNextPage ? (
+        <div className={styles.listFooter} role="status">
+          {olderState?.busy ? (
+            <>
+              <Spinner size="tiny" /> {tt("mail.list.loadOlder")}
+            </>
+          ) : olderState?.exhausted ? (
+            tt("mail.list.noOlder")
+          ) : (
+            <Button size="small" appearance="subtle" onClick={() => void loadOlder()}>
+              {tt("mail.list.loadOlder")}
+            </Button>
+          )}
         </div>
       ) : null}
 

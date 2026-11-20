@@ -590,7 +590,7 @@ export function MailSidebar() {
     async (folder: Folder) => {
       try {
         await foldersApi.sync(folder.id);
-        toast.success(tt("mail.sidebar.syncStarted", { name: roleLabel(folder) }));
+        toast.success(tt("mail.sidebar.folderSynced", { name: roleLabel(folder) }));
       } catch (error) {
         toast.error(tt("mail.toast.actionFailed"), errorText(error));
       }

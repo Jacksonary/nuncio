@@ -121,16 +121,6 @@ pub async fn sync_account_with(
                 {
                     warn!(%error, folder = %folder.remote_path, "notification step failed");
                 }
-                if folder.role == FolderRole::Inbox {
-                    let limit = ctx.settings.current().mail.prefetch_unread_bodies;
-                    if limit > 0 {
-                        if let Err(error) =
-                            body::prefetch_unread(ctx, conn, &account.id, folder, limit).await
-                        {
-                            debug!(%error, "unread body prefetch failed");
-                        }
-                    }
-                }
             }
             Err(error) => {
                 warn!(%error, folder = %folder.remote_path, "folder sync failed");
@@ -202,12 +192,6 @@ pub async fn sync_folder_by_id_with(
                 outcome.initial,
             )
             .await?;
-            if folder.role == FolderRole::Inbox {
-                let limit = ctx.settings.current().mail.prefetch_unread_bodies;
-                if limit > 0 {
-                    let _ = body::prefetch_unread(ctx, conn, &account.id, &folder, limit).await;
-                }
-            }
             ctx.sync_status.finish(&account.id, SyncModule::Mail);
             Ok(())
         }

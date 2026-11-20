@@ -192,10 +192,29 @@ async fn lists_searches_reads_and_renders_messages() {
         .message_get(&summary.id, false)
         .await
         .expect("detail");
+    assert!(detail.summary.seen, "opening a message marks it read");
+
+    // A view-only re-render (the reader's "view on white" toggle) must not mark
+    // the message read again: the user may have marked it unread since opening.
+    service
+        .message_act(
+            std::slice::from_ref(&summary.id),
+            &MessageAction::SetSeen { value: false },
+        )
+        .await
+        .expect("mark unread");
+    let rerendered = service
+        .message_get_with(&summary.id, false, true)
+        .await
+        .expect("re-render on white");
     assert!(
-        detail.summary.seen,
-        "markReadMode onOpen marks the message read"
+        !rerendered.summary.seen,
+        "a rendering-only request must not undo mark-as-unread"
     );
+    service
+        .message_get(&summary.id, false)
+        .await
+        .expect("open again");
     assert!(detail.has_remote_content);
     assert!(!detail.remote_content_allowed);
     assert!(!detail.html.contains(" src=\"https://remote.example"));
@@ -523,7 +542,10 @@ async fn delete_decides_per_message_and_discards_drafts() {
         .expect("delete");
     assert!(!undo_id.is_empty(), "an undo entry must be recorded");
 
-    assert_eq!(stored_folder(&ctx, "inbox-msg").await.as_deref(), Some(trash.as_str()));
+    assert_eq!(
+        stored_folder(&ctx, "inbox-msg").await.as_deref(),
+        Some(trash.as_str())
+    );
     assert_eq!(stored_folder(&ctx, "draft-msg").await, None);
 }
 
@@ -571,16 +593,34 @@ async fn undo_by_id_reverts_the_action_it_names() {
         .await
         .expect("archive");
     assert_ne!(delete_undo, archive_undo);
-    assert_eq!(stored_folder(&ctx, "delete-me").await.as_deref(), Some(trash.as_str()));
+    assert_eq!(
+        stored_folder(&ctx, "delete-me").await.as_deref(),
+        Some(trash.as_str())
+    );
 
     // The delete's toast must revert the delete even though the archive ran
     // afterwards and is the most recent undo entry.
-    assert!(service.message_undo(&delete_undo).await.expect("undo delete"));
-    assert_eq!(stored_folder(&ctx, "delete-me").await.as_deref(), Some(inbox.as_str()));
+    assert!(service
+        .message_undo(&delete_undo)
+        .await
+        .expect("undo delete"));
+    assert_eq!(
+        stored_folder(&ctx, "delete-me").await.as_deref(),
+        Some(inbox.as_str())
+    );
     // The archive is still in effect, and its own id still works afterwards.
-    assert_ne!(stored_folder(&ctx, "archive-me").await.as_deref(), Some(inbox.as_str()));
-    assert!(service.message_undo(&archive_undo).await.expect("undo archive"));
-    assert_eq!(stored_folder(&ctx, "archive-me").await.as_deref(), Some(inbox.as_str()));
+    assert_ne!(
+        stored_folder(&ctx, "archive-me").await.as_deref(),
+        Some(inbox.as_str())
+    );
+    assert!(service
+        .message_undo(&archive_undo)
+        .await
+        .expect("undo archive"));
+    assert_eq!(
+        stored_folder(&ctx, "archive-me").await.as_deref(),
+        Some(inbox.as_str())
+    );
 }
 
 #[tokio::test]
@@ -809,8 +849,7 @@ async fn bcc_recipients_are_delivered_but_hidden_from_transmitted_data() {
         .into_iter()
         .find(|op| op.kind == ops::KIND_APPEND_TO_SENT)
         .expect("sent append queued");
-    let payload: ops::AppendToSentOp =
-        repo::pending_ops::payload(&append).expect("append payload");
+    let payload: ops::AppendToSentOp = repo::pending_ops::payload(&append).expect("append payload");
     let copy = tokio::fs::read(&payload.rfc822_path)
         .await
         .expect("read sent copy");
@@ -1581,6 +1620,189 @@ async fn server_search_is_skipped_for_providers_with_broken_text_search() {
     );
 }
 
+/// A 163-like fixture: content SEARCH answers zero hits, FETCH works.
+async fn scan_fixture(email: &str) -> (MockImap, CoreContext, Account, MailService) {
+    let imap = MockImap::start_with_folders(&["UIDPLUS"], &[("INBOX", &["\\Inbox"])]).await;
+    imap.state.set_content_search_empty(true);
+    for (subject, id) in [("Hello there", "a"), ("Weekly notes", "b")] {
+        imap.state.add_message(
+            "INBOX",
+            &message_raw("Alice <alice@example.com>", email, subject, "text", id),
+        );
+    }
+    let ctx = context(
+        StaticCreds::password("test@example.com", "secret"),
+        Arc::new(RecordingNotifier::default()),
+    )
+    .await;
+    let account = account("acc", email, Some(server(imap.addr.port())), None, None);
+    insert_account(&ctx, &account).await;
+    sync_once(&ctx, &account).await;
+    // Arrive after the initial sync: only a server-side look can find these.
+    for (subject, id) in [("Quarterly Budget review", "c"), ("会议纪要 十一月", "d")] {
+        imap.state.add_message(
+            "INBOX",
+            &message_raw("Bob <bob@example.com>", email, subject, "text", id),
+        );
+    }
+    let service = MailService::new(ctx.clone());
+    (imap, ctx, account, service)
+}
+
+async fn scan_search(service: &MailService, text: &str) -> nuncio_core::models::MessagePage {
+    let mut search = SearchQuery::text(text);
+    search.include_server = true;
+    service
+        .message_list(
+            &MessageListQuery::new(MailScope::search(search))
+                .with_conversation(false)
+                .with_limit(20),
+        )
+        .await
+        .expect("search")
+}
+
+#[tokio::test]
+async fn header_scan_finds_unsynced_ascii_and_cjk_subjects() {
+    use nuncio_core::models::SearchCoverage;
+    let (imap, _ctx, _account, service) = scan_fixture("test@163.com").await;
+
+    let page = scan_search(&service, "BUDGET").await;
+    assert_eq!(
+        page.items.len(),
+        1,
+        "unsynced ASCII match must be listable: {:?} {:?}",
+        page.coverage,
+        imap.state.commands()
+    );
+    assert_eq!(page.items[0].subject, "Quarterly Budget review");
+    assert_eq!(
+        page.coverage,
+        Some(SearchCoverage::Scanned {
+            scanned: 4,
+            total: 4
+        })
+    );
+
+    let page = scan_search(&service, "会议纪要").await;
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].subject, "会议纪要 十一月");
+
+    let commands = imap.state.commands();
+    assert!(
+        commands.iter().any(|c| c.starts_with("EXAMINE")),
+        "scan must open the folder read-only: {commands:?}"
+    );
+    assert!(commands.iter().any(|c| c.contains("SEARCH ALL")), "{commands:?}");
+    assert!(commands.iter().any(|c| c.contains("FETCH")
+        && c.contains("HEADER.FIELDS (FROM TO CC SUBJECT DATE MESSAGE-ID)")));
+    let after_examine = commands
+        .iter()
+        .skip_while(|c| !c.starts_with("EXAMINE"))
+        .collect::<Vec<_>>();
+    assert!(
+        !after_examine
+            .iter()
+            .any(|c| c.contains("BODY.PEEK[TEXT]") && c.contains("1:4")),
+        "the scan must not fetch bodies (only matched hits get a 2 KiB preview): {after_examine:?}"
+    );
+    // A miss still reports how much was covered instead of a bare empty page.
+    let page = scan_search(&service, "zzznotpresent").await;
+    assert!(page.items.is_empty());
+    assert!(matches!(
+        page.coverage,
+        Some(SearchCoverage::Scanned { total: 4, .. })
+    ));
+}
+
+#[tokio::test]
+async fn header_scan_respects_the_cap_and_cancellation() {
+    let (_imap, ctx, account, _service) = scan_fixture("test@163.com").await;
+    let inbox_id = folder_id(&ctx, "acc", "INBOX").await;
+    let inbox = ctx
+        .db
+        .read(move |db| repo::folders::get(db, &inbox_id))
+        .await
+        .expect("folder")
+        .expect("inbox");
+    let mut connection = connect(&account).await;
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let outcome = nuncio_mail::sync::messages::server_scan_with_cap(
+        &ctx,
+        &mut connection,
+        &account,
+        &inbox,
+        &SearchQuery::text("hello"),
+        &cancel,
+        2,
+    )
+    .await
+    .expect("scan");
+    assert_eq!((outcome.scanned, outcome.total), (2, 4));
+    assert!(
+        outcome.ids.is_empty(),
+        "'Hello there' is older than the capped window"
+    );
+
+    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    let outcome = nuncio_mail::sync::messages::server_scan(
+        &ctx,
+        &mut connection,
+        &account,
+        &inbox,
+        &SearchQuery::text("budget"),
+        &cancel,
+    )
+    .await
+    .expect("cancelled scan");
+    assert_eq!(outcome.scanned, 0, "a cancelled scan stops before fetching");
+}
+
+#[tokio::test]
+async fn search_reports_how_it_was_produced() {
+    use nuncio_core::models::SearchCoverage;
+    // Generic provider: native SEARCH is trusted.
+    let imap = MockImap::start_with_folders(&["UIDPLUS"], &[("INBOX", &["\\Inbox"])]).await;
+    imap.state.add_message(
+        "INBOX",
+        &message_raw(
+            "Alice <alice@example.com>",
+            "test@example.com",
+            "Budget",
+            "x",
+            "n@example.com",
+        ),
+    );
+    let ctx = context(
+        StaticCreds::password("test@example.com", "secret"),
+        Arc::new(RecordingNotifier::default()),
+    )
+    .await;
+    let account = account(
+        "acc",
+        "test@example.com",
+        Some(server(imap.addr.port())),
+        None,
+        None,
+    );
+    insert_account(&ctx, &account).await;
+    sync_once(&ctx, &account).await;
+    let service = MailService::new(ctx.clone());
+
+    let page = scan_search(&service, "budget").await;
+    assert_eq!(page.coverage, Some(SearchCoverage::Server));
+
+    let page = service
+        .message_list(
+            &MessageListQuery::new(MailScope::search(SearchQuery::text("budget")))
+                .with_conversation(false),
+        )
+        .await
+        .expect("local search");
+    assert_eq!(page.coverage, Some(SearchCoverage::LocalOnly));
+    assert_eq!(page.items.len(), 1);
+}
+
 #[tokio::test]
 async fn outbox_cancel_returns_an_editable_draft() {
     let ctx = context(
@@ -1707,8 +1929,11 @@ async fn outbox_retry_none_restarts_every_failed_item() {
 
     let path = ctx.paths.staging_dir().join("outbox-retry.eml");
     ctx.paths.ensure_parent(&path).expect("staging dir");
-    std::fs::write(&path, b"Subject: retry\r\nTo: bob@example.com\r\n\r\nbody\r\n")
-        .expect("write staged message");
+    std::fs::write(
+        &path,
+        b"Subject: retry\r\nTo: bob@example.com\r\n\r\nbody\r\n",
+    )
+    .expect("write staged message");
     let item = nuncio_core::models::OutboxItem::new(
         "acc",
         None,
@@ -1786,7 +2011,10 @@ async fn folder_empty_only_allows_trash_and_junk() {
     assert_eq!(error.code(), "invalidInput");
 
     let junk = folder_id(&ctx, "acc", "Junk").await;
-    service.folder_empty(&junk).await.expect("junk can be emptied");
+    service
+        .folder_empty(&junk)
+        .await
+        .expect("junk can be emptied");
 }
 
 #[tokio::test]
@@ -1849,4 +2077,111 @@ async fn trusted_only_ignores_the_one_off_remote_override() {
         .expect("trusted detail");
     assert!(detail.remote_content_allowed);
     assert!(detail.html.contains("https://remote.example"));
+}
+
+/// Opening a POP3 message materialises its body on demand; listing alone did
+/// not download it.
+#[tokio::test]
+async fn pop3_message_detail_fetches_the_body_on_demand() {
+    let mock = support::mock_pop3::MockPop3::start().await;
+    mock.add(
+        "uid-a",
+        &message_raw(
+            "alice@example.com",
+            "test@example.com",
+            "POP3 detail",
+            "pop3 on-demand body",
+            "pop3-detail@x",
+        ),
+    );
+    let ctx = context(
+        StaticCreds::password("test@example.com", "secret"),
+        Arc::new(RecordingNotifier::default()),
+    )
+    .await;
+    let account = account(
+        "acc",
+        "test@example.com",
+        None,
+        None,
+        Some(server(mock.addr.port())),
+    );
+    insert_account(&ctx, &account).await;
+    nuncio_mail::pop3::sync::sync_account(&ctx, &account)
+        .await
+        .expect("pop3 sync");
+    assert_eq!(mock.counters.retr(), 0);
+
+    let service = MailService::new(ctx.clone());
+    let inbox = folder_id(&ctx, "acc", "INBOX").await;
+    let message = only_message(&ctx, &inbox).await;
+    assert_eq!(mock.counters.retr(), 0, "listing must stay header-only");
+
+    let detail = service
+        .message_get(&message.id, false)
+        .await
+        .expect("detail");
+    assert!(detail.html.contains("pop3 on-demand body"));
+    assert_eq!(mock.counters.retr(), 1);
+
+    // Re-opening is served from the cached body.
+    let _ = service
+        .message_get(&message.id, false)
+        .await
+        .expect("second detail");
+    assert_eq!(mock.counters.retr(), 1);
+}
+
+/// A POP3 attachment is resolved from the on-demand body: the list (header
+/// only) reports no attachments yet, and asking for one downloads the body
+/// once and then serves the part from the cached `.eml`.
+#[tokio::test]
+async fn pop3_attachment_downloads_the_body_once() {
+    let mock = support::mock_pop3::MockPop3::start().await;
+    mock.add(
+        "uid-a",
+        &raw_with_parts(
+            "Alice <alice@example.com>",
+            "test@example.com",
+            "Files",
+            "pop3-files@x",
+        ),
+    );
+    let ctx = context(
+        StaticCreds::password("test@example.com", "secret"),
+        Arc::new(RecordingNotifier::default()),
+    )
+    .await;
+    let account = account(
+        "acc",
+        "test@example.com",
+        None,
+        None,
+        Some(server(mock.addr.port())),
+    );
+    insert_account(&ctx, &account).await;
+    nuncio_mail::pop3::sync::sync_account(&ctx, &account)
+        .await
+        .expect("pop3 sync");
+    assert_eq!(mock.counters.retr(), 0);
+
+    let service = MailService::new(ctx.clone());
+    let inbox = folder_id(&ctx, "acc", "INBOX").await;
+    let message = only_message(&ctx, &inbox).await;
+    let detail = service
+        .message_get(&message.id, false)
+        .await
+        .expect("detail");
+    let regular = detail
+        .attachments
+        .iter()
+        .find(|attachment| !attachment.is_inline)
+        .expect("regular attachment");
+    let opened = service
+        .attachment_open(&regular.id)
+        .await
+        .expect("open attachment");
+    assert_eq!(std::fs::read(&opened).expect("bytes"), b"report body");
+    // One RETR for the detail, none extra for the attachment.
+    assert_eq!(mock.counters.retr(), 1);
 }

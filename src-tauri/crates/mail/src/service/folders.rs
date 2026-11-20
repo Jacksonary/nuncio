@@ -427,6 +427,27 @@ impl MailService {
         }
     }
 
+    /// Load the next batch of older mail for a real folder (IMAP / Graph).
+    /// POP3 and local accounts answer `{ loaded: 0, hasMore: false }`.
+    pub async fn folder_load_older(&self, id: &str) -> Result<nuncio_core::models::LoadOlderResult> {
+        let folder = self.folder(id).await?;
+        let account = self.account(&folder.account_id).await?;
+        if is_local_only(account.provider) {
+            return Ok(nuncio_core::models::LoadOlderResult::default());
+        }
+        let result = self.inner.engine.load_older(&folder.id).await?;
+        if result.loaded > 0 {
+            self.emit_changed(
+                &folder.account_id,
+                vec![folder.id.clone()],
+                Vec::new(),
+                events::MailChangeKind::Updated,
+            );
+            self.update_badge().await;
+        }
+        Ok(result)
+    }
+
     /// Subscribe/unsubscribe a folder (IMAP only) and mirror the flag locally.
     pub async fn folder_set_subscribed(&self, id: &str, subscribed: bool) -> Result<()> {
         let folder = self.folder(id).await?;

@@ -384,6 +384,69 @@ fn sync_window_filter(window_days: u32, now: DateTime<Utc>) -> Option<String> {
     ))
 }
 
+/// Messages requested per "load older mail" click.
+const OLDER_BATCH: usize = 100;
+
+/// One batch of older messages for [`list_older`].
+#[derive(Debug, Default)]
+pub struct OlderPage {
+    pub messages: Vec<StoredMessage>,
+    /// `true` while Graph reports a further page below this batch.
+    pub has_more: bool,
+}
+
+/// Request URL for one "load older" batch: newest first, bounded above by the
+/// oldest locally stored `receivedDateTime` (`le`, so equal-second neighbours
+/// are never skipped; the known boundary row is simply upserted again).
+fn older_url(client: &GraphMailClient, folder_id: &str, before: Option<DateTime<Utc>>) -> String {
+    let mut url = client.url(&format!(
+        "/me/mailFolders/{}/messages?%24select={}",
+        GraphMailClient::encode(folder_id),
+        GraphMailClient::encode(DELTA_SELECT)
+    ));
+    if let Some(before) = before {
+        // Graph requires every `$orderby` property to appear first in `$filter`.
+        let filter = format!(
+            "receivedDateTime le {}",
+            before.to_rfc3339_opts(SecondsFormat::Secs, true)
+        );
+        url.push_str("&%24filter=");
+        url.push_str(&GraphMailClient::encode(&filter));
+    }
+    url.push_str("&%24orderby=");
+    url.push_str(&GraphMailClient::encode("receivedDateTime desc"));
+    url.push_str(&format!("&%24top={OLDER_BATCH}"));
+    url
+}
+
+/// Fetch the next batch of older messages of a folder (one GET, no delta
+/// state touched). The cursor is derived by the caller from the local
+/// database (`before`), so it survives deletions and never goes stale like a
+/// stored `$skip` continuation would.
+pub async fn list_older(
+    client: &GraphMailClient,
+    ctx: &CoreContext,
+    account_id: &str,
+    folder: &Folder,
+    before: Option<DateTime<Utc>>,
+) -> Result<OlderPage> {
+    let url = older_url(client, &folder.remote_path, before);
+    let page: GraphMessagePage = client.get(ctx, account_id, &url).await?;
+    let mut messages = Vec::new();
+    for message in &page.value {
+        if is_removed(message) {
+            continue;
+        }
+        if let Some(stored) = map_message(message, account_id, &folder.id) {
+            messages.push(stored);
+        }
+    }
+    Ok(OlderPage {
+        messages,
+        has_more: page.next_link.is_some(),
+    })
+}
+
 /* ─────────────────────────────── mapping ───────────────────────────────── */
 
 /// Map one Graph message onto the local row model.

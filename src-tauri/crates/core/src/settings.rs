@@ -145,22 +145,6 @@ impl SettingsService {
         if let Some(theme) = patch.theme {
             let _ = theme;
         }
-        if let Some(delay) = patch
-            .mail
-            .as_ref()
-            .and_then(|mail| mail.mark_read_delay_seconds)
-        {
-            if delay > 3600 {
-                return Err(AppError::invalid_input(
-                    "markReadDelaySeconds must be <= 3600",
-                ));
-            }
-        }
-        if let Some(lines) = patch.mail.as_ref().and_then(|mail| mail.preview_lines) {
-            if lines > 10 {
-                return Err(AppError::invalid_input("previewLines must be <= 10"));
-            }
-        }
         if let Some(cache) = patch
             .mail
             .as_ref()
@@ -177,7 +161,7 @@ impl SettingsService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{HoverAction, ThemeMode};
+    use crate::models::ThemeMode;
     use crate::traits::testing::RecordingEventSink;
 
     async fn service() -> (SettingsService, Arc<RecordingEventSink>) {
@@ -205,16 +189,12 @@ mod tests {
         let (service, sink) = service().await;
         let patch: SettingsPatch = serde_json::from_value(serde_json::json!({
             "theme": "dark",
-            "mail": { "previewLines": 2, "hoverActions": ["delete", "flag"] }
+            "mail": { "bodyCacheLimitMb": 120 }
         }))
         .expect("patch");
         let updated = service.update(patch).await.expect("update");
         assert_eq!(updated.theme, ThemeMode::Dark);
-        assert_eq!(updated.mail.preview_lines, 2);
-        assert_eq!(
-            updated.mail.hover_actions,
-            vec![HoverAction::Delete, HoverAction::Flag]
-        );
+        assert_eq!(updated.mail.body_cache_limit_mb, 120);
         // Untouched sections survive the patch.
         assert_eq!(updated.calendar.work_days, vec![1, 2, 3, 4, 5]);
 
@@ -236,24 +216,72 @@ mod tests {
         });
         let second = tokio::spawn(async move {
             let patch: SettingsPatch =
-                serde_json::from_value(serde_json::json!({"startMinimized": true})).unwrap();
+                serde_json::from_value(serde_json::json!({"launchAtStartup": true})).unwrap();
             b.update(patch).await.unwrap();
         });
         first.await.expect("first");
         second.await.expect("second");
         let settings = service.current();
         assert!(!settings.close_to_tray);
-        assert!(settings.start_minimized);
+        assert!(settings.launch_at_startup);
+    }
+
+    #[tokio::test]
+    async fn stored_settings_with_removed_keys_load_and_are_dropped() {
+        let db = Db::open_in_memory().expect("db");
+        db.migrate_core().expect("migrate");
+        let legacy = serde_json::json!({
+            "startMinimized": true,
+            "closeToTray": false,
+            "mail": { "hoverActions": ["delete"], "bodyCacheLimitMb": 300 },
+            "contacts": { "sortBy": "lastName", "displayOrder": "lastFirst", "pollMinutes": 120 },
+            "tasks": { "showCompleted": true, "newTasksOnTop": false, "pollMinutes": 45 }
+        });
+        let json = serde_json::to_string(&legacy).expect("json");
+        db.write(move |conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (id, json, updated_at)
+                 VALUES (1, ?1, '1970-01-01T00:00:00Z')",
+                rusqlite::params![json],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("seed");
+
+        let sink = Arc::new(RecordingEventSink::new());
+        let service = SettingsService::load(db.clone(), sink).await.expect("load");
+        let settings = service.current();
+        assert!(!settings.close_to_tray);
+        assert_eq!(settings.mail.body_cache_limit_mb, 300);
+        assert_eq!(settings.contacts.poll_minutes, 120);
+        assert_eq!(settings.tasks.poll_minutes, 45);
+
+        // The next write persists the cleaned document: removed keys are gone.
+        let patch: SettingsPatch =
+            serde_json::from_value(serde_json::json!({"theme": "dark"})).expect("patch");
+        service.update(patch).await.expect("update");
+        let stored: Option<AppSettings> = db.read(repo::settings::load).await.expect("read back");
+        let stored = stored.expect("row");
+        let value = serde_json::to_value(&stored).expect("serialize");
+        assert!(value.get("startMinimized").is_none());
+        assert!(value["mail"].get("hoverActions").is_none());
+        assert!(value["contacts"].get("sortBy").is_none());
+        assert!(value["contacts"].get("displayOrder").is_none());
+        assert!(value["tasks"].get("showCompleted").is_none());
+        assert!(value["tasks"].get("newTasksOnTop").is_none());
+        assert_eq!(value["contacts"]["pollMinutes"], 120);
+        assert_eq!(value["tasks"]["pollMinutes"], 45);
     }
 
     #[tokio::test]
     async fn validation_rejects_bad_values() {
         let patch: SettingsPatch =
-            serde_json::from_value(serde_json::json!({"mail": {"previewLines": 99}}))
+            serde_json::from_value(serde_json::json!({"mail": {"bodyCacheLimitMb": 10}}))
                 .expect("patch");
         assert!(SettingsService::validate(&patch).is_err());
         let patch: SettingsPatch =
-            serde_json::from_value(serde_json::json!({"mail": {"previewLines": 3}}))
+            serde_json::from_value(serde_json::json!({"mail": {"bodyCacheLimitMb": 100}}))
                 .expect("patch");
         assert!(SettingsService::validate(&patch).is_ok());
     }

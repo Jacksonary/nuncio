@@ -558,11 +558,11 @@ export function CalendarMain() {
         <div className={styles.syncActions}>
           <ModuleSyncStatus module="calendar" />
           <IconButton
-            icon={syncing ? <Spinner size="tiny" /> : <ArrowSync16Regular />}
+            icon={<ArrowSync16Regular />}
             label={t("common.syncNow")}
             size="small"
             onClick={() => void syncNow()}
-            disabled={syncing}
+            busy={syncing}
           />
         </div>
         <div className={styles.searchWrap} ref={searchRef}>

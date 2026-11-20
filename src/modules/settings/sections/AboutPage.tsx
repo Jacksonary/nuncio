@@ -1,4 +1,11 @@
-/** About: version, platform, paths, links, license and privacy statement. */
+/**
+ * About Nuncio: update controls plus version, platform, paths, links, licence
+ * and privacy statement.
+ *
+ * This is a top-level settings entry (it used to be a sub-page reached from the
+ * bottom of General), so the update section that also lived in General now lives
+ * here instead of being duplicated.
+ */
 import { Copy24Regular, Open24Regular } from "@fluentui/react-icons";
 import { Button, IconButton, Spinner, toast } from "@/components";
 import { useT } from "@/lib/i18n";
@@ -7,6 +14,7 @@ import { copyText, isDesktop, openExternal } from "../lib/desktop";
 import { describeError } from "../lib/errors";
 import { useAppInfo } from "../lib/hooks";
 import { Banner, Card, Section, SettingsPage } from "../components/SettingsUI";
+import { UpdateSection } from "./UpdateSection";
 import styles from "../settings.module.css";
 
 const PLATFORM_LABEL: Record<string, string> = {
@@ -64,61 +72,65 @@ export function AboutPage({ onBack }: { onBack: () => void }) {
   };
 
   return (
-    <SettingsPage title={t("settings.about.title")} subtitle={t("settings.about.subtitle")} onBack={onBack}>
-      <Card className={styles.cardPad}>
-        {info.isLoading ? (
-          <div className={styles.spinnerRow}>
-            <Spinner size="small" />
-            <span>{t("common.loading")}</span>
-          </div>
-        ) : info.data ? (
-          <div className={styles.aboutGrid}>
-            <span className={styles.aboutLabel}>{t("settings.about.appName")}</span>
-            <span className={styles.aboutValue}>Nuncio</span>
-            <span className={styles.aboutLabel}>{t("settings.about.version")}</span>
-            <span className={styles.aboutValue}>{info.data.version}</span>
-            <span className={styles.aboutLabel}>{t("settings.about.platform")}</span>
-            <span className={styles.aboutValue}>
-              {PLATFORM_LABEL[info.data.platform] ?? info.data.platform}
-            </span>
-            <span className={styles.aboutLabel}>{t("settings.about.dataDir")}</span>
-            <span className={styles.aboutValue}>
-              <span className={styles.mono}>{info.data.dataDir}</span>{" "}
-              <IconButton
-                icon={<Copy24Regular />}
-                label={t("settings.about.copyPath")}
-                size="small"
-                tooltip={false}
-                onClick={() => void copy(info.data!.dataDir, t("settings.about.dataDir"))}
-              />
-            </span>
-            <span className={styles.aboutLabel}>{t("settings.about.logDir")}</span>
-            <span className={styles.aboutValue}>
-              <span className={styles.mono}>{info.data.logDir}</span>{" "}
-              <IconButton
-                icon={<Copy24Regular />}
-                label={t("settings.about.copyPath")}
-                size="small"
-                tooltip={false}
-                onClick={() => void copy(info.data!.logDir, t("settings.about.logDir"))}
-              />
-              <IconButton
-                icon={<Open24Regular />}
-                label={t("settings.data.openLogs")}
-                size="small"
-                tooltip={false}
-                onClick={() => void openLogs()}
-              />
-            </span>
-            <span className={styles.aboutLabel}>{t("settings.about.license")}</span>
-            <span className={styles.aboutValue}>{t("settings.about.licenseValue")}</span>
-          </div>
-        ) : (
-          <Banner tone="warning" title={t("settings.about.infoUnavailable")}>
-            {describeError(info.error, t)}
-          </Banner>
-        )}
-      </Card>
+    <SettingsPage title={t("settings.home.about")} subtitle={t("settings.home.aboutDesc")} onBack={onBack}>
+      <UpdateSection />
+
+      <Section>
+        <Card className={styles.cardPad}>
+          {info.isLoading ? (
+            <div className={styles.spinnerRow}>
+              <Spinner size="small" />
+              <span>{t("common.loading")}</span>
+            </div>
+          ) : info.data ? (
+            <div className={styles.aboutGrid}>
+              <span className={styles.aboutLabel}>{t("settings.about.appName")}</span>
+              <span className={styles.aboutValue}>Nuncio</span>
+              <span className={styles.aboutLabel}>{t("settings.about.version")}</span>
+              <span className={styles.aboutValue}>{info.data.version}</span>
+              <span className={styles.aboutLabel}>{t("settings.about.platform")}</span>
+              <span className={styles.aboutValue}>
+                {PLATFORM_LABEL[info.data.platform] ?? info.data.platform}
+              </span>
+              <span className={styles.aboutLabel}>{t("settings.about.dataDir")}</span>
+              <span className={styles.aboutValue}>
+                <span className={styles.mono}>{info.data.dataDir}</span>{" "}
+                <IconButton
+                  icon={<Copy24Regular />}
+                  label={t("settings.about.copyPath")}
+                  size="small"
+                  tooltip={false}
+                  onClick={() => void copy(info.data!.dataDir, t("settings.about.dataDir"))}
+                />
+              </span>
+              <span className={styles.aboutLabel}>{t("settings.about.logDir")}</span>
+              <span className={styles.aboutValue}>
+                <span className={styles.mono}>{info.data.logDir}</span>{" "}
+                <IconButton
+                  icon={<Copy24Regular />}
+                  label={t("settings.about.copyPath")}
+                  size="small"
+                  tooltip={false}
+                  onClick={() => void copy(info.data!.logDir, t("settings.about.logDir"))}
+                />
+                <IconButton
+                  icon={<Open24Regular />}
+                  label={t("settings.data.openLogs")}
+                  size="small"
+                  tooltip={false}
+                  onClick={() => void openLogs()}
+                />
+              </span>
+              <span className={styles.aboutLabel}>{t("settings.about.license")}</span>
+              <span className={styles.aboutValue}>{t("settings.about.licenseValue")}</span>
+            </div>
+          ) : (
+            <Banner tone="warning" title={t("settings.about.infoUnavailable")}>
+              {describeError(info.error, t)}
+            </Banner>
+          )}
+        </Card>
+      </Section>
 
       <Section title={t("settings.about.linksTitle")}>
         <Card className={styles.cardPad}>

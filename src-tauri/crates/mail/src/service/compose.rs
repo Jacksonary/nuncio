@@ -117,8 +117,7 @@ impl MailService {
             Language::EnUs => "en-US",
             _ => "zh-CN",
         };
-        let quote = settings.mail.quote_original;
-        let parts = nuncio_mime::build_reply(&parsed, mode, &me, lang, quote);
+        let parts = nuncio_mime::build_reply(&parsed, mode, &me, lang, true);
 
         let signature = self
             .signature_for_identity(
@@ -176,8 +175,7 @@ impl MailService {
                 tokio::fs::write(&dest, &bytes).await.map_err(|error| {
                     AppError::io(format!("cannot stage forwarded attachment: {error}"))
                 })?;
-                let keep_inline = quote || matches!(mode, ReplyMode::EditAsNew);
-                let content_id = if attachment.is_inline && keep_inline {
+                let content_id = if attachment.is_inline {
                     Some(
                         attachment
                             .content_id

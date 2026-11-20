@@ -1,16 +1,16 @@
-/** Calendar settings page. */
+/** Calendar settings; embedded by the Calendar, contacts & tasks page. */
 import { Checkbox, Select, Switch, TimePicker } from "@/components";
 import { useT } from "@/lib/i18n";
 import type { CalendarView } from "@/ipc/types";
 import { useSettings } from "@/lib/useSettings";
-import { SettingRow, Section, Card, SettingsPage, StackRow } from "../components/SettingsUI";
+import { SettingRow, Section, Card, StackRow } from "../components/SettingsUI";
 import styles from "../settings.module.css";
 
 const VIEWS: CalendarView[] = ["day", "workWeek", "week", "month", "year", "agenda"];
 const REMINDER_MINUTES = [0, 5, 10, 15, 30, 60, 120, 1440];
 const DURATIONS = [15, 30, 45, 60, 90, 120, 180, 240];
 
-export function CalendarSettingsPage({ onBack }: { onBack: () => void }) {
+export function CalendarSettingsContent() {
   const t = useT();
   const { settings, update } = useSettings();
 
@@ -22,7 +22,7 @@ export function CalendarSettingsPage({ onBack }: { onBack: () => void }) {
   };
 
   return (
-    <SettingsPage title={t("settings.calendar.title")} subtitle={t("settings.calendar.subtitle")} onBack={onBack}>
+    <>
       <Section title={t("settings.calendar.views")}>
         <Card>
           <SettingRow label={t("settings.calendar.defaultView")} description={t("settings.calendar.defaultViewDesc")}>
@@ -139,6 +139,6 @@ export function CalendarSettingsPage({ onBack }: { onBack: () => void }) {
           </SettingRow>
         </Card>
       </Section>
-    </SettingsPage>
+    </>
   );
 }

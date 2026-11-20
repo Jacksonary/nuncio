@@ -2,13 +2,13 @@
  * Settings module public entry points, consumed by the shell:
  *  - SettingsPanel: content of the right-side settings flyout
  *  - AddAccountDialog: first-run / add-account wizard
- *  - AccountsSection: account management page
+ *  - AccountsPage: account management page
  */
 import { startAutoUpdateCheck } from "./lib/autoUpdate";
 
 export { SettingsPanel } from "./SettingsPanel";
 export { AddAccountDialog } from "./AddAccountDialog";
-export { AccountsSection } from "./components/AccountsSection";
+export { AccountsPage } from "./sections/AccountsPage";
 
 // The shell imports this entry module once at startup. Starting the scheduler
 // here makes the "check for updates automatically" setting take effect even

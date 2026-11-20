@@ -1,4 +1,4 @@
-/** Advanced: custom OAuth client ids for Google and Microsoft. */
+/** Advanced OAuth client ids; embedded under a disclosure on the Accounts page. */
 import { useState } from "react";
 import { Eye24Regular, EyeOff24Regular, Open24Regular } from "@fluentui/react-icons";
 import { Button, IconButton, Input, confirm, toast } from "@/components";
@@ -10,13 +10,13 @@ import {
   clientSecretPatch,
   hasStoredClientSecret,
 } from "../lib/clientSecret";
-import { Banner, Card, Hint, Section, SettingsPage, StackRow } from "../components/SettingsUI";
+import { Banner, Card, Hint, Section, StackRow } from "../components/SettingsUI";
 import styles from "../settings.module.css";
 
 const GOOGLE_CREDENTIALS_URL = "https://console.cloud.google.com/apis/credentials";
 const MICROSOFT_ENTRA_URL = "https://entra.microsoft.com/";
 
-export function AdvancedPage({ onBack }: { onBack: () => void }) {
+export function AdvancedContent() {
   const t = useT();
   const { settings, updateAsync } = useSettings();
   const appInfo = useAppInfo();
@@ -87,7 +87,7 @@ export function AdvancedPage({ onBack }: { onBack: () => void }) {
   };
 
   return (
-    <SettingsPage title={t("settings.advanced.title")} subtitle={t("settings.advanced.subtitle")} onBack={onBack}>
+    <>
       <Banner tone="info" title={t("settings.advanced.whyTitle")}>
         {t("settings.advanced.why")}
       </Banner>
@@ -186,6 +186,6 @@ export function AdvancedPage({ onBack }: { onBack: () => void }) {
 
       <Hint>{t("settings.advanced.restartNote")}</Hint>
       <Hint>{t("settings.advanced.securityNote")}</Hint>
-    </SettingsPage>
+    </>
   );
 }

@@ -1,5 +1,6 @@
 //! Test support: mock servers, static credentials and a recording notifier.
 
+pub mod mock_graph;
 pub mod mock_imap;
 pub mod mock_pop3;
 pub mod mock_smtp;

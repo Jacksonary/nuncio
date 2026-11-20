@@ -50,7 +50,7 @@ export const people: {
     "people.list.unfavorite": "取消收藏 {name}",
     "people.list.multiSelectHint": "按 Ctrl/⌘ 点击可选择多位联系人",
     "people.list.sync": "同步联系人",
-    "people.list.syncStarted": "已开始同步联系人",
+    "people.list.synced": "联系人已同步",
     "people.list.noEmail": "无电子邮件",
     "people.list.sectionOther": "其他",
 
@@ -267,7 +267,7 @@ export const people: {
     "people.list.unfavorite": "Remove {name} from favorites",
     "people.list.multiSelectHint": "Ctrl/⌘-click to select multiple contacts",
     "people.list.sync": "Sync contacts",
-    "people.list.syncStarted": "Contacts sync started",
+    "people.list.synced": "Contacts synced",
     "people.list.noEmail": "No email",
     "people.list.sectionOther": "Other",
 

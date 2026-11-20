@@ -1027,6 +1027,38 @@ pub struct MessagePage {
     pub items: Vec<MessageSummary>,
     pub next_cursor: Option<String>,
     pub total: i64,
+    /// How a search page was produced; `None` for non-search listings.
+    #[serde(default)]
+    pub coverage: Option<SearchCoverage>,
+}
+
+/// Outcome of one user-driven "load older mail" batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoadOlderResult {
+    /// Messages newly stored locally by this batch.
+    pub loaded: u32,
+    /// Whether the server may still hold older mail below this batch.
+    pub has_more: bool,
+}
+
+/// How much of the mailbox a search actually covered, so the UI never claims
+/// "no matches" when only part of it was looked at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum SearchCoverage {
+    /// Only the local index (synced messages) was searched.
+    LocalOnly,
+    /// The server answered a native `UID SEARCH` (bodies included).
+    Server,
+    /// The server cannot search content; message headers were scanned and
+    /// matched locally. `scanned` of `total` candidate messages were read;
+    /// bodies are not covered.
+    #[serde(rename_all = "camelCase")]
+    Scanned { scanned: u32, total: u32 },
+    /// The server search failed; only the local index was used.
+    #[serde(rename_all = "camelCase")]
+    ServerUnavailable { message: String },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -2286,17 +2318,6 @@ impl FromStr for Language {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum HoverAction {
-    Archive,
-    Delete,
-    Flag,
-    Read,
-    Move,
-    None,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub enum CalendarView {
     Day,
     WorkWeek,
@@ -2304,24 +2325,6 @@ pub enum CalendarView {
     Month,
     Year,
     Agenda,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum MailDensity {
-    Compact,
-    #[default]
-    Normal,
-    Spacious,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum MarkReadMode {
-    #[default]
-    OnOpen,
-    AfterDelay,
-    Manual,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -2336,74 +2339,22 @@ pub enum RemoteImagesPolicy {
     Always,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum AutoAdvance {
-    #[default]
-    Next,
-    Previous,
-    List,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ContactsSortBy {
-    #[default]
-    FirstName,
-    LastName,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum DisplayOrder {
-    #[default]
-    FirstLast,
-    LastFirst,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct MailSettings {
     pub conversation_view: bool,
-    pub preview_lines: u32,
-    pub density: MailDensity,
-    pub show_avatars: bool,
-    pub mark_read_mode: MarkReadMode,
-    pub mark_read_delay_seconds: u32,
     pub remote_images: RemoteImagesPolicy,
-    pub light_message_background: bool,
-    pub hover_actions: Vec<HoverAction>,
-    pub confirm_delete: bool,
-    pub auto_advance: AutoAdvance,
-    pub default_font_family: String,
-    pub default_font_size: u32,
-    pub prefetch_unread_bodies: u32,
     pub body_cache_limit_mb: u32,
     pub other_folders_poll_minutes: u32,
-    /// Include the original message when replying.
-    pub quote_original: bool,
 }
 
 impl Default for MailSettings {
     fn default() -> Self {
         Self {
             conversation_view: true,
-            preview_lines: 1,
-            density: MailDensity::Normal,
-            show_avatars: true,
-            mark_read_mode: MarkReadMode::OnOpen,
-            mark_read_delay_seconds: 5,
             remote_images: RemoteImagesPolicy::Always,
-            light_message_background: false,
-            hover_actions: vec![HoverAction::Archive, HoverAction::Delete, HoverAction::Flag],
-            confirm_delete: true,
-            auto_advance: AutoAdvance::Next,
-            default_font_family: String::new(),
-            default_font_size: 14,
-            prefetch_unread_bodies: 50,
             body_cache_limit_mb: 500,
             other_folders_poll_minutes: 15,
-            quote_original: true,
         }
     }
 }
@@ -2441,36 +2392,24 @@ impl Default for CalendarSettings {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ContactsSettings {
-    pub sort_by: ContactsSortBy,
-    pub display_order: DisplayOrder,
     pub poll_minutes: u32,
 }
 
 impl Default for ContactsSettings {
     fn default() -> Self {
-        Self {
-            sort_by: ContactsSortBy::FirstName,
-            display_order: DisplayOrder::FirstLast,
-            poll_minutes: 60,
-        }
+        Self { poll_minutes: 60 }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct TasksSettings {
-    pub show_completed: bool,
     pub poll_minutes: u32,
-    pub new_tasks_on_top: bool,
 }
 
 impl Default for TasksSettings {
     fn default() -> Self {
-        Self {
-            show_completed: false,
-            poll_minutes: 30,
-            new_tasks_on_top: true,
-        }
+        Self { poll_minutes: 30 }
     }
 }
 
@@ -2577,7 +2516,6 @@ pub struct AppSettings {
     pub language: Language,
     pub close_to_tray: bool,
     pub launch_at_startup: bool,
-    pub start_minimized: bool,
     pub mail: MailSettings,
     pub calendar: CalendarSettings,
     pub contacts: ContactsSettings,
@@ -2596,7 +2534,6 @@ impl Default for AppSettings {
             language: Language::System,
             close_to_tray: true,
             launch_at_startup: false,
-            start_minimized: false,
             mail: MailSettings::default(),
             calendar: CalendarSettings::default(),
             contacts: ContactsSettings::default(),
@@ -2633,22 +2570,9 @@ macro_rules! patch_struct {
 
 patch_struct!(MailSettingsPatch {
     conversation_view: bool,
-    preview_lines: u32,
-    density: MailDensity,
-    show_avatars: bool,
-    mark_read_mode: MarkReadMode,
-    mark_read_delay_seconds: u32,
     remote_images: RemoteImagesPolicy,
-    light_message_background: bool,
-    hover_actions: Vec<HoverAction>,
-    confirm_delete: bool,
-    auto_advance: AutoAdvance,
-    default_font_family: String,
-    default_font_size: u32,
-    prefetch_unread_bodies: u32,
     body_cache_limit_mb: u32,
     other_folders_poll_minutes: u32,
-    quote_original: bool,
 });
 
 patch_struct!(CalendarSettingsPatch {
@@ -2663,17 +2587,9 @@ patch_struct!(CalendarSettingsPatch {
     poll_minutes: u32,
 });
 
-patch_struct!(ContactsSettingsPatch {
-    sort_by: ContactsSortBy,
-    display_order: DisplayOrder,
-    poll_minutes: u32,
-});
+patch_struct!(ContactsSettingsPatch { poll_minutes: u32 });
 
-patch_struct!(TasksSettingsPatch {
-    show_completed: bool,
-    poll_minutes: u32,
-    new_tasks_on_top: bool,
-});
+patch_struct!(TasksSettingsPatch { poll_minutes: u32 });
 
 patch_struct!(NotificationsSettingsPatch {
     enabled: bool,
@@ -2727,8 +2643,6 @@ pub struct SettingsPatch {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub launch_at_startup: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub start_minimized: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub mail: Option<MailSettingsPatch>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub calendar: Option<CalendarSettingsPatch>,
@@ -2754,7 +2668,6 @@ impl std::fmt::Debug for SettingsPatch {
             .field("language", &self.language)
             .field("close_to_tray", &self.close_to_tray)
             .field("launch_at_startup", &self.launch_at_startup)
-            .field("start_minimized", &self.start_minimized)
             .field("mail", &self.mail)
             .field("calendar", &self.calendar)
             .field("contacts", &self.contacts)
@@ -3525,16 +3438,16 @@ mod tests {
         let patch = SettingsPatch {
             theme: Some(ThemeMode::Dark),
             mail: Some(MailSettingsPatch {
-                preview_lines: Some(2),
+                body_cache_limit_mb: Some(100),
                 ..Default::default()
             }),
             ..Default::default()
         };
         let value = patch.to_patch_value().expect("value");
         assert_eq!(value["theme"], "dark");
-        assert_eq!(value["mail"]["previewLines"], 2);
+        assert_eq!(value["mail"]["bodyCacheLimitMb"], 100);
         assert!(value.get("language").is_none());
-        assert!(value["mail"].get("density").is_none());
+        assert!(value["mail"].get("remoteImages").is_none());
     }
 
     #[test]
@@ -3543,15 +3456,7 @@ mod tests {
         assert_eq!(s.theme, ThemeMode::System);
         assert_eq!(s.language, Language::System);
         assert!(s.close_to_tray);
-        assert_eq!(s.mail.preview_lines, 1);
-        assert_eq!(s.mail.density, MailDensity::Normal);
-        assert_eq!(s.mail.mark_read_mode, MarkReadMode::OnOpen);
         assert_eq!(s.mail.remote_images, RemoteImagesPolicy::Always);
-        assert_eq!(
-            s.mail.hover_actions,
-            vec![HoverAction::Archive, HoverAction::Delete, HoverAction::Flag]
-        );
-        assert_eq!(s.mail.prefetch_unread_bodies, 50);
         assert_eq!(s.mail.body_cache_limit_mb, 500);
         assert_eq!(s.mail.other_folders_poll_minutes, 15);
         assert_eq!(s.calendar.default_view, CalendarView::Week);
@@ -3573,17 +3478,62 @@ mod tests {
     fn deep_merge_merges_objects_replaces_arrays() {
         let base = AppSettings::default();
         let patch: SettingsPatch = serde_json::from_value(serde_json::json!({
-            "mail": { "previewLines": 3, "hoverActions": ["delete"] },
+            "mail": { "bodyCacheLimitMb": 200, "remoteImages": "ask" },
             "calendar": { "workDays": [1] }
         }))
         .expect("patch");
         let merged = merge_settings(&base, &patch).expect("merge");
-        assert_eq!(merged.mail.preview_lines, 3);
-        assert_eq!(merged.mail.hover_actions, vec![HoverAction::Delete]);
+        assert_eq!(merged.mail.body_cache_limit_mb, 200);
+        assert_eq!(merged.mail.remote_images, RemoteImagesPolicy::Ask);
         assert_eq!(merged.calendar.work_days, vec![1]);
         // untouched values preserved
-        assert_eq!(merged.mail.density, MailDensity::Normal);
+        assert!(merged.mail.conversation_view);
         assert_eq!(merged.calendar.work_hours_start, "09:00");
+    }
+
+    #[test]
+    fn stored_settings_with_removed_keys_still_load() {
+        let stored = serde_json::json!({
+            "startMinimized": true,
+            "mail": {
+                "conversationView": false,
+                "previewLines": 3,
+                "density": "compact",
+                "showAvatars": false,
+                "markReadMode": "manual",
+                "markReadDelaySeconds": 5,
+                "hoverActions": ["delete"],
+                "confirmDelete": false,
+                "autoAdvance": "list",
+                "defaultFontFamily": "Arial",
+                "defaultFontSize": 16,
+                "prefetchUnreadBodies": 50,
+                "quoteOriginal": false,
+                "bodyCacheLimitMb": 300
+            },
+            "contacts": {
+                "sortBy": "lastName",
+                "displayOrder": "lastFirst",
+                "pollMinutes": 120
+            },
+            "tasks": {
+                "showCompleted": true,
+                "newTasksOnTop": false,
+                "pollMinutes": 45
+            }
+        });
+        let s: AppSettings = serde_json::from_value(stored).expect("legacy settings load");
+        assert!(!s.mail.conversation_view);
+        assert_eq!(s.mail.body_cache_limit_mb, 300);
+        assert_eq!(s.contacts.poll_minutes, 120);
+        assert_eq!(s.tasks.poll_minutes, 45);
+        // The removed keys are dropped, not round-tripped back to storage.
+        let reloaded = serde_json::to_value(&s).expect("serialize");
+        assert!(reloaded.get("startMinimized").is_none());
+        assert!(reloaded["contacts"].get("sortBy").is_none());
+        assert!(reloaded["contacts"].get("displayOrder").is_none());
+        assert!(reloaded["tasks"].get("showCompleted").is_none());
+        assert!(reloaded["tasks"].get("newTasksOnTop").is_none());
     }
 
     #[test]

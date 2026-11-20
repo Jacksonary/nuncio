@@ -236,9 +236,8 @@ pub fn next_occurrence(task: &Task, today: &str) -> Option<TaskInput> {
 
 /// Sort a custom list by `sort_order` (ascending).
 ///
-/// New tasks receive `MIN(sort_order) - 1` when `newTasksOnTop` is on (they
-/// land first) and `MAX(sort_order) + 1` when it is off (they land last), so a
-/// single ascending sort implements both settings.
+/// New tasks receive `MIN(sort_order) - 1` so they land first, and a single
+/// ascending sort puts them at the top of the list.
 pub fn sort_for_list(tasks: &mut [Task]) {
     tasks.sort_by(|left, right| {
         left.sort_order

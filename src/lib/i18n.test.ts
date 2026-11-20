@@ -8,6 +8,36 @@ import {
   translateMaybeKey,
 } from "@/lib/i18n";
 
+/**
+ * Every `src/i18n/<module>.ts` dictionary file with its source text, read
+ * through Vite so no Node built-ins (and no `@types/node`) are needed.
+ */
+const DICTIONARY_SOURCES = import.meta.glob("../i18n/*.ts", {
+  query: "?raw",
+  import: "default",
+  eager: true,
+}) as Record<string, string> | undefined;
+
+function moduleSources(): Array<[string, string]> {
+  return Object.entries(DICTIONARY_SOURCES ?? {})
+    .filter(([path]) => !path.endsWith("/index.ts"))
+    .map(([path, source]): [string, string] => [path.split("/").pop() ?? path, source])
+    .sort(([a], [b]) => a.localeCompare(b));
+}
+
+/**
+ * Source text of one language block, from its `"zh-CN": {` line to the matching
+ * closing `},`. Dictionary files are a flat object of string literals, so the
+ * first `},` at the same indent ends the block.
+ */
+function languageBlock(source: string, language: "zh-CN" | "en-US"): string | null {
+  const start = source.search(new RegExp(`^\\s*"${language}":\\s*\\{`, "m"));
+  if (start < 0) return null;
+  const open = source.indexOf("{", start);
+  const end = source.indexOf("\n  },", open);
+  return source.slice(open, end < 0 ? undefined : end);
+}
+
 describe("i18n", () => {
   beforeEach(() => {
     setLanguage("en-US");
@@ -59,6 +89,35 @@ describe("i18n", () => {
     const en = Object.keys(dictionaries["en-US"]).sort();
     expect(zh).toEqual(en);
     expect(zh.length).toBeGreaterThan(50);
+  });
+
+  /**
+   * A duplicated key inside one language object is legal JavaScript: the later
+   * entry silently wins, so the earlier translation disappears without any
+   * error. The merge that produced this bug left entries shadowed that way, so
+   * the dictionaries are scanned as source text rather than as objects (the
+   * object would already have collapsed the duplicate).
+   */
+  it("declares every key at most once per language block", () => {
+    const duplicated: string[] = [];
+    for (const [file, source] of moduleSources()) {
+      for (const language of ["zh-CN", "en-US"] as const) {
+        const block = languageBlock(source, language);
+        if (block === null) continue;
+        const seen = new Map<string, number>();
+        for (const match of block.matchAll(/^\s*"([^"]+)"\s*:/gm)) {
+          const key = match[1];
+          const line = block.slice(0, match.index).split("\n").length;
+          const previous = seen.get(key);
+          if (previous !== undefined) {
+            duplicated.push(`${file} ${language} ${key} (lines ${previous} and ${line})`);
+          } else {
+            seen.set(key, line);
+          }
+        }
+      }
+    }
+    expect(duplicated).toEqual([]);
   });
 
   it("contains no empty translations", () => {

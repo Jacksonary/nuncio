@@ -6,49 +6,32 @@ import {
   CalendarLtr24Regular,
   ChevronRight24Regular,
   Database24Regular,
-  Filter24Regular,
   Info24Regular,
   MailRead24Regular,
-  PaintBrush24Regular,
-  People24Regular,
   Person24Regular,
   Settings24Regular,
-  Signature24Regular,
-  TaskListLtr24Regular,
-  Wrench24Regular,
 } from "@fluentui/react-icons";
 import { useSidePanelCloseGuard, isDraftTextField } from "@/components/SidePanel";
 import { useT } from "@/lib/i18n";
 import type { SettingsPanelProps } from "@/app/moduleTypes";
-import { AccountsSection } from "./components/AccountsSection";
-import { AppearancePage } from "./sections/AppearancePage";
-import { ReadingPage } from "./sections/ReadingPage";
-import { RulesPage } from "./sections/RulesPage";
+import { AccountsPage } from "./sections/AccountsPage";
+import { MailPage } from "./sections/MailPage";
 import { NotificationsPage } from "./sections/NotificationsPage";
-import { CalendarSettingsPage } from "./sections/CalendarSettingsPage";
-import { ContactsSettingsPage } from "./sections/ContactsSettingsPage";
-import { TasksSettingsPage } from "./sections/TasksSettingsPage";
-import { SignaturesPage } from "./sections/SignaturesPage";
+import { CalendarContactsTasksPage } from "./sections/CalendarContactsTasksPage";
 import { GeneralPage } from "./sections/GeneralPage";
 import { DataPage } from "./sections/DataPage";
-import { AdvancedPage } from "./sections/AdvancedPage";
 import { AboutPage } from "./sections/AboutPage";
 import styles from "./settings.module.css";
 
+/** The seven top-level entries. */
 type SectionId =
   | "home"
   | "accounts"
-  | "signatures"
-  | "appearance"
-  | "reading"
-  | "rules"
+  | "mail"
+  | "pim"
   | "notifications"
-  | "calendar"
-  | "contacts"
-  | "tasks"
   | "general"
   | "data"
-  | "advanced"
   | "about";
 
 interface HomeItem {
@@ -58,7 +41,20 @@ interface HomeItem {
   descKey: string;
 }
 
-const HOME_ITEMS: HomeItem[] = [
+/** Where the back button returns to: every page is top-level, so all go home. */
+const BACK_TARGETS: Record<SectionId, SectionId> = {
+  home: "home",
+  accounts: "home",
+  mail: "home",
+  pim: "home",
+  notifications: "home",
+  general: "home",
+  data: "home",
+  about: "home",
+};
+
+/** Exported for the home-list i18n coverage test. */
+export const HOME_ITEMS: HomeItem[] = [
   {
     id: "accounts",
     icon: <Person24Regular />,
@@ -66,52 +62,22 @@ const HOME_ITEMS: HomeItem[] = [
     descKey: "settings.home.accountsDesc",
   },
   {
-    id: "signatures",
-    icon: <Signature24Regular />,
-    titleKey: "settings.home.signatures",
-    descKey: "settings.home.signaturesDesc",
-  },
-  {
-    id: "appearance",
-    icon: <PaintBrush24Regular />,
-    titleKey: "settings.home.appearance",
-    descKey: "settings.home.appearanceDesc",
-  },
-  {
-    id: "reading",
+    id: "mail",
     icon: <MailRead24Regular />,
-    titleKey: "settings.home.reading",
-    descKey: "settings.home.readingDesc",
+    titleKey: "settings.home.mail",
+    descKey: "settings.home.mailDesc",
   },
   {
-    id: "rules",
-    icon: <Filter24Regular />,
-    titleKey: "settings.home.rules",
-    descKey: "settings.home.rulesDesc",
+    id: "pim",
+    icon: <CalendarLtr24Regular />,
+    titleKey: "settings.home.pim",
+    descKey: "settings.home.pimDesc",
   },
   {
     id: "notifications",
     icon: <Alert24Regular />,
     titleKey: "settings.home.notifications",
     descKey: "settings.home.notificationsDesc",
-  },
-  {
-    id: "calendar",
-    icon: <CalendarLtr24Regular />,
-    titleKey: "settings.home.calendar",
-    descKey: "settings.home.calendarDesc",
-  },
-  {
-    id: "contacts",
-    icon: <People24Regular />,
-    titleKey: "settings.home.contacts",
-    descKey: "settings.home.contactsDesc",
-  },
-  {
-    id: "tasks",
-    icon: <TaskListLtr24Regular />,
-    titleKey: "settings.home.tasks",
-    descKey: "settings.home.tasksDesc",
   },
   {
     id: "general",
@@ -124,12 +90,6 @@ const HOME_ITEMS: HomeItem[] = [
     icon: <Database24Regular />,
     titleKey: "settings.home.data",
     descKey: "settings.home.dataDesc",
-  },
-  {
-    id: "advanced",
-    icon: <Wrench24Regular />,
-    titleKey: "settings.home.advanced",
-    descKey: "settings.home.advancedDesc",
   },
   {
     id: "about",
@@ -145,7 +105,9 @@ export function SettingsPanel({ accountId }: SettingsPanelProps) {
   const t = useT();
   // A deep link to one account should land on the accounts page with that
   // account already open, rather than on the index.
-  const [section, setSection] = useState<SectionId>(accountId ? "accounts" : "home");
+  const [section, setSection] = useState<SectionId>(
+    accountId ? "accounts" : "home",
+  );
   const [dirty, setDirty] = useState(false);
   const closeGuard = useSidePanelCloseGuard();
   const queryClient = useQueryClient();
@@ -209,7 +171,7 @@ export function SettingsPanel({ accountId }: SettingsPanelProps) {
     if (!dirty) setDirty(true);
   };
 
-  const back = () => openSection("home");
+  const back = () => openSection(BACK_TARGETS[section]);
 
   let content: ReactNode = null;
   if (section === "home") {
@@ -244,40 +206,22 @@ export function SettingsPanel({ accountId }: SettingsPanelProps) {
   } else {
     switch (section) {
       case "accounts":
-        content = <AccountsSection onBack={back} initialAccountId={accountId} />;
+        content = <AccountsPage onBack={back} initialAccountId={accountId} />;
         break;
-      case "signatures":
-        content = <SignaturesPage onBack={back} />;
+      case "mail":
+        content = <MailPage onBack={back} />;
         break;
-      case "appearance":
-        content = <AppearancePage onBack={back} />;
-        break;
-      case "reading":
-        content = <ReadingPage onBack={back} />;
-        break;
-      case "rules":
-        content = <RulesPage onBack={back} />;
+      case "pim":
+        content = <CalendarContactsTasksPage onBack={back} />;
         break;
       case "notifications":
         content = <NotificationsPage onBack={back} />;
-        break;
-      case "calendar":
-        content = <CalendarSettingsPage onBack={back} />;
-        break;
-      case "contacts":
-        content = <ContactsSettingsPage onBack={back} />;
-        break;
-      case "tasks":
-        content = <TasksSettingsPage onBack={back} />;
         break;
       case "general":
         content = <GeneralPage onBack={back} />;
         break;
       case "data":
-        content = <DataPage onBack={back} onOpenAbout={() => openSection("about")} />;
-        break;
-      case "advanced":
-        content = <AdvancedPage onBack={back} />;
+        content = <DataPage onBack={back} />;
         break;
       case "about":
         content = <AboutPage onBack={back} />;

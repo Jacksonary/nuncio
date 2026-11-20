@@ -9,7 +9,7 @@
 
 use std::collections::HashSet;
 use std::io;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -66,12 +66,34 @@ pub struct MockState {
     /// When set, a connection that stays idle (no command) for this long is
     /// silently closed, mimicking NetEase 163.
     idle_timeout: Mutex<Option<Duration>>,
+    /// When set, content SEARCH keys (TEXT/SUBJECT/FROM/...) answer `OK` with
+    /// zero hits while structural keys and FETCH keep working (NetEase 163).
+    content_search_empty: AtomicBool,
+    /// Omit the `UIDNEXT` response code from SELECT/EXAMINE (NetEase 163).
+    omit_uidnext: AtomicBool,
+    /// Every command received, as `"COMMAND args"` in arrival order.
+    commands: Mutex<Vec<String>>,
 }
 
 impl MockState {
     /// Silently close connections that have been idle for `timeout`.
     pub fn set_idle_timeout(&self, timeout: Option<Duration>) {
         *self.idle_timeout.lock().expect("mock idle timeout lock") = timeout;
+    }
+
+    /// Make content SEARCH keys return no hits.
+    pub fn set_content_search_empty(&self, value: bool) {
+        self.content_search_empty.store(value, Ordering::SeqCst);
+    }
+
+    /// Make SELECT/EXAMINE leave out `UIDNEXT`, as NetEase 163 does.
+    pub fn set_omit_uidnext(&self, value: bool) {
+        self.omit_uidnext.store(value, Ordering::SeqCst);
+    }
+
+    /// Commands received so far, as `"COMMAND args"`.
+    pub fn commands(&self) -> Vec<String> {
+        self.commands.lock().expect("mock commands lock").clone()
     }
 
     fn idle_timeout(&self) -> Option<Duration> {
@@ -212,6 +234,9 @@ impl MockImap {
             capabilities: caps,
             connections: AtomicUsize::new(0),
             idle_timeout: Mutex::new(None),
+            content_search_empty: AtomicBool::new(false),
+            omit_uidnext: AtomicBool::new(false),
+            commands: Mutex::new(Vec::new()),
             folders: Mutex::new(
                 folders
                     .iter()
@@ -294,6 +319,11 @@ async fn handle_command(
     let tag = tokens[0].clone();
     let command = tokens[1].to_ascii_uppercase();
     let args = &tokens[2..];
+    state
+        .commands
+        .lock()
+        .expect("mock commands lock")
+        .push(format!("{command} {}", args.join(" ")));
 
     match command.as_str() {
         "CAPABILITY" => {
@@ -364,13 +394,18 @@ async fn handle_command(
                 write_str(reader, &format!("{tag} NO no such mailbox\r\n")).await?;
                 return Ok(true);
             };
+            let uidnext_line = if state.omit_uidnext.load(Ordering::SeqCst) {
+                String::new()
+            } else {
+                format!("* OK [UIDNEXT {next_uid}] Predicted next UID\r\n")
+            };
             write_str(
                 reader,
                 &format!(
                     "* FLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)\r\n\
                      * {exists} EXISTS\r\n* 0 RECENT\r\n\
                      * OK [UIDVALIDITY {uidvalidity}] UIDs valid\r\n\
-                     * OK [UIDNEXT {next_uid}] Predicted next UID\r\n\
+                     {uidnext_line}\
                      * OK [HIGHESTMODSEQ {modseq}] Highest\r\n"
                 ),
             )
@@ -535,6 +570,14 @@ async fn handle_search(
         return Ok(());
     };
     let criteria = args.join(" ").to_ascii_uppercase();
+    let content_key = ["TEXT", "SUBJECT", "FROM", "TO", "CC", "BODY", "HEADER"]
+        .iter()
+        .any(|key| criteria.split_whitespace().any(|token| token == *key));
+    if content_key && state.content_search_empty.load(Ordering::SeqCst) {
+        write_str(reader, "* SEARCH\r\n").await?;
+        write_str(reader, &format!("{tag} OK SEARCH completed\r\n")).await?;
+        return Ok(());
+    }
     let uids: Vec<String> = {
         let folders = state.folders.lock().expect("folders lock");
         let folder = folders
@@ -545,10 +588,16 @@ async fn handle_search(
             .strip_prefix("UID ")
             .and_then(|value| value.split(':').next())
             .and_then(|value| value.parse::<u32>().ok());
+        // `UID lo:hi` (bounded range); `hi` may be `*`.
+        let end = criteria
+            .strip_prefix("UID ")
+            .and_then(|value| value.split(':').nth(1))
+            .and_then(|value| value.parse::<u32>().ok());
         folder
             .messages
             .iter()
             .filter(|message| start.map(|start| message.uid >= start).unwrap_or(true))
+            .filter(|message| end.map(|end| message.uid <= end).unwrap_or(true))
             .map(|message| message.uid.to_string())
             .collect()
     };

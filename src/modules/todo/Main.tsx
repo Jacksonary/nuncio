@@ -44,7 +44,7 @@ import { accounts as accountsApi, sync as syncApi, tasks as tasksApi } from "@/i
 import { queryClient } from "@/lib/queryClient";
 import { queryKeys } from "@/lib/queryKeys";
 import { useLanguage, useT } from "@/lib/i18n";
-import { useAppSettings, useUpdateSettings } from "@/lib/useSettings";
+import { useAppSettings } from "@/lib/useSettings";
 import { useShellStore } from "@/lib/store";
 import { cn } from "@/lib/cn";
 import { parseIsoDate } from "@/lib/format";
@@ -152,7 +152,6 @@ export function TodoMain() {
   const t = useT();
   const locale = useLanguage();
   const settings = useAppSettings();
-  const updateSettings = useUpdateSettings();
   const selection = useShellStore((state) => state.selection.todo);
   const setSelection = useShellStore((state) => state.setSelection);
   const today = useToday();
@@ -162,6 +161,9 @@ export function TodoMain() {
   const setSortMode = useTodoUiStore((state) => state.setSortMode);
   const completedCollapsed = useTodoUiStore((state) => state.completedCollapsed);
   const setCompletedCollapsed = useTodoUiStore((state) => state.setCompletedCollapsed);
+  // View toggle, not a stored setting: completed tasks stay hidden by default.
+  const showCompleted = useTodoUiStore((state) => state.showCompleted);
+  const setShowCompleted = useTodoUiStore((state) => state.setShowCompleted);
   const addRequest = useTodoUiStore((state) => state.addRequest);
   const requestDetailEdit = useTodoUiStore((state) => state.requestDetailEdit);
   const requestCreateList = useTodoUiStore((state) => state.requestCreateList);
@@ -197,7 +199,7 @@ export function TodoMain() {
   const effectiveSmart: SmartList | null =
     selection.smart ?? (selection.listId ? null : "myDay");
   const effectiveListId = effectiveSmart ? null : selection.listId;
-  const showCompleted = settings.tasks.showCompleted;
+  // Completed tasks are hidden by default; the session toggle reveals them.
   const includeCompleted = showCompleted || effectiveSmart === "completed";
 
   const taskQueryPayload: TaskQuery = {
@@ -509,7 +511,7 @@ export function TodoMain() {
   };
 
   const toggleShowCompleted = () => {
-    updateSettings.mutate({ tasks: { showCompleted: !showCompleted } });
+    setShowCompleted(!showCompleted);
   };
 
   /**
@@ -848,9 +850,9 @@ export function TodoMain() {
               <span className={styles.spacer} />
               <ModuleSyncStatus module="tasks" className={styles.headerSync} />
               <IconButton
-                icon={syncBusy ? <Spinner size="tiny" /> : <ArrowSyncRegular />}
+                icon={<ArrowSyncRegular />}
                 label={t("common.syncNow")}
-                disabled={syncBusy}
+                busy={syncBusy}
                 onClick={() => void syncNow()}
               />
               {taskQuery.isFetching ? <Spinner size="tiny" /> : null}

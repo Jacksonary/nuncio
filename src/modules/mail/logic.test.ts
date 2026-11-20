@@ -9,11 +9,13 @@ import {
   dateGroupKey,
   displayFolderTree,
   emptyStateCopy,
+  firstAppendedRowIndex,
   primaryNodes,
   secondaryNodes,
   messageIds,
   nextAfterRemoval,
   parseUnifiedFolderId,
+  searchCoverageNotice,
   selectionReducer,
   splitAccountFolders,
   unifiedFolderId,
@@ -137,17 +139,51 @@ describe("nextAfterRemoval", () => {
   const ordered = ["a", "b", "c", "d"];
 
   it("advances to the next message", () => {
-    expect(nextAfterRemoval(ordered, new Set(["b"]), "b", "next")).toBe("c");
+    expect(nextAfterRemoval(ordered, new Set(["b"]), "b")).toBe("c");
   });
 
   it("falls back to the previous message at the end", () => {
-    expect(nextAfterRemoval(ordered, new Set(["d"]), "d", "next")).toBe("c");
-    expect(nextAfterRemoval(ordered, new Set(["c"]), "c", "previous")).toBe("b");
+    expect(nextAfterRemoval(ordered, new Set(["d"]), "d")).toBe("c");
   });
 
-  it("returns null in list mode or when everything was removed", () => {
-    expect(nextAfterRemoval(ordered, new Set(["b"]), "b", "list")).toBeNull();
-    expect(nextAfterRemoval(ordered, new Set(ordered), "b", "next")).toBeNull();
+  it("returns null when everything was removed", () => {
+    expect(nextAfterRemoval(ordered, new Set(ordered), "b")).toBeNull();
+  });
+
+  it("keeps the open message when a different row is removed", () => {
+    // Open "b", delete "d" (hover button / context menu): "b" stays open.
+    expect(nextAfterRemoval(ordered, new Set(["d"]), "b")).toBe("b");
+    expect(nextAfterRemoval(ordered, new Set(["a", "c"]), "b")).toBe("b");
+  });
+
+  it("opens nothing when nothing was open", () => {
+    expect(nextAfterRemoval(ordered, new Set(["b"]), null)).toBeNull();
+  });
+
+  it("anchors on the removed rows for a multi-delete that includes the open one", () => {
+    // Open "d" among removed b+d: survivor below the lowest removed row ("b") is "c".
+    expect(nextAfterRemoval(ordered, new Set(["b", "d"]), "d")).toBe("c");
+    // Removed tail block: nearest survivor above it.
+    expect(nextAfterRemoval(ordered, new Set(["c", "d"]), "d")).toBe("b");
+  });
+
+  it("works deep in a long list when the oldest rows are removed", () => {
+    const long = Array.from({ length: 600 }, (_, i) => `m${i}`);
+    const removed = new Set(["m599", "m598"]);
+    expect(nextAfterRemoval(long, removed, "m599")).toBe("m597");
+    expect(nextAfterRemoval(long, removed, "m40")).toBe("m40");
+  });
+});
+
+describe("firstAppendedRowIndex", () => {
+  it("points at the first row appended by load-older", () => {
+    expect(firstAppendedRowIndex(201, 300)).toBe(201);
+  });
+
+  it("is null while nothing was appended or the list was empty", () => {
+    expect(firstAppendedRowIndex(201, 201)).toBeNull();
+    expect(firstAppendedRowIndex(201, 150)).toBeNull();
+    expect(firstAppendedRowIndex(0, 100)).toBeNull();
   });
 });
 
@@ -403,5 +439,30 @@ describe("splitAccountFolders", () => {
     expect(primary.map((entry) => entry.folder.id)).toEqual(["inbox"]);
     expect(secondary).toEqual([]);
     expect(primary).toHaveLength(1);
+  });
+});
+
+describe("searchCoverageNotice", () => {
+  it("is silent without coverage and states how a search was produced", () => {
+    expect(searchCoverageNotice(null)).toBeNull();
+    expect(searchCoverageNotice({ kind: "localOnly" })?.key).toBe("mail.search.coverage.localOnly");
+    expect(searchCoverageNotice({ kind: "server" })?.key).toBe("mail.search.coverage.server");
+  });
+
+  it("never reads a partial scan as full coverage", () => {
+    expect(searchCoverageNotice({ kind: "scanned", scanned: 5000, total: 12000 })).toEqual({
+      key: "mail.search.coverage.scannedPartial",
+      params: { scanned: 5000, total: 12000 },
+    });
+    expect(searchCoverageNotice({ kind: "scanned", scanned: 40, total: 40 })?.key).toBe(
+      "mail.search.coverage.scanned",
+    );
+  });
+
+  it("surfaces a failed server search", () => {
+    expect(searchCoverageNotice({ kind: "serverUnavailable", message: "timed out" })).toEqual({
+      key: "mail.search.coverage.unavailable",
+      params: { message: "timed out" },
+    });
   });
 });

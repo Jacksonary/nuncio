@@ -140,11 +140,33 @@ pub async fn sync_folder(
     let last_sync = Utc::now();
     ctx.db
         .write(move |db| {
+            // Some servers (NetEase 163) never report UIDNEXT. Without a stored
+            // value every later sync would look like a first sync: a full
+            // window scan each time, and no increments. The highest UID we
+            // hold, plus one, is a safe stand-in because UIDs only grow within
+            // one UIDVALIDITY.
+            //
+            // With nothing stored (an empty folder, or only mail older than the
+            // sync window) there is nothing to derive it from: keep it unset
+            // rather than store 1, which would make the next incremental sync
+            // request `UID 1:*` and pull the whole history past the window.
+            let uidnext = match current_uidnext {
+                Some(value) => Some(value),
+                None => db
+                    .query_row(
+                        "SELECT MAX(uid) + 1 FROM message
+                         WHERE folder_id = ?1 AND uid IS NOT NULL",
+                        rusqlite::params![folder_id],
+                        |row| row.get::<_, Option<i64>>(0),
+                    )
+                    .ok()
+                    .flatten(),
+            };
             repo::folders::set_sync_flags(
                 db,
                 &folder_id,
                 current_validity,
-                current_uidnext,
+                uidnext,
                 current_modseq,
             )?;
             repo::folders::set_last_sync_at(db, &folder_id, last_sync)?;
@@ -214,6 +236,18 @@ pub async fn sync_folder_graph(
         account.sync_window_days,
     )
     .await?;
+    apply_graph_delta(ctx, account, folder, delta).await
+}
+
+/// Persist one Graph batch (delta pass or older-mail page) into the local
+/// model and emit the matching events. Shared by [`sync_folder_graph`] and
+/// [`load_older_graph`] so both write rows exactly the same way.
+async fn apply_graph_delta(
+    ctx: &CoreContext,
+    account: &nuncio_core::models::Account,
+    folder: &Folder,
+    delta: crate::graph::messages::MessageDelta,
+) -> Result<SyncOutcome> {
     let initial = delta.full_sync;
     // Snapshot the ids before the messages move into the write closure.  A
     // complete delta scan is the Graph equivalent of an IMAP expunge pass: any
@@ -684,6 +718,212 @@ async fn incremental_sync(
     }
 
     Ok(())
+}
+
+/// First UID range width tried by [`older_uid_batch`]; widened x4 while the
+/// mailbox is sparse so a big folder never costs a full `UID SEARCH ALL`.
+const OLDER_RANGE_START: u32 = 1000;
+
+/// Load the next batch (up to [`BATCH_SIZE`]) of messages OLDER than anything
+/// stored for an IMAP folder, ignoring the sync window.
+///
+/// The cursor is derived, not stored: it is the minimum UID already in the
+/// local database for the folder (or the server `UIDNEXT` when the window
+/// excluded everything). Rows go through the same `fetch_metadata` /
+/// `persist_metadata` pair as the initial sync (`BODY.PEEK`, so no message is
+/// ever marked read). Folder sync flags (UIDVALIDITY/UIDNEXT/MODSEQ) are not
+/// touched, so the incremental sync is unaffected.
+pub async fn load_older_imap(
+    ctx: &CoreContext,
+    conn: &mut ImapConnection,
+    account: &nuncio_core::models::Account,
+    folder: &Folder,
+) -> Result<nuncio_core::models::LoadOlderResult> {
+    use nuncio_core::models::LoadOlderResult;
+    if !folder.is_selectable {
+        return Ok(LoadOlderResult::default());
+    }
+    let (stored_validity, stored_uidnext, _) = ctx
+        .db
+        .read({
+            let folder_id = folder.id.clone();
+            move |db| repo::folders::sync_flags(db, &folder_id)
+        })
+        .await?;
+    let mailbox = conn.select(&folder.remote_path).await.map_err(|error| {
+        if error.code() == "protocol" {
+            AppError::not_found(format!("mailbox {} is not available", folder.remote_path))
+        } else {
+            error
+        }
+    })?;
+    let current_validity = mailbox.uid_validity.map(|value| value as i64);
+    if let (Some(stored), Some(current)) = (stored_validity, current_validity) {
+        if stored != current {
+            // Nothing is cleared here: the next regular sync owns that reset.
+            return Err(AppError::conflict(
+                "UIDVALIDITY changed on the server; sync the folder before loading older mail",
+            ));
+        }
+    }
+
+    let min_uid: Option<i64> = ctx
+        .db
+        .read({
+            let folder_id = folder.id.clone();
+            move |db| {
+                Ok(db.query_row(
+                    "SELECT MIN(uid) FROM message WHERE folder_id = ?1 AND uid IS NOT NULL",
+                    rusqlite::params![folder_id],
+                    |row| row.get::<_, Option<i64>>(0),
+                )?)
+            }
+        })
+        .await?;
+    // Exclusive upper bound: everything strictly below it is "older".
+    // The cursor is the lowest UID we already hold; it needs no stored UIDNEXT
+    // (163 does not report one). With nothing stored the server's UIDNEXT, or a
+    // previously stored one, bounds the first batch; with none of those the
+    // folder simply has not been synced.
+    let Some(upper) = min_uid.or(mailbox.uid_next.map(|value| value as i64)).or(stored_uidnext)
+    else {
+        return Err(AppError::conflict(
+            "the folder has not been synced yet; sync it before loading older mail",
+        ));
+    };
+    if upper <= 1 {
+        return Ok(LoadOlderResult::default());
+    }
+    let upper = upper.min(i64::from(u32::MAX)) as u32;
+
+    let (uids, has_more) = older_uid_batch(conn, upper - 1).await?;
+    if uids.is_empty() {
+        return Ok(LoadOlderResult {
+            loaded: 0,
+            has_more: false,
+        });
+    }
+    let metas = fetch_metadata(conn, account, folder, current_validity, &uids).await?;
+    let new = persist_metadata(ctx, conn, account, folder, metas, true).await?;
+    let ids: Vec<String> = new.iter().map(|item| item.id.clone()).collect();
+    if !ids.is_empty() {
+        events::emit_mail_new(
+            ctx.events.as_ref(),
+            account.id.clone(),
+            folder.id.clone(),
+            ids,
+        );
+    }
+    let folder_id = folder.id.clone();
+    ctx.db
+        .write(move |db| repo::folders::recompute_counts(db, &folder_id))
+        .await?;
+    debug!(
+        folder = %folder.remote_path,
+        loaded = new.len(),
+        has_more,
+        "older mail loaded"
+    );
+    Ok(LoadOlderResult {
+        loaded: new.len() as u32,
+        has_more,
+    })
+}
+
+/// Up to [`BATCH_SIZE`] UIDs at or below `hi`, newest first, plus whether more
+/// exist below them. Uses bounded `UID SEARCH UID lo:hi` ranges that widen x4
+/// until the batch is full (one surplus UID proves `has_more`) or UID 1 is
+/// reached (an exhaustive answer), so exhaustion is exact without ever
+/// listing a large mailbox.
+async fn older_uid_batch(conn: &mut ImapConnection, hi: u32) -> Result<(Vec<u32>, bool)> {
+    let mut width = OLDER_RANGE_START;
+    loop {
+        let lo = hi.saturating_sub(width - 1).max(1);
+        let query = format!("UID {lo}:{hi}");
+        let session = &mut conn.session;
+        let mut found: Vec<u32> = tokio::time::timeout(FETCH_TIMEOUT, session.uid_search(query))
+            .await
+            .map_err(|_| AppError::network("UID SEARCH timed out"))?
+            .map(|set| set.into_iter().collect())
+            .map_err(imap_error)?;
+        if found.len() > BATCH_SIZE || lo == 1 {
+            found.sort_unstable_by(|a, b| b.cmp(a));
+            let has_more = found.len() > BATCH_SIZE;
+            found.truncate(BATCH_SIZE);
+            return Ok((found, has_more));
+        }
+        width = width.saturating_mul(4);
+    }
+}
+
+/// Microsoft Graph counterpart of [`load_older_imap`]: one batch of messages
+/// received at or before the oldest locally stored one, persisted through the
+/// same writer as [`sync_folder_graph`].
+pub async fn load_older_graph(
+    ctx: &CoreContext,
+    account: &nuncio_core::models::Account,
+    folder: &Folder,
+) -> Result<nuncio_core::models::LoadOlderResult> {
+    load_older_graph_with(ctx, &crate::graph::GraphMailClient::new(), account, folder).await
+}
+
+/// [`load_older_graph`] with an explicit client (loopback mock in tests).
+pub async fn load_older_graph_with(
+    ctx: &CoreContext,
+    client: &crate::graph::GraphMailClient,
+    account: &nuncio_core::models::Account,
+    folder: &Folder,
+) -> Result<nuncio_core::models::LoadOlderResult> {
+    use nuncio_core::models::LoadOlderResult;
+    if !folder.is_selectable {
+        return Ok(LoadOlderResult::default());
+    }
+    let graph_path = crate::sync::folders::graph_folder_id(ctx, &account.id, &folder.remote_path)
+        .await?
+        .ok_or_else(|| {
+            AppError::not_found(format!(
+                "Graph folder id is unknown for {}; refresh folders first",
+                folder.remote_path
+            ))
+        })?;
+    let mut graph_folder = folder.clone();
+    graph_folder.remote_path = graph_path;
+
+    let oldest: Option<String> = ctx
+        .db
+        .read({
+            let folder_id = folder.id.clone();
+            move |db| {
+                Ok(db
+                    .query_row(
+                        "SELECT date FROM message WHERE folder_id = ?1 AND uid IS NOT NULL
+                         ORDER BY date ASC LIMIT 1",
+                        rusqlite::params![folder_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?)
+            }
+        })
+        .await?;
+    let before = oldest
+        .and_then(|date| DateTime::parse_from_rfc3339(&date).ok())
+        .map(|date| date.with_timezone(&Utc));
+
+    let page =
+        crate::graph::messages::list_older(client, ctx, &account.id, &graph_folder, before)
+            .await?;
+    let has_more = page.has_more;
+    let delta = crate::graph::messages::MessageDelta {
+        messages: page.messages,
+        delta_link: None,
+        full_sync: false,
+        removed_remote_ids: Vec::new(),
+    };
+    let outcome = apply_graph_delta(ctx, account, folder, delta).await?;
+    Ok(LoadOlderResult {
+        loaded: outcome.new_messages.len() as u32,
+        has_more,
+    })
 }
 
 async fn search_uids(conn: &mut ImapConnection, window_days: u32) -> Result<Vec<u32>> {
@@ -1599,6 +1839,19 @@ pub async fn server_search(
     }?;
     let uidvalidity = mailbox.uid_validity.map(|value| value as i64);
     let found = search_with_fallback(conn, criteria).await?;
+    cache_hits(ctx, conn, account, folder, uidvalidity, found).await
+}
+
+/// Fetch and persist metadata for server hits that are not stored locally and
+/// return the local ids of every hit.
+async fn cache_hits(
+    ctx: &CoreContext,
+    conn: &mut ImapConnection,
+    account: &nuncio_core::models::Account,
+    folder: &Folder,
+    uidvalidity: Option<i64>,
+    found: Vec<u32>,
+) -> Result<Vec<String>> {
     if found.is_empty() {
         return Ok(Vec::new());
     }
@@ -1646,6 +1899,204 @@ pub async fn server_search(
     Ok(ids)
 }
 
+/// Newest-first cap on how many message headers a fallback scan reads. 5000
+/// is 25 round trips of [`BATCH_SIZE`] and roughly 5 MB of header text: a
+/// few seconds on a home connection while still covering several years of a
+/// typical personal mailbox. Larger folders report `scanned < total`.
+pub const SCAN_CAP: usize = 5000;
+
+/// Header fields requested by the fallback scan.
+const SCAN_FIELDS: &str = "(UID BODY.PEEK[HEADER.FIELDS (FROM TO CC SUBJECT DATE MESSAGE-ID)])";
+
+/// Outcome of [`server_scan`].
+#[derive(Debug, Clone, Default)]
+pub struct ScanOutcome {
+    /// Local ids of every matched message (persisted when not yet stored).
+    pub ids: Vec<String>,
+    /// Headers actually read.
+    pub scanned: u32,
+    /// Candidate messages the server reported (before the cap).
+    pub total: u32,
+}
+
+/// Terms used by the header matcher of the fallback scan.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScanTerms {
+    /// Lower-cased free-text terms; every term must hit some header field.
+    pub text: Vec<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub subject: Option<String>,
+}
+
+impl ScanTerms {
+    pub fn from_query(query: &nuncio_core::models::SearchQuery) -> Self {
+        let clean = |value: &Option<String>| {
+            value
+                .as_deref()
+                .map(|value| value.trim().to_lowercase())
+                .filter(|value| !value.is_empty())
+        };
+        Self {
+            text: query
+                .text
+                .split_whitespace()
+                .map(|term| term.trim_matches('"').to_lowercase())
+                .filter(|term| !term.is_empty())
+                .collect(),
+            from: clean(&query.from),
+            to: clean(&query.to),
+            subject: clean(&query.subject),
+        }
+    }
+
+    /// True when there is anything a header scan can match on.
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty() && self.from.is_none() && self.to.is_none() && self.subject.is_none()
+    }
+}
+
+/// Structural-only criteria for the scan: the keys every server answers
+/// correctly (`ALL`, `UNSEEN`, `FLAGGED`, `SINCE`, `BEFORE`). Content keys are
+/// matched locally against the fetched headers.
+pub fn imap_scan_criteria(query: &nuncio_core::models::SearchQuery) -> String {
+    let mut structural = query.clone();
+    structural.text.clear();
+    structural.from = None;
+    structural.to = None;
+    structural.subject = None;
+    imap_search_criteria(&structural).unwrap_or_else(|| "ALL".to_string())
+}
+
+/// Case-insensitive substring match of `terms` against a raw header block.
+/// RFC 2047 words are decoded first so CJK subjects and display names match.
+pub fn header_matches(raw_headers: &[u8], terms: &ScanTerms) -> bool {
+    let Ok(headers) = nuncio_mime::parse_headers_only(raw_headers) else {
+        return false;
+    };
+    let addresses = |list: &[nuncio_core::models::Address]| {
+        list.iter()
+            .map(|address| format!("{} {}", address.name.as_deref().unwrap_or(""), address.email))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    };
+    let subject = headers.subject.to_lowercase();
+    let from = headers
+        .from
+        .as_ref()
+        .map(|address| addresses(std::slice::from_ref(address)))
+        .unwrap_or_default();
+    let to = addresses(&headers.to);
+    let cc = addresses(&headers.cc);
+    let message_id = headers.message_id.clone().unwrap_or_default().to_lowercase();
+    if let Some(wanted) = &terms.from {
+        if !from.contains(wanted.as_str()) {
+            return false;
+        }
+    }
+    if let Some(wanted) = &terms.to {
+        if !to.contains(wanted.as_str()) && !cc.contains(wanted.as_str()) {
+            return false;
+        }
+    }
+    if let Some(wanted) = &terms.subject {
+        if !subject.contains(wanted.as_str()) {
+            return false;
+        }
+    }
+    terms.text.iter().all(|term| {
+        [&subject, &from, &to, &cc, &message_id]
+            .iter()
+            .any(|field| field.contains(term.as_str()))
+    })
+}
+
+/// Fallback for servers whose content `SEARCH` is broken (NetEase, QQ):
+/// `EXAMINE` the folder read-only, `UID SEARCH` structural criteria, then read
+/// headers newest-first in [`BATCH_SIZE`] UID batches and match locally.
+/// Matches that are not stored yet are cached through the same path as
+/// [`server_search`]. `cancel` is checked between batches.
+pub async fn server_scan(
+    ctx: &CoreContext,
+    conn: &mut ImapConnection,
+    account: &nuncio_core::models::Account,
+    folder: &Folder,
+    query: &nuncio_core::models::SearchQuery,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<ScanOutcome> {
+    server_scan_with_cap(ctx, conn, account, folder, query, cancel, SCAN_CAP).await
+}
+
+/// [`server_scan`] with an explicit newest-first cap (tests use a tiny one).
+pub async fn server_scan_with_cap(
+    ctx: &CoreContext,
+    conn: &mut ImapConnection,
+    account: &nuncio_core::models::Account,
+    folder: &Folder,
+    query: &nuncio_core::models::SearchQuery,
+    cancel: &std::sync::atomic::AtomicBool,
+    cap: usize,
+) -> Result<ScanOutcome> {
+    use std::sync::atomic::Ordering;
+    let terms = ScanTerms::from_query(query);
+    if terms.is_empty() {
+        return Ok(ScanOutcome::default());
+    }
+    let mailbox = {
+        let session = &mut conn.session;
+        crate::util::with_timeout(crate::imap::conn::COMMAND_TIMEOUT, "EXAMINE", async move {
+            session.examine(&folder.remote_path).await.map_err(imap_error)
+        })
+        .await?
+    };
+    let uidvalidity = mailbox.uid_validity.map(|value| value as i64);
+    let mut uids = run_search(conn, &imap_scan_criteria(query)).await?;
+    uids.sort_unstable_by(|a, b| b.cmp(a));
+    let total = uids.len() as u32;
+    uids.truncate(cap);
+
+    let mut matched: Vec<u32> = Vec::new();
+    let mut scanned = 0u32;
+    for chunk in uids.chunks(BATCH_SIZE) {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let set = uid_set(&chunk.iter().map(|uid| *uid as i64).collect::<Vec<_>>());
+        let session = &mut conn.session;
+        let fetches = tokio::time::timeout(FETCH_TIMEOUT, async {
+            let stream = session
+                .uid_fetch(set, SCAN_FIELDS)
+                .await
+                .map_err(imap_error)?;
+            stream.try_collect::<Vec<Fetch>>().await.map_err(imap_error)
+        })
+        .await
+        .map_err(|_| AppError::network("header scan timed out"))??;
+        scanned += chunk.len() as u32;
+        for fetch in &fetches {
+            let (Some(uid), Some(raw)) = (
+                fetch.uid,
+                fetch.section(&SectionPath::Full(MessageSection::Header)),
+            ) else {
+                continue;
+            };
+            if header_matches(raw, &terms) {
+                matched.push(uid);
+            }
+        }
+    }
+    matched.sort_unstable_by(|a, b| b.cmp(a));
+    // Caching needs a read-write view only for local state; FETCH of metadata
+    // is read-only on the wire, so the EXAMINE selection stays valid.
+    let ids = cache_hits(ctx, conn, account, folder, uidvalidity, matched).await?;
+    Ok(ScanOutcome {
+        ids,
+        scanned,
+        total,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1681,6 +2132,38 @@ mod tests {
         let criteria = imap_search_criteria(&nuncio_core::models::SearchQuery::text("invoice"))
             .expect("criteria");
         assert_eq!(criteria, "TEXT \"invoice\"");
+    }
+
+    #[test]
+    fn header_matcher_handles_ascii_cjk_and_encoded_words() {
+        let raw = "From: =?UTF-8?B?5byg5LiJ?= <zhang@example.com>\r\nTo: me@example.com\r\n\
+                   Subject: =?UTF-8?B?5Lya6K6u57qq6KaB?= Re: Budget\r\nMessage-ID: <abc@x>\r\n\r\n";
+        let terms = |text: &str| ScanTerms {
+            text: text.split_whitespace().map(str::to_lowercase).collect(),
+            ..ScanTerms::default()
+        };
+        assert!(header_matches(raw.as_bytes(), &terms("budget")));
+        assert!(header_matches(raw.as_bytes(), &terms("BUDGET re:")));
+        assert!(header_matches(raw.as_bytes(), &terms("会议纪要")));
+        assert!(header_matches(raw.as_bytes(), &terms("张三")));
+        assert!(header_matches(raw.as_bytes(), &terms("zhang@example")));
+        assert!(!header_matches(raw.as_bytes(), &terms("budget missing")));
+        let subject_only = ScanTerms {
+            subject: Some("zhang".into()),
+            ..ScanTerms::default()
+        };
+        assert!(!header_matches(raw.as_bytes(), &subject_only));
+        assert!(!header_matches(b"", &terms("x")));
+    }
+
+    #[test]
+    fn scan_criteria_keep_only_structural_keys() {
+        let mut query = nuncio_core::models::SearchQuery::text("会议");
+        query.from = Some("a".into());
+        assert_eq!(imap_scan_criteria(&query), "ALL");
+        query.unread = Some(true);
+        query.date_from = Some("2026-11-01".into());
+        assert_eq!(imap_scan_criteria(&query), "UNSEEN SINCE 01-Nov-2026");
     }
 
     #[test]

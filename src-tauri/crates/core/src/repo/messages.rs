@@ -914,6 +914,7 @@ fn list_outbox(
         items,
         next_cursor,
         total,
+        coverage: None,
     })
 }
 
@@ -1028,6 +1029,7 @@ pub fn list(conn: &Connection, query: &crate::models::MessageListQuery) -> Resul
         items,
         next_cursor,
         total,
+        coverage: None,
     })
 }
 

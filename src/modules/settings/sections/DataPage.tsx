@@ -6,7 +6,6 @@ import {
   DocumentArrowDown24Regular,
   FolderOpen24Regular,
   HardDrive24Regular,
-  Open24Regular,
 } from "@fluentui/react-icons";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -33,13 +32,7 @@ import styles from "../settings.module.css";
 
 type BackupMode = "export" | "import";
 
-export function DataPage({
-  onBack,
-  onOpenAbout,
-}: {
-  onBack: () => void;
-  onOpenAbout?: () => void;
-}) {
+export function DataPage({ onBack }: { onBack: () => void }) {
   const t = useT();
   const client = useQueryClient();
   const usage = useStorageUsage();
@@ -281,13 +274,6 @@ export function DataPage({
               {t("settings.data.openLogs")}
             </Button>
           </SettingRow>
-          {onOpenAbout ? (
-            <SettingRow label={t("settings.data.about")} description={t("settings.data.aboutDesc")}>
-              <Button icon={<Open24Regular />} onClick={onOpenAbout}>
-                {t("settings.data.openAbout")}
-              </Button>
-            </SettingRow>
-          ) : null}
         </Card>
       </Section>
 

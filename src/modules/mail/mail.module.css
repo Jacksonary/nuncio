@@ -346,6 +346,13 @@
   gap: var(--sp-2);
 }
 
+.coverageNote {
+  padding: var(--sp-1) var(--sp-3);
+  font-size: var(--font-caption);
+  color: var(--text-secondary);
+  line-height: 1.4;
+}
+
 .listBody {
   flex: 1;
   min-height: 0;

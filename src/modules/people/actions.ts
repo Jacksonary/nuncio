@@ -24,11 +24,7 @@ import { toIsoDate } from "@/lib/format";
 import { useShellStore } from "@/lib/store";
 import { DEFAULT_SETTINGS } from "@/lib/useSettings";
 import { useComposeStore } from "@/modules/mail/compose";
-import {
-  formatContactName,
-  primaryEmail,
-  type ContactDisplayOrder,
-} from "./logic";
+import { formatContactName, primaryEmail } from "./logic";
 import { usePeopleUiStore } from "./uiStore";
 
 export function peopleErrorText(error: unknown): string {
@@ -139,14 +135,13 @@ export async function composeToEmail(
 
 export async function composeToContact(
   contact: Pick<Contact, "accountId" | "emails" | "displayName" | "givenName" | "familyName">,
-  displayOrder: ContactDisplayOrder = "firstLast",
 ): Promise<void> {
   const email = primaryEmail(contact);
   if (!email) {
     toast.info(t("people.detail.missingEmail"));
     return;
   }
-  const name = formatContactName(contact, displayOrder) || null;
+  const name = formatContactName(contact) || null;
   await composeToEmail(email, name, contact.accountId);
 }
 
@@ -198,7 +193,6 @@ function cachedSettings(): AppSettings {
  */
 export async function scheduleMeetingWithContact(
   contact: Pick<Contact, "accountId" | "emails" | "displayName" | "givenName" | "familyName">,
-  displayOrder: ContactDisplayOrder = "firstLast",
 ): Promise<void> {
   const email = primaryEmail(contact);
   if (!email) {
@@ -210,7 +204,7 @@ export async function scheduleMeetingWithContact(
     toast.error(t("people.detail.noWritableCalendar"));
     return;
   }
-  const name = formatContactName(contact, displayOrder) || email;
+  const name = formatContactName(contact) || email;
   const settings = cachedSettings();
   const start = nextHalfHour();
   const duration = Math.max(15, settings.calendar.defaultEventDurationMinutes);
@@ -301,7 +295,7 @@ export async function deleteContactWithConfirm(contact: Contact): Promise<void> 
   const approved = await confirm({
     title: t("people.detail.deleteConfirmTitle"),
     message: t("people.detail.deleteConfirmMessage", {
-      name: formatContactName(contact, "firstLast") || contact.displayName,
+      name: formatContactName(contact) || contact.displayName,
     }),
     confirmLabel: t("common.delete"),
     danger: true,

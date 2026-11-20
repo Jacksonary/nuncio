@@ -17,6 +17,7 @@ import {
   ArrowReplyAll24Regular,
   Attach16Regular,
   BookOpen24Regular,
+  DarkTheme24Regular,
   Code24Regular,
   Delete24Regular,
   DocumentEdit16Regular,
@@ -66,6 +67,7 @@ import {
 import { t, useT } from "@/lib/i18n";
 import { queryKeys } from "@/lib/queryKeys";
 import { useShellStore } from "@/lib/store";
+import { useIsDarkTheme } from "@/lib/useSettings";
 import {
   isPermanentDelete,
   messageActionToast,
@@ -536,7 +538,6 @@ function MessageCard({
   const queryClient = useQueryClient();
   const compose = useMailCompose();
   const { apply } = useMessageActions();
-  const mailSettings = useMailSettings();
   const accountsQuery = useAccountsQuery();
   const accounts = accountsQuery.data ?? [];
   const [recipientsOpen, setRecipientsOpen] = useState(false);
@@ -544,6 +545,17 @@ function MessageCard({
   const [busyAction, setBusyAction] = useState<string | null>(null);
   // Reading view ("readability") preference, remembered per message.
   const [readingView, setReadingView] = useState(() => readReadingView(detail.summary.id));
+  // "View on white": a one-off choice for the message on screen. It lives only
+  // in this card's memory (never stored), so showing another message, or
+  // coming back to this one later, starts from the app theme again.
+  const isDark = useIsDarkTheme();
+  const [whiteHtml, setWhiteHtml] = useState<string | null>(null);
+  const [whiteBusy, setWhiteBusy] = useState(false);
+  const remoteAllowedRef = useRef(false);
+  // The message on screen right now, so a slow fetch that finishes after the
+  // user moved on cannot paint its result onto a different message.
+  const currentIdRef = useRef(detail.summary.id);
+  currentIdRef.current = detail.summary.id;
   // Once a message has ever been seen while open, never auto-mark it again in
   // this view (otherwise "mark as unread" would immediately flip back).
   const seenTrueRef = useRef(false);
@@ -584,34 +596,16 @@ function MessageCard({
     if (summary.seen) seenTrueRef.current = true;
   }, [summary.id, summary.seen]);
 
-  // Mark as read according to the user preference (covers stacked conversations
-  // where several messages are visible at once).
+  // Mark as read when opened (covers stacked conversations where several
+  // messages are visible at once).
   useEffect(() => {
     if (summary.seen || external || seenTrueRef.current) return;
-    if (mailSettings.markReadMode === "manual") return;
-    const mark = () => {
-      if (seenTrueRef.current) return;
-      seenTrueRef.current = true;
-      void apply({ ids: [summary.id], action: { kind: "setSeen", value: true } }).catch(() => {
-        // The mutation surfaces its own error; a failed read receipt must not
-        // prevent the user from reading the message.
-      });
-    };
-    if (mailSettings.markReadMode === "onOpen") {
-      mark();
-      return;
-    }
-    const delay = Math.max(1, mailSettings.markReadDelaySeconds) * 1000;
-    const timer = window.setTimeout(mark, delay);
-    return () => window.clearTimeout(timer);
-  }, [
-    apply,
-    external,
-    mailSettings.markReadDelaySeconds,
-    mailSettings.markReadMode,
-    summary.id,
-    summary.seen,
-  ]);
+    seenTrueRef.current = true;
+    void apply({ ids: [summary.id], action: { kind: "setSeen", value: true } }).catch(() => {
+      // The mutation surfaces its own error; a failed read receipt must not
+      // prevent the user from reading the message.
+    });
+  }, [apply, external, summary.id, summary.seen]);
 
   const clearSelection = useCallback(() => {
     useShellStore.getState().setSelection("mail", { messageId: null });
@@ -648,17 +642,15 @@ function MessageCard({
     // A draft is always gone for good: moving it to Trash would leave
     // is_draft set and keep inflating the Drafts count.
     const permanent = summary.isDraft || isPermanentDelete(folderRole);
-    if (mailSettings.confirmDelete || permanent) {
-      const ok = await confirm({
-        title: permanent ? tt("mail.reader.deletePermanentTitle") : tt("mail.reader.deleteTitle"),
-        message: permanent
-          ? tt("mail.reader.deletePermanentMessage")
-          : tt("mail.reader.deleteMessage"),
-        confirmLabel: tt("common.delete"),
-        danger: true,
-      });
-      if (!ok) return;
-    }
+    const ok = await confirm({
+      title: permanent ? tt("mail.reader.deletePermanentTitle") : tt("mail.reader.deleteTitle"),
+      message: permanent
+        ? tt("mail.reader.deletePermanentMessage")
+        : tt("mail.reader.deleteMessage"),
+      confirmLabel: tt("common.delete"),
+      danger: true,
+    });
+    if (!ok) return;
     setBusyAction("delete");
     try {
       const outcome = await apply({ ids: [summary.id], action: { kind: "delete", permanent } });
@@ -674,7 +666,6 @@ function MessageCard({
     apply,
     clearSelection,
     folderRole,
-    mailSettings.confirmDelete,
     standalone,
     summary.id,
     summary.isDraft,
@@ -799,7 +790,34 @@ function MessageCard({
     openMessageWindow(summary.id, summary.subject, true);
   }, [external, summary.id, summary.subject]);
 
+  useEffect(() => {
+    // New message, or the body changed under us (for example remote images were
+    // just allowed): drop the white copy rather than show a stale one.
+    setWhiteHtml(null);
+  }, [summary.id, detail.html]);
+  useEffect(() => {
+    remoteAllowedRef.current = false;
+  }, [summary.id]);
+
+  const toggleWhiteBackground = useCallback(async () => {
+    if (whiteHtml !== null) {
+      setWhiteHtml(null);
+      return;
+    }
+    const requestedFor = summary.id;
+    setWhiteBusy(true);
+    try {
+      const next = await messagesApi.get(requestedFor, remoteAllowedRef.current, true);
+      if (currentIdRef.current === requestedFor) setWhiteHtml(next.html);
+    } catch (error) {
+      toast.error(tt("mail.reader.whiteBackgroundFailed"), errorText(error));
+    } finally {
+      setWhiteBusy(false);
+    }
+  }, [summary.id, tt, whiteHtml]);
+
   const allowRemote = useCallback(async () => {
+    remoteAllowedRef.current = true;
     if (onAllowRemote) {
       onAllowRemote();
       return;
@@ -978,6 +996,24 @@ function MessageCard({
 
   const recipientsSummary = formatAddressList(to) || tt("mail.reader.noRecipients");
 
+  // Only where it can make a difference: a dark theme, an HTML body that is not
+  // swapped for the reading view, and a stored message (outbox and external
+  // .eml renders do not take this choice).
+  const whiteBackgroundButton =
+    isDark && !showReadingView && !isOutbox && !external && detail.html.trim() ? (
+      <IconButton
+        icon={<DarkTheme24Regular />}
+        label={
+          whiteHtml !== null
+            ? tt("mail.reader.whiteBackgroundOff")
+            : tt("mail.reader.whiteBackground")
+        }
+        selected={whiteHtml !== null}
+        onClick={() => void toggleWhiteBackground()}
+        disabled={whiteBusy}
+      />
+    ) : null;
+
   const readingViewButton = detail.html.trim() ? (
     <IconButton
       icon={<BookOpen24Regular />}
@@ -1132,6 +1168,7 @@ function MessageCard({
             appearance="subtle"
           />
           <span className={styles.toolbarSpacer} />
+          {whiteBackgroundButton}
           {readingViewButton}
           {summary.isDraft ? (
             <Button
@@ -1169,7 +1206,7 @@ function MessageCard({
             className={styles.messageFrame}
             title={summary.subject || tt("mail.reader.messageBody")}
             sandbox="allow-popups allow-popups-to-escape-sandbox"
-            srcDoc={detail.html}
+            srcDoc={whiteHtml ?? detail.html}
             onLoad={printOnce}
           />
         ) : detail.text ? (

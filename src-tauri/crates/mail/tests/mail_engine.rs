@@ -83,6 +83,21 @@ async fn subjects(ctx: &CoreContext, folder_id: &str) -> Vec<String> {
         .collect()
 }
 
+async fn message_ids(ctx: &CoreContext, folder_id: &str) -> Vec<String> {
+    let folder_id = folder_id.to_string();
+    let query = MessageListQuery::new(MailScope::folder(folder_id))
+        .with_conversation(false)
+        .with_limit(200);
+    ctx.db
+        .read(move |db| repo::messages::list(db, &query))
+        .await
+        .expect("list")
+        .items
+        .into_iter()
+        .map(|message| message.id)
+        .collect()
+}
+
 #[tokio::test]
 async fn initial_sync_discovers_folders_messages_and_previews() {
     let mock = MockImap::start_with_folders(
@@ -181,14 +196,6 @@ async fn initial_sync_discovers_folders_messages_and_previews() {
 
     // Initial sync never notifies.
     assert!(notifier.new_mail.lock().expect("notifier").is_empty());
-
-    // Body prefetch ran for unread messages.
-    let cached = ctx
-        .db
-        .read(repo::messages::cached_body_count)
-        .await
-        .expect("cached count");
-    assert!(cached >= 1);
 }
 
 #[tokio::test]
@@ -539,6 +546,300 @@ async fn pop3_uidl_diff_downloads_new_and_removes_deleted() {
     assert!(!subjects.contains(&"Pop A".to_string()));
     assert!(subjects.contains(&"Pop B".to_string()));
     assert!(subjects.contains(&"Pop C".to_string()));
+}
+
+/// Listing downloads headers only (`TOP`), never a body.
+#[tokio::test]
+async fn pop3_sync_stores_headers_without_fetching_bodies() {
+    let mock = MockPop3::start().await;
+    mock.add(
+        "uid-a",
+        &message_raw(
+            "a@example.com",
+            "test@example.com",
+            "Pop A",
+            "body a",
+            "pop-a@x",
+        ),
+    );
+    mock.add(
+        "uid-b",
+        &message_raw(
+            "b@example.com",
+            "test@example.com",
+            "Pop B",
+            "body b",
+            "pop-b@x",
+        ),
+    );
+    let ctx = context(
+        StaticCreds::password("test@example.com", "secret"),
+        Arc::new(RecordingNotifier::default()),
+    )
+    .await;
+    let account = account(
+        "acc",
+        "test@example.com",
+        None,
+        None,
+        Some(server(mock.addr.port())),
+    );
+    insert_account(&ctx, &account).await;
+
+    nuncio_mail::pop3::sync::sync_account(&ctx, &account)
+        .await
+        .expect("pop3 sync");
+
+    let inbox = folder_id(&ctx, "acc", "INBOX").await;
+    assert_eq!(message_count(&ctx, &inbox).await, 2);
+    assert_eq!(mock.counters.top(), 2);
+    assert_eq!(mock.counters.retr(), 0, "listing must not download bodies");
+
+    // Rows are listable in date order and carry headers but no body.
+    let subjects = subjects(&ctx, &inbox).await;
+    assert!(subjects.contains(&"Pop A".to_string()));
+    assert!(subjects.contains(&"Pop B".to_string()));
+    let folder = inbox.clone();
+    let stored = ctx
+        .db
+        .read(move |db| {
+            let mut statement =
+                db.prepare("SELECT body_path, preview, subject FROM message WHERE folder_id = ?1")?;
+            let mut rows = statement.query([folder])?;
+            let mut result = Vec::new();
+            while let Some(row) = rows.next()? {
+                result.push((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ));
+            }
+            Ok(result)
+        })
+        .await
+        .expect("rows");
+    assert_eq!(stored.len(), 2);
+    for (body_path, preview, subject) in stored {
+        assert!(body_path.is_none(), "{subject} must not have a cached body");
+        assert!(preview.is_empty(), "{subject} has no body text yet");
+    }
+}
+
+/// A server without TOP still lists, by falling back to a size-guarded RETR.
+#[tokio::test]
+async fn pop3_sync_falls_back_to_retr_when_top_is_rejected() {
+    let mock = MockPop3::without_top().await;
+    mock.add(
+        "uid-a",
+        &message_raw(
+            "a@example.com",
+            "test@example.com",
+            "Pop A",
+            "fallback body",
+            "pop-a@x",
+        ),
+    );
+    let ctx = context(
+        StaticCreds::password("test@example.com", "secret"),
+        Arc::new(RecordingNotifier::default()),
+    )
+    .await;
+    let account = account(
+        "acc",
+        "test@example.com",
+        None,
+        None,
+        Some(server(mock.addr.port())),
+    );
+    insert_account(&ctx, &account).await;
+
+    nuncio_mail::pop3::sync::sync_account(&ctx, &account)
+        .await
+        .expect("pop3 sync with RETR fallback");
+
+    let inbox = folder_id(&ctx, "acc", "INBOX").await;
+    assert_eq!(message_count(&ctx, &inbox).await, 1);
+    assert_eq!(mock.counters.retr(), 1);
+    // The fallback downloaded the body, so it is cached from the start.
+    let id = message_ids(&ctx, &inbox).await.pop().expect("message id");
+    let path = ctx
+        .db
+        .read(move |db| repo::messages::get(db, &id))
+        .await
+        .expect("stored")
+        .expect("row")
+        .body_path;
+    assert!(
+        path.is_some(),
+        "RETR fallback caches the body it downloaded"
+    );
+}
+
+/// Opening a message downloads its body once and caches it.
+#[tokio::test]
+async fn pop3_body_is_fetched_on_demand_and_cached() {
+    let mock = MockPop3::start().await;
+    mock.add(
+        "uid-a",
+        &message_raw(
+            "a@example.com",
+            "test@example.com",
+            "Body on demand",
+            "unique body text",
+            "pop-body@x",
+        ),
+    );
+    let ctx = context(
+        StaticCreds::password("test@example.com", "secret"),
+        Arc::new(RecordingNotifier::default()),
+    )
+    .await;
+    let account = account(
+        "acc",
+        "test@example.com",
+        None,
+        None,
+        Some(server(mock.addr.port())),
+    );
+    insert_account(&ctx, &account).await;
+    nuncio_mail::pop3::sync::sync_account(&ctx, &account)
+        .await
+        .expect("pop3 sync");
+
+    let inbox = folder_id(&ctx, "acc", "INBOX").await;
+    let id = message_ids(&ctx, &inbox).await.pop().expect("message id");
+    assert_eq!(mock.counters.retr(), 0);
+
+    let first = nuncio_mail::pop3::body::fetch_body(&ctx, &account, &id)
+        .await
+        .expect("body download");
+    let raw = tokio::fs::read(&first).await.expect("cached body");
+    assert!(String::from_utf8_lossy(&raw).contains("unique body text"));
+    assert_eq!(mock.counters.retr(), 1);
+
+    // Second call is served from disk: no new RETR.
+    let second = nuncio_mail::pop3::body::fetch_body(&ctx, &account, &id)
+        .await
+        .expect("cached body");
+    assert_eq!(first, second);
+    assert_eq!(mock.counters.retr(), 1);
+
+    // The parsed body text and preview are now indexed.
+    let stored = ctx
+        .db
+        .read(move |db| repo::messages::get(db, &id))
+        .await
+        .expect("stored")
+        .expect("row");
+    assert!(stored.body_path.is_some());
+    assert!(!stored.summary.preview.is_empty());
+}
+
+/// A body that can no longer be downloaded (already DELETEd on the server)
+/// reports a clear not-found error instead of retrying or panicking.
+#[tokio::test]
+async fn pop3_body_of_a_deleted_message_fails_cleanly() {
+    let mock = MockPop3::start().await;
+    mock.add(
+        "uid-a",
+        &message_raw(
+            "a@example.com",
+            "test@example.com",
+            "Gone",
+            "gone body",
+            "pop-gone@x",
+        ),
+    );
+    let ctx = context(
+        StaticCreds::password("test@example.com", "secret"),
+        Arc::new(RecordingNotifier::default()),
+    )
+    .await;
+    let account = account(
+        "acc",
+        "test@example.com",
+        None,
+        None,
+        Some(server(mock.addr.port())),
+    );
+    insert_account(&ctx, &account).await;
+    nuncio_mail::pop3::sync::sync_account(&ctx, &account)
+        .await
+        .expect("pop3 sync");
+
+    let inbox = folder_id(&ctx, "acc", "INBOX").await;
+    let id = message_ids(&ctx, &inbox).await.pop().expect("message id");
+
+    // Another client removes the message; the header row is still listable.
+    mock.remove("uid-a");
+    let error = nuncio_mail::pop3::body::fetch_body(&ctx, &account, &id)
+        .await
+        .expect_err("body is gone");
+    assert_eq!(error.code(), "notFound");
+    assert!(error.message().contains("no longer available"));
+
+    // The miss is remembered, so reopening does not reconnect to the server.
+    let uidls_before = mock.counters.retr();
+    let again = nuncio_mail::pop3::body::fetch_body(&ctx, &account, &id)
+        .await
+        .expect_err("still gone");
+    assert_eq!(again.code(), "notFound");
+    assert_eq!(mock.counters.retr(), uidls_before);
+
+    // The row survives: only its body is unavailable.
+    let stored = ctx
+        .db
+        .read(move |db| repo::messages::get(db, &id))
+        .await
+        .expect("stored")
+        .expect("row");
+    assert!(stored.body_path.is_none());
+}
+
+/// leave-on-server = false deletes as soon as the header row is stored, and
+/// the local row stays listable afterwards.
+#[tokio::test]
+async fn pop3_header_store_is_enough_for_server_deletion() {
+    let mock = MockPop3::start().await;
+    mock.add(
+        "uid-a",
+        &message_raw(
+            "a@example.com",
+            "test@example.com",
+            "Spam",
+            "spam body",
+            "pop-spam@x",
+        ),
+    );
+    let ctx = context(
+        StaticCreds::password("test@example.com", "secret"),
+        Arc::new(RecordingNotifier::default()),
+    )
+    .await;
+    let account = account(
+        "acc",
+        "test@example.com",
+        None,
+        None,
+        Some(server(mock.addr.port())),
+    );
+    insert_account(&ctx, &account).await;
+    let account_id = account.id.clone();
+    ctx.db
+        .write(move |db| repo::sync_state::set(db, &account_id, "pop3", "leave_on_server", "false"))
+        .await
+        .expect("leave_on_server");
+
+    nuncio_mail::pop3::sync::sync_account(&ctx, &account)
+        .await
+        .expect("pop3 sync");
+
+    assert_eq!(mock.counters.dele(), 1, "deleted once its row was stored");
+    assert_eq!(mock.counters.retr(), 0, "deletion does not need the body");
+    let inbox = folder_id(&ctx, "acc", "INBOX").await;
+    assert_eq!(message_count(&ctx, &inbox).await, 1);
+    // The server copy is gone (QUIT applied the delete).
+    assert!(mock.messages.lock().expect("messages").is_empty());
 }
 
 #[tokio::test]
@@ -1083,4 +1384,507 @@ async fn keepalive_noop_prevents_idle_connection_drop() {
         "keepalive should have kept the worker connection open"
     );
     engine.shutdown().await;
+}
+
+/// Incremental sync is a pure UIDL diff: known messages cost no TOP/RETR, and
+/// a message already DELETEd is not fetched again even though it vanished.
+#[tokio::test]
+async fn pop3_incremental_sync_skips_known_and_already_deleted_messages() {
+    let mock = MockPop3::start().await;
+    mock.add(
+        "uid-old",
+        &message_raw(
+            "a@example.com",
+            "test@example.com",
+            "Old",
+            "old body",
+            "pop-old@x",
+        ),
+    );
+    let ctx = context(
+        StaticCreds::password("test@example.com", "secret"),
+        Arc::new(RecordingNotifier::default()),
+    )
+    .await;
+    let account = account(
+        "acc",
+        "test@example.com",
+        None,
+        None,
+        Some(server(mock.addr.port())),
+    );
+    insert_account(&ctx, &account).await;
+    let account_id = account.id.clone();
+    ctx.db
+        .write(move |db| repo::sync_state::set(db, &account_id, "pop3", "leave_on_server", "false"))
+        .await
+        .expect("leave_on_server");
+
+    nuncio_mail::pop3::sync::sync_account(&ctx, &account)
+        .await
+        .expect("first sync");
+    assert_eq!(mock.counters.dele(), 1);
+    assert!(mock.messages.lock().expect("messages").is_empty());
+    let inbox = folder_id(&ctx, "acc", "INBOX").await;
+    assert_eq!(message_count(&ctx, &inbox).await, 1);
+
+    // A second pass sees an empty server: the local row must survive because
+    // its UIDL is recorded as deleted rather than silently pruned.
+    mock.reset_counters();
+    nuncio_mail::pop3::sync::sync_account(&ctx, &account)
+        .await
+        .expect("second sync");
+    assert_eq!(mock.counters.top(), 0);
+    assert_eq!(mock.counters.retr(), 0);
+    assert_eq!(message_count(&ctx, &inbox).await, 1);
+
+    // A brand-new message costs exactly one header fetch.
+    mock.add(
+        "uid-new",
+        &message_raw(
+            "b@example.com",
+            "test@example.com",
+            "New",
+            "new body",
+            "pop-new@x",
+        ),
+    );
+    nuncio_mail::pop3::sync::sync_account(&ctx, &account)
+        .await
+        .expect("third sync");
+    assert_eq!(mock.counters.top(), 1, "only the new message is fetched");
+    assert_eq!(mock.counters.retr(), 0);
+    assert_eq!(message_count(&ctx, &inbox).await, 2);
+}
+
+/// Every UIDL is known locally, so paging older POP3 mail is a pure SQL
+/// query: the second page needs no server connection at all.
+#[tokio::test]
+async fn pop3_paging_is_served_locally_without_a_server_round_trip() {
+    let mock = MockPop3::start().await;
+    for index in 0..3 {
+        mock.add(
+            &format!("uid-{index}"),
+            &message_raw(
+                "a@example.com",
+                "test@example.com",
+                &format!("Pop {index}"),
+                "body",
+                &format!("pop-page-{index}@x"),
+            ),
+        );
+    }
+    let ctx = context(
+        StaticCreds::password("test@example.com", "secret"),
+        Arc::new(RecordingNotifier::default()),
+    )
+    .await;
+    let account = account(
+        "acc",
+        "test@example.com",
+        None,
+        None,
+        Some(server(mock.addr.port())),
+    );
+    insert_account(&ctx, &account).await;
+    nuncio_mail::pop3::sync::sync_account(&ctx, &account)
+        .await
+        .expect("pop3 sync");
+    assert_eq!(mock.counters.retr(), 0);
+    let inbox = folder_id(&ctx, "acc", "INBOX").await;
+
+    let first = {
+        let query = MessageListQuery::new(MailScope::folder(inbox.clone()))
+            .with_conversation(false)
+            .with_limit(2);
+        ctx.db
+            .read(move |db| repo::messages::list(db, &query))
+            .await
+            .expect("first page")
+    };
+    assert_eq!(first.items.len(), 2);
+    assert_eq!(first.total, 3);
+    let cursor = first.next_cursor.expect("next cursor");
+
+    let top = mock.counters.top();
+    let second = {
+        let query = MessageListQuery::new(MailScope::folder(inbox))
+            .with_conversation(false)
+            .with_limit(2)
+            .with_cursor(Some(cursor));
+        ctx.db
+            .read(move |db| repo::messages::list(db, &query))
+            .await
+            .expect("second page")
+    };
+    assert_eq!(second.items.len(), 1);
+    assert_eq!(mock.counters.top(), top, "paging must not touch the server");
+    assert_eq!(mock.counters.retr(), 0);
+}
+
+/* ───────────────────────────── load older mail ───────────────────────────── */
+
+/// Add `count` messages to the mock INBOX (UIDs `1..=count`).
+fn seed_inbox(mock: &MockImap, count: usize) {
+    for index in 0..count {
+        mock.state.add_message(
+            "INBOX",
+            &message_raw(
+                "a@example.com",
+                "test@example.com",
+                &format!("Older {index}"),
+                "body",
+                &format!("older-{index}@x"),
+            ),
+        );
+    }
+}
+
+/// Emulate a sync window that excluded old mail: drop the local rows whose UID
+/// is at or below `max_uid` (the server still has them).
+async fn forget_local_up_to(ctx: &CoreContext, folder_id: &str, max_uid: i64) {
+    let folder_id = folder_id.to_string();
+    ctx.db
+        .write(move |db| {
+            db.execute(
+                "DELETE FROM message WHERE folder_id = ?1 AND uid <= ?2",
+                rusqlite::params![folder_id, max_uid],
+            )?;
+            repo::folders::recompute_counts(db, &folder_id)
+        })
+        .await
+        .expect("forget old rows");
+}
+
+async fn min_uid(ctx: &CoreContext, folder_id: &str) -> Option<i64> {
+    let folder_id = folder_id.to_string();
+    ctx.db
+        .read(move |db| {
+            Ok(db.query_row(
+                "SELECT MIN(uid) FROM message WHERE folder_id = ?1",
+                rusqlite::params![folder_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )?)
+        })
+        .await
+        .expect("min uid")
+}
+
+async fn synced_inbox(mock: &MockImap) -> (CoreContext, nuncio_core::models::Account, String) {
+    let ctx = context(
+        StaticCreds::password("test@example.com", "secret"),
+        Arc::new(RecordingNotifier::default()),
+    )
+    .await;
+    let account = account(
+        "acc",
+        "test@example.com",
+        Some(server(mock.addr.port())),
+        None,
+        None,
+    );
+    insert_account(&ctx, &account).await;
+    sync_account(&ctx, &account).await;
+    let inbox = folder_id(&ctx, "acc", "INBOX").await;
+    (ctx, account, inbox)
+}
+
+#[tokio::test]
+async fn load_older_imap_pulls_batches_below_the_min_uid_until_exhausted() {
+    let mock = MockImap::start(&["IDLE", "CONDSTORE", "UIDPLUS"]).await;
+    seed_inbox(&mock, 450);
+    let (ctx, _account, inbox) = synced_inbox(&mock).await;
+    assert_eq!(message_count(&ctx, &inbox).await, 450);
+    forget_local_up_to(&ctx, &inbox, 300).await;
+    assert_eq!(message_count(&ctx, &inbox).await, 150);
+    assert_eq!(min_uid(&ctx, &inbox).await, Some(301));
+
+    // Through the engine/actor path so the command plumbing is covered too.
+    let engine = Engine::new(ctx.clone());
+    engine.start().await.expect("engine start");
+
+    let first = engine.load_older(&inbox).await.expect("first batch");
+    assert_eq!((first.loaded, first.has_more), (200, true));
+    assert_eq!(min_uid(&ctx, &inbox).await, Some(101));
+    assert_eq!(message_count(&ctx, &inbox).await, 350);
+
+    let second = engine.load_older(&inbox).await.expect("second batch");
+    assert_eq!((second.loaded, second.has_more), (100, false));
+    assert_eq!(min_uid(&ctx, &inbox).await, Some(1));
+    assert_eq!(message_count(&ctx, &inbox).await, 450);
+
+    // Exhausted: UID 1 is stored, nothing below it, no request needed.
+    let third = engine.load_older(&inbox).await.expect("third batch");
+    assert_eq!((third.loaded, third.has_more), (0, false));
+
+    // Unseen state is untouched: no STORE, no non-PEEK body fetch, and the
+    // folder's unread counter covers every loaded row.
+    let commands = mock.state.commands();
+    assert!(
+        commands.iter().all(|command| !command.contains(" STORE ")
+            && !command.starts_with("STORE ")),
+        "load older must never write flags"
+    );
+    assert!(commands
+        .iter()
+        .filter(|command| command.contains("FETCH"))
+        .all(|command| !command.contains("BODY[") || command.contains("BODY.PEEK[")));
+    for uid in [1u32, 150, 300, 450] {
+        assert!(mock.state.message_flags("INBOX", uid).is_empty());
+    }
+    let folder = {
+        let inbox = inbox.clone();
+        ctx.db
+            .read(move |db| repo::folders::get_required(db, &inbox))
+            .await
+            .expect("folder")
+    };
+    assert_eq!(folder.total_count, 450);
+    assert_eq!(folder.unread_count, 450);
+
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn load_older_imap_on_an_empty_folder_reports_nothing_more() {
+    let mock = MockImap::start(&["CONDSTORE"]).await;
+    let (ctx, account, inbox) = synced_inbox(&mock).await;
+    let folder = {
+        let inbox = inbox.clone();
+        ctx.db
+            .read(move |db| repo::folders::get_required(db, &inbox))
+            .await
+            .expect("folder")
+    };
+    let mut connection = connect_account(&account).await;
+    let result = nuncio_mail::sync::messages::load_older_imap(&ctx, &mut connection, &account, &folder)
+        .await
+        .expect("empty folder");
+    assert_eq!((result.loaded, result.has_more), (0, false));
+}
+
+#[tokio::test]
+async fn load_older_imap_widens_the_range_over_sparse_uids() {
+    let mock = MockImap::start(&["CONDSTORE"]).await;
+    seed_inbox(&mock, 3000);
+    // Leave UIDs 1..=5 and 3000; everything in between was expunged.
+    for uid in 6..3000u32 {
+        mock.state.remove_message("INBOX", uid);
+    }
+    let (ctx, account, inbox) = synced_inbox(&mock).await;
+    assert_eq!(message_count(&ctx, &inbox).await, 6);
+    forget_local_up_to(&ctx, &inbox, 5).await;
+    assert_eq!(min_uid(&ctx, &inbox).await, Some(3000));
+
+    let folder = {
+        let inbox = inbox.clone();
+        ctx.db
+            .read(move |db| repo::folders::get_required(db, &inbox))
+            .await
+            .expect("folder")
+    };
+    let mut connection = connect_account(&account).await;
+    let result = nuncio_mail::sync::messages::load_older_imap(&ctx, &mut connection, &account, &folder)
+        .await
+        .expect("sparse");
+    assert_eq!((result.loaded, result.has_more), (5, false));
+    assert_eq!(min_uid(&ctx, &inbox).await, Some(1));
+    // Bounded ranges only: never an unbounded `SEARCH ALL` for this request.
+    let searches: Vec<String> = mock
+        .state
+        .commands()
+        .into_iter()
+        .filter(|command| command.contains("SEARCH") && command.contains("UID 1:"))
+        .collect();
+    assert!(!searches.is_empty());
+}
+
+#[tokio::test]
+async fn load_older_imap_refuses_after_a_uidvalidity_change() {
+    let mock = MockImap::start(&["CONDSTORE"]).await;
+    seed_inbox(&mock, 10);
+    let (ctx, account, inbox) = synced_inbox(&mock).await;
+    forget_local_up_to(&ctx, &inbox, 5).await;
+    let before = message_count(&ctx, &inbox).await;
+
+    mock.state.bump_uidvalidity("INBOX", 99);
+    let folder = {
+        let inbox = inbox.clone();
+        ctx.db
+            .read(move |db| repo::folders::get_required(db, &inbox))
+            .await
+            .expect("folder")
+    };
+    let mut connection = connect_account(&account).await;
+    let error = nuncio_mail::sync::messages::load_older_imap(&ctx, &mut connection, &account, &folder)
+        .await
+        .expect_err("uidvalidity changed");
+    assert_eq!(error.code(), "conflict");
+    // Nothing destructive happened.
+    assert_eq!(message_count(&ctx, &inbox).await, before);
+    assert_eq!(min_uid(&ctx, &inbox).await, Some(6));
+}
+
+#[tokio::test]
+async fn load_older_is_a_no_op_for_pop3() {
+    let mock = MockPop3::start().await;
+    mock.add(
+        "uid-0",
+        &message_raw("a@example.com", "test@example.com", "Pop", "body", "pop-old@x"),
+    );
+    let ctx = context(
+        StaticCreds::password("test@example.com", "secret"),
+        Arc::new(RecordingNotifier::default()),
+    )
+    .await;
+    let account = account(
+        "acc",
+        "test@example.com",
+        None,
+        None,
+        Some(server(mock.addr.port())),
+    );
+    insert_account(&ctx, &account).await;
+    nuncio_mail::pop3::sync::sync_account(&ctx, &account)
+        .await
+        .expect("pop3 sync");
+    let inbox = folder_id(&ctx, "acc", "INBOX").await;
+    let top = mock.counters.top();
+    let retr = mock.counters.retr();
+
+    let engine = Engine::new(ctx.clone());
+    let result = engine.load_older(&inbox).await.expect("pop3 no-op");
+    assert_eq!((result.loaded, result.has_more), (0, false));
+    assert_eq!(mock.counters.top(), top);
+    assert_eq!(mock.counters.retr(), retr);
+}
+
+#[tokio::test]
+async fn load_older_graph_resumes_below_the_oldest_stored_message() {
+    let mock = support::mock_graph::MockGraph::start(250).await;
+    let ctx = context(
+        StaticCreds::password("test@example.com", "secret"),
+        Arc::new(RecordingNotifier::default()),
+    )
+    .await;
+    let mut account = account("acc", "test@example.com", None, None, None);
+    account.provider = ProviderKind::Outlook;
+    insert_account(&ctx, &account).await;
+    let folder = nuncio_core::models::Folder::new(
+        "f-inbox",
+        "acc",
+        "Inbox",
+        nuncio_core::models::FolderRole::Inbox,
+    );
+    {
+        let folder = folder.clone();
+        ctx.db
+            .write(move |db| {
+                repo::folders::insert(db, &folder)?;
+                repo::sync_state::set(db, "acc", "mail", "graph_folder:Inbox", "AAMk-inbox")
+            })
+            .await
+            .expect("seed folder");
+    }
+    let client = nuncio_mail::graph::GraphMailClient::with_base(mock.base.clone());
+    let load = || async {
+        nuncio_mail::sync::messages::load_older_graph_with(&ctx, &client, &account, &folder)
+            .await
+            .expect("graph load older")
+    };
+
+    // No local rows yet: the newest page, no date bound.
+    let first = load().await;
+    assert_eq!((first.loaded, first.has_more), (100, true));
+    // Second click is bounded by the oldest stored message (boundary row is
+    // re-sent once and not counted as new).
+    let second = load().await;
+    assert_eq!((second.loaded, second.has_more), (99, true));
+    let third = load().await;
+    assert_eq!((third.loaded, third.has_more), (51, false));
+    // Everything is local; a further click finds only the boundary row.
+    let fourth = load().await;
+    assert_eq!((fourth.loaded, fourth.has_more), (0, false));
+    assert_eq!(message_count(&ctx, &folder.id).await, 250);
+
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 4);
+    assert!(requests
+        .iter()
+        .all(|url| url.starts_with("/me/mailFolders/AAMk-inbox/messages?")));
+    assert!(!requests[0].contains("filter"));
+    assert!(requests[1].contains("%24filter=receivedDateTime%20le%20"));
+    assert!(requests[1].contains("%24orderby=receivedDateTime%20desc"));
+    assert!(requests[1].contains("%24top=100"));
+}
+
+/// NetEase 163 never reports UIDNEXT. Before the fix a stored UIDNEXT of NULL
+/// made every sync look like a first sync (full window scan, no increments)
+/// and made "load older" refuse with "not synced yet".
+#[tokio::test]
+async fn a_server_without_uidnext_still_gets_incremental_sync() {
+    let mock = MockImap::start(&["IDLE", "UIDPLUS"]).await;
+    mock.state.set_omit_uidnext(true);
+    seed_inbox(&mock, 5);
+    let (ctx, account, inbox) = synced_inbox(&mock).await;
+    assert_eq!(message_count(&ctx, &inbox).await, 5);
+
+    // The stand-in (highest UID + 1) is stored, so the next sync is incremental.
+    let (_, uidnext, _) = ctx
+        .db
+        .read({
+            let inbox = inbox.clone();
+            move |db| nuncio_core::repo::folders::sync_flags(db, &inbox)
+        })
+        .await
+        .expect("sync flags");
+    assert_eq!(uidnext, Some(6));
+
+    // A new message arrives; the second sync must fetch only that one.
+    let before = mock.state.commands().len();
+    seed_inbox(&mock, 6);
+    sync_account(&ctx, &account).await;
+    assert_eq!(message_count(&ctx, &inbox).await, 6);
+    let later: Vec<String> = mock.state.commands().into_iter().skip(before).collect();
+    assert!(
+        later.iter().any(|command| command.contains("UID SEARCH UID 6:*")),
+        "expected an incremental UID range, got {later:?}"
+    );
+}
+
+#[tokio::test]
+async fn load_older_works_when_the_server_reports_no_uidnext() {
+    let mock = MockImap::start(&["IDLE", "UIDPLUS"]).await;
+    mock.state.set_omit_uidnext(true);
+    seed_inbox(&mock, 450);
+    let (ctx, _account, inbox) = synced_inbox(&mock).await;
+    forget_local_up_to(&ctx, &inbox, 300).await;
+
+    let engine = Engine::new(ctx.clone());
+    engine.start().await.expect("engine start");
+    let first = engine
+        .load_older(&inbox)
+        .await
+        .expect("load older must not need a stored UIDNEXT");
+    assert_eq!((first.loaded, first.has_more), (200, true));
+}
+
+/// With nothing stored there is nothing to derive UIDNEXT from. Storing 1 would
+/// make the next incremental sync ask for `UID 1:*`, i.e. the whole history
+/// beyond the sync window.
+#[tokio::test]
+async fn an_empty_folder_on_a_server_without_uidnext_stores_no_uidnext() {
+    let mock = MockImap::start(&["IDLE", "UIDPLUS"]).await;
+    mock.state.set_omit_uidnext(true);
+    let (ctx, _account, inbox) = synced_inbox(&mock).await;
+    assert_eq!(message_count(&ctx, &inbox).await, 0);
+    let (_, uidnext, _) = ctx
+        .db
+        .read({
+            let inbox = inbox.clone();
+            move |db| nuncio_core::repo::folders::sync_flags(db, &inbox)
+        })
+        .await
+        .expect("sync flags");
+    assert_eq!(uidnext, None, "an unknown UIDNEXT must stay unknown");
 }

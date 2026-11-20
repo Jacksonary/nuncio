@@ -1,4 +1,4 @@
-/** Account management list with drag reordering and per-account details. */
+/** Account management list with drag reordering. */
 import { useState } from "react";
 import {
   Add24Regular,
@@ -15,27 +15,24 @@ import { hasConnectedAccount, isLocalAccount } from "@/lib/accounts";
 import { useAccounts, useReorderAccounts } from "../lib/hooks";
 import { describeError } from "../lib/errors";
 import { AddAccountDialog } from "../AddAccountDialog";
-import { AccountDetail } from "./AccountDetail";
-import { Section, SettingsPage, Banner } from "./SettingsUI";
+import { Section, Banner } from "./SettingsUI";
 import styles from "../settings.module.css";
 
-export function AccountsSection({
-  onAddAccount,
-  onBack,
-  initialAccountId,
-}: AccountsSectionProps & { onBack?: () => void; initialAccountId?: string | null }) {
+export interface AccountsContentProps extends AccountsSectionProps {
+  /** Open one account's detail page. */
+  onSelect: (accountId: string) => void;
+}
+
+/** The account list itself; the Accounts page supplies page chrome. */
+export function AccountsContent({ onAddAccount, onSelect }: AccountsContentProps) {
   const t = useT();
   const accountsQuery = useAccounts();
   const reorder = useReorderAccounts();
-  // Seeded from the deep link so opening settings from an account row lands on
-  // that account, not the index the user then has to hunt through.
-  const [selectedId, setSelectedId] = useState<string | null>(initialAccountId ?? null);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [dragId, setDragId] = useState<string | null>(null);
   const [dragOverId, setDragOverId] = useState<string | null>(null);
 
   const accounts = accountsQuery.data ?? [];
-  const selected = selectedId ? accounts.find((account) => account.id === selectedId) : null;
 
   const requestAdd = () => {
     if (onAddAccount) onAddAccount();
@@ -72,22 +69,10 @@ export function AccountsSection({
     commitOrder(ids);
   };
 
-  if (selected) {
-    return <AccountDetail account={selected} onBack={() => setSelectedId(null)} />;
-  }
-
   return (
-    <SettingsPage
-      title={t("settings.accounts.title")}
-      subtitle={t("settings.accounts.subtitle")}
-      onBack={onBack}
+    <Section
       actions={
-        <Button
-          appearance="primary"
-          size="small"
-          icon={<Add24Regular />}
-          onClick={requestAdd}
-        >
+        <Button appearance="primary" size="small" icon={<Add24Regular />} onClick={requestAdd}>
           {t("settings.accounts.add")}
         </Button>
       }
@@ -161,7 +146,7 @@ export function AccountsSection({
                 <button
                   type="button"
                   className={styles.accountMain}
-                  onClick={() => setSelectedId(account.id)}
+                  onClick={() => onSelect(account.id)}
                 >
                   <Avatar name={account.displayName} email={account.email} size={36} />
                   <span className={styles.accountMeta}>
@@ -212,15 +197,15 @@ export function AccountsSection({
           onClose={() => setDialogOpen(false)}
           onCreated={(account) => {
             setDialogOpen(false);
-            setSelectedId(account.id);
+            onSelect(account.id);
           }}
         />
       ) : null}
-    </SettingsPage>
+    </Section>
   );
 }
 
-function StateBadge({ account }: { account: Account }) {
+export function StateBadge({ account }: { account: Account }) {
   const t = useT();
   switch (account.state) {
     case "needsReauth":

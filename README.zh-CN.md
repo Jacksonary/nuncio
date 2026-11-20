@@ -77,7 +77,7 @@
 | 平台 | 格式 |
 |------|------|
 | Windows 10/11 x64 | `.exe` (NSIS) |
-| macOS（Apple Silicon / Intel） | `.dmg` |
+| macOS（Apple Silicon） | `.dmg` |
 | Linux x64 | `.deb` / `.AppImage` |
 
 > 未签名的 Windows 构建首次运行会触发 SmartScreen；未公证的 macOS 构建需要右键「打开」，或在「系统设置 → 隐私与安全性」中放行。也可以清除隔离属性，但**仅限**从官方 Releases 页面下载并确认可信的安装包——这会绕过 Gatekeeper 的首次运行检查：
