@@ -2154,6 +2154,17 @@ impl FromStr for TaskStatus {
     }
 }
 
+/// `wellknownListName` value for a list the user created.
+pub const WELL_KNOWN_NONE: &str = "none";
+/// Microsoft To Do's built-in "Tasks" list.
+pub const WELL_KNOWN_DEFAULT: &str = "defaultList";
+/// Microsoft To Do's built-in "Flagged Emails" list.
+pub const WELL_KNOWN_FLAGGED_EMAILS: &str = "flaggedEmails";
+
+fn default_well_known() -> String {
+    WELL_KNOWN_NONE.to_string()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskList {
@@ -2163,8 +2174,30 @@ pub struct TaskList {
     pub color: String,
     pub is_default: bool,
     pub is_read_only: bool,
+    /// Provider-reported built-in list marker. `none` for user-created lists;
+    /// `defaultList` and `flaggedEmails` cannot be renamed or deleted.
+    #[serde(default = "default_well_known")]
+    pub well_known_list_name: String,
     pub incomplete_count: i64,
     pub sort_order: i64,
+}
+
+impl TaskList {
+    /// True when the provider owns this list's name and lifetime.
+    pub fn is_builtin(&self) -> bool {
+        self.well_known_list_name != WELL_KNOWN_NONE
+    }
+}
+
+/// A file attached to a task. Only Microsoft To Do exposes task attachments
+/// through a public API, so other providers return an empty list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskAttachment {
+    pub id: Id,
+    pub name: String,
+    pub size: i64,
+    pub content_type: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2198,6 +2231,23 @@ pub struct Task {
     pub sort_order: i64,
     /// Linked e-mail (for "flagged email" tasks).
     pub linked_message_id: Option<Id>,
+}
+
+/// Options for turning an e-mail into a task. The dialog supplies every
+/// field, so nothing is inferred except a fallback title/notes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewTaskFromMessage {
+    pub title: String,
+    #[serde(default)]
+    pub notes: String,
+    pub list_id: Id,
+    pub due_date: Option<String>,
+    pub reminder_at: Option<DateTime<Utc>>,
+    pub my_day_date: Option<String>,
+    /// Flag the source message as well; off unless the user ticks the box.
+    #[serde(default)]
+    pub mark_flagged: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

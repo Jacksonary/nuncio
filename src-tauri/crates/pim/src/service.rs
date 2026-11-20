@@ -2791,10 +2791,14 @@ impl PimService {
         self.inner.tasks_service.task_search(text).await
     }
 
-    pub async fn message_create_task(&self, message_id: &str) -> Result<nuncio_core::models::Task> {
+    pub async fn message_create_task(
+        &self,
+        message_id: &str,
+        options: nuncio_core::models::NewTaskFromMessage,
+    ) -> Result<nuncio_core::models::Task> {
         self.inner
             .tasks_service
-            .message_create_task(message_id)
+            .message_create_task(message_id, options)
             .await
     }
 

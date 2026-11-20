@@ -1252,6 +1252,9 @@ function Composer({ initialDraft, mode, onClose, onSent }: ComposerProps) {
   /* Ctrl/Cmd+Enter sends; Ctrl/Cmd+K opens the link dialog. */
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
+      // The inline composer stays mounted while another module is on screen
+      // (module keep-alive), so it must not capture shortcuts from there.
+      if (mode !== "window" && useShellStore.getState().activeModule !== "mail") return;
       if (!(event.metaKey || event.ctrlKey)) return;
       if (event.key === "Enter") {
         event.preventDefault();

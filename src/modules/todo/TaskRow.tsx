@@ -37,6 +37,8 @@ export interface TaskRowProps {
   selected: boolean;
   showListName: boolean;
   readOnly: boolean;
+  /** False when the account cannot store importance remotely (Google Tasks). */
+  importanceSynced?: boolean;
   menuItems: MenuEntry[];
   /** Visual drop indicator while dragging another task over this row. */
   dropPosition: "before" | "after" | null;
@@ -62,6 +64,7 @@ export function TaskRow({
   selected,
   showListName,
   readOnly,
+  importanceSynced = true,
   menuItems,
   dropPosition,
   dragging,
@@ -227,6 +230,7 @@ export function TaskRow({
           label={
             task.importance === "high" ? t("todo.row.notImportant") : t("todo.row.important")
           }
+          tooltip={importanceSynced ? undefined : t("todo.detail.localOnly")}
           selected={task.importance === "high"}
           disabled={readOnly}
           onClick={(event) => {

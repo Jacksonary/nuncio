@@ -637,6 +637,15 @@ export function isMyDayToday(task: Task, today: IsoDate): boolean {
   return task.myDayDate !== null && task.myDayDate === today;
 }
 
+/**
+ * A list the provider created for itself (Microsoft To Do's "Tasks" and
+ * "Flagged Emails"). It exists remotely but cannot be renamed or deleted, so
+ * the menu must not offer either.
+ */
+export function isBuiltinList(list: Pick<TaskList, "wellKnownListName">): boolean {
+  return (list.wellKnownListName ?? "none") !== "none";
+}
+
 /** The list new tasks go to when the view is a smart list. */
 export function defaultList(lists: TaskList[]): TaskList | null {
   const writable = lists.filter((list) => !list.isReadOnly);

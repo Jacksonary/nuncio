@@ -343,6 +343,38 @@ export function parseTimeOfDay(value: string): number | null {
   return hours * 60 + minutes;
 }
 
+/**
+ * Parse a time the user typed, tolerating the shorthand people actually use:
+ * `9:05`, `09:05`, `9：05`, `905`, `0905`, or a bare hour `9`.
+ *
+ * Returns the normalized `HH:mm` form, or `null` when the text is not a valid
+ * time of day.
+ */
+export function parseLooseTime(value: string): string | null {
+  const text = value.trim().replace(/：/g, ":");
+  if (text.length === 0) return null;
+  const withSeparator = /^(\d{1,2}):(\d{1,2})$/.exec(text);
+  if (withSeparator) {
+    const hours = Number(withSeparator[1]);
+    const minutes = Number(withSeparator[2]);
+    return hours <= 23 && minutes <= 59
+      ? formatTimeOfDay(hours * 60 + minutes)
+      : null;
+  }
+  const digits = /^(\d{1,4})$/.exec(text);
+  if (!digits) return null;
+  const raw = digits[1];
+  if (raw.length <= 2) {
+    const hours = Number(raw);
+    return hours <= 23 ? formatTimeOfDay(hours * 60) : null;
+  }
+  const hours = Number(raw.slice(0, raw.length - 2));
+  const minutes = Number(raw.slice(-2));
+  return hours <= 23 && minutes <= 59
+    ? formatTimeOfDay(hours * 60 + minutes)
+    : null;
+}
+
 /** Format minutes since midnight as "HH:mm". */
 export function formatTimeOfDay(minutesSinceMidnight: number): string {
   const total = ((Math.round(minutesSinceMidnight) % 1440) + 1440) % 1440;

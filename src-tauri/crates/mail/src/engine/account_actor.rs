@@ -986,7 +986,7 @@ async fn idle_loop(
             // connection is kept alive with a separate NOOP ticker.
             tokio::select! {
                 _ = cancel.cancelled() => break,
-                _ = sleep(config.no_idle_poll_interval) => {}
+                _ = sleep(crate::engine::poll_interval(config.no_idle_poll_interval)) => {}
             }
             let (reply, _rx) = oneshot::channel();
             let _ = tx.send(AccountCommand::SyncFolder(None, reply)).await;
@@ -1219,9 +1219,8 @@ async fn graph_loop(
     cancel: CancellationToken,
     config: EngineConfig,
 ) {
-    let base = config.no_idle_poll_interval.max(Duration::from_secs(30));
     let mut backoff = Backoff::new(Duration::from_secs(5), Duration::from_secs(300));
-    let mut delay = base;
+    let mut delay = crate::engine::poll_interval(config.no_idle_poll_interval);
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
@@ -1231,16 +1230,30 @@ async fn graph_loop(
                 // A command is an explicit wake-up: retry immediately if it
                 // failed, then return to the normal cadence.
                 backoff.reset();
-                delay = base;
+                delay = crate::engine::poll_interval(config.no_idle_poll_interval);
             }
             _ = sleep(delay) => {
                 match graph_sync_account(&ctx, &account_id).await {
                     Ok(()) => {
                         backoff.reset();
-                        delay = base;
+                        delay = crate::engine::poll_interval(config.no_idle_poll_interval);
                     }
                     Err(error) => {
-                        delay = backoff.next_delay();
+                        let mut next = backoff.next_delay();
+                        // A rate limit or server error means the service
+                        // answered and asked us to slow down; retrying five
+                        // seconds later would hammer it. Never come back
+                        // sooner than the normal poll cadence, and honour a
+                        // `Retry-After` hint plus a small margin.
+                        if matches!(error, nuncio_core::AppError::Service(_)) {
+                            next = next.max(crate::engine::poll_interval(
+                                config.no_idle_poll_interval,
+                            ));
+                        }
+                        if let Some(seconds) = crate::graph::take_retry_after_secs() {
+                            next = next.max(Duration::from_secs(seconds + 5));
+                        }
+                        delay = next;
                         debug!(
                             account = %account_id,
                             %error,

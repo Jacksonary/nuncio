@@ -64,6 +64,14 @@
   line-height: var(--line-body);
 }
 
+/* The wrapper draws the focus ring (`:focus-within` above). The global
+   `:focus-visible` rule is emitted after the module CSS (global.css is
+   imported last), so a plain `outline: none` here loses the cascade and the
+   field gets two rings. */
+.input:focus-visible {
+  outline: none;
+}
+
 .input::placeholder {
   color: var(--text-tertiary);
 }
@@ -133,6 +141,10 @@
   color: var(--text);
   font-size: var(--font-body);
   line-height: var(--line-body);
+}
+
+.textarea:focus-visible {
+  outline: none;
 }
 
 .textarea::placeholder {

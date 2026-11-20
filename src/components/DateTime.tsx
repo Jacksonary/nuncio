@@ -24,6 +24,7 @@ import {
   formatWeekday,
   isSameDay,
   parseIsoDate,
+  parseLooseTime,
   parseTimeOfDay,
   startOfWeek,
   toIsoDate,
@@ -372,9 +373,13 @@ export function TimePicker({
   const id = idProp ?? generatedId;
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
+  const manualRef = useRef<HTMLInputElement | null>(null);
   const optionRefs = useRef(new Map<number, HTMLButtonElement | null>());
   const [open, setOpen] = useState(false);
   const [activeIndex, setActiveIndex] = useState(0);
+  // Typed value: the list offers 15-minute stops, but a reminder can be any
+  // minute, so the field has to accept free text as well.
+  const [draft, setDraft] = useState("");
   const wasOpen = useRef(false);
 
   const options = useMemo(() => {
@@ -394,10 +399,11 @@ export function TimePicker({
     if (!open) return;
     const index = selectedIndex >= 0 ? selectedIndex : 0;
     setActiveIndex(index);
+    setDraft(value ?? "");
     window.requestAnimationFrame(() => {
-      const element = optionRefs.current.get(index);
-      element?.scrollIntoView({ block: "center" });
-      element?.focus();
+      optionRefs.current.get(index)?.scrollIntoView({ block: "center" });
+      manualRef.current?.focus();
+      manualRef.current?.select();
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
@@ -411,6 +417,13 @@ export function TimePicker({
 
   const choose = (minutes: number) => {
     onChange(formatTimeOfDay(minutes));
+    close();
+  };
+
+  const commitDraft = () => {
+    const parsed = parseLooseTime(draft);
+    if (!parsed) return;
+    onChange(parsed);
     close();
   };
 
@@ -501,6 +514,32 @@ export function TimePicker({
         minWidth={148}
         closeOnEscape={false}
       >
+        <div className={styles.timeManual}>
+          <input
+            ref={manualRef}
+            className={styles.timeInput}
+            value={draft}
+            placeholder="HH:MM"
+            inputMode="numeric"
+            aria-label={t("common.enterTime")}
+            onChange={(event) => setDraft(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                commitDraft();
+              } else if (event.key === "Escape") {
+                event.preventDefault();
+                event.stopPropagation();
+                close();
+              } else if (event.key === "ArrowDown") {
+                event.preventDefault();
+                const index = selectedIndex >= 0 ? selectedIndex : 0;
+                setActiveIndex(index);
+                optionRefs.current.get(index)?.focus();
+              }
+            }}
+          />
+        </div>
         <div
           ref={listRef}
           className={styles.timeList}

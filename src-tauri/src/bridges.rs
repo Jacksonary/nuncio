@@ -106,6 +106,19 @@ impl AppNotifier {
             .unwrap_or_default()
     }
 
+    /// True when the main window is on screen, unminimized and focused: the
+    /// in-app reminder card is visible, and the OS would suppress a banner for
+    /// the frontmost app anyway.
+    fn main_window_is_foreground(&self) -> bool {
+        let Some(window) = self.app.get_webview_window("main") else {
+            return false;
+        };
+        let visible = window.is_visible().unwrap_or(false);
+        let minimized = window.is_minimized().unwrap_or(false);
+        let focused = window.is_focused().unwrap_or(false);
+        visible && !minimized && focused
+    }
+
     fn show(&self, id: i32, title: &str, body: &str, settings: &AppSettings) {
         use tauri_plugin_notification::NotificationExt;
 
@@ -217,6 +230,12 @@ impl Notifier for AppNotifier {
             _ => true,
         };
         if !enabled {
+            return;
+        }
+        // Foreground: the in-app reminder card already told the user, and
+        // macOS silently drops banners from the frontmost app. Minimized or
+        // hidden: only the system notification can reach them.
+        if self.main_window_is_foreground() {
             return;
         }
         let id = self.registry.insert(target);

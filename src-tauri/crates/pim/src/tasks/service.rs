@@ -1,13 +1,15 @@
 //! Task sync engine, command facade and pending-operation executor.
 
+use base64::Engine as _;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use nuncio_core::events::{emit_mail_changed, emit_tasks_changed, MailChangeKind};
 use nuncio_core::models::{
-    new_id, Account, Importance, NewPendingOp, PendingOp, SmartListCounts, SyncModule, Task,
-    TaskInput, TaskList, TaskQuery, TaskStatus, TaskStep,
+    new_id, Account, Importance, NewPendingOp, NewTaskFromMessage, OAuthProvider, PendingOp,
+    PendingOpState, SmartListCounts, SyncModule, Task, TaskAttachment, TaskInput, TaskList,
+    TaskQuery, TaskStatus, TaskStep,
 };
 use nuncio_core::providers::DavService;
 use nuncio_core::repo::{
@@ -26,7 +28,7 @@ use crate::status::record_failure;
 use crate::store::{self, TaskListRemote};
 use crate::tasks::dav::CalDavTaskProvider;
 use crate::tasks::google::GoogleTasksProvider;
-use crate::tasks::graph::GraphTasksProvider;
+use crate::tasks::graph::{GraphTasksClient, GraphTasksProvider};
 use crate::tasks::map::{self, next_occurrence, sort_for_list, today};
 use crate::tasks::ops::{self, TaskListSnapshot, TaskOp, TaskSnapshot};
 use crate::tasks::provider::{
@@ -284,6 +286,15 @@ impl TasksService {
                                     list.is_read_only = remote.read_only;
                                     changed = true;
                                 }
+                                if list.well_known_list_name != remote.well_known_list_name
+                                    || (remote.well_known_list_name
+                                        == nuncio_core::models::WELL_KNOWN_DEFAULT
+                                        && !list.is_default)
+                                {
+                                    apply_well_known(conn, &list.id, &remote.well_known_list_name)?;
+                                    list = task_lists::get_required(conn, &list.id)?;
+                                    changed = true;
+                                }
                                 if mapping.href != remote.href {
                                     store::set_task_list(
                                         conn,
@@ -457,6 +468,31 @@ impl TasksService {
         let color = color.map(normalize_color_or_default);
         let name = name.map(str::to_string);
         let id = id.to_string();
+        // The provider refuses to rename its own lists, and the failure only
+        // surfaces after the local row was already changed. Reject it here so
+        // the user sees one clear error instead of a success followed by a
+        // rollback.
+        {
+            let id = id.clone();
+            let existing = self
+                .ctx
+                .db
+                .read(move |conn| {
+                    let list = task_lists::get_required(conn, &id)?;
+                    Ok((list.is_builtin(), list.name))
+                })
+                .await?;
+            let (builtin, current_name) = existing;
+            if builtin
+                && name
+                    .as_ref()
+                    .is_some_and(|requested| requested != &current_name)
+            {
+                return Err(invalid(
+                    "built-in task lists cannot be renamed; the provider owns their name",
+                ));
+            }
+        }
         let (previous, updated) = self
             .ctx
             .db
@@ -486,6 +522,22 @@ impl TasksService {
 
     pub async fn tasklist_delete(&self, id: &str) -> Result<()> {
         let id = id.to_string();
+        {
+            let id = id.clone();
+            let builtin = self
+                .ctx
+                .db
+                .read(move |conn| {
+                    let list = task_lists::get_required(conn, &id)?;
+                    Ok(list.is_builtin())
+                })
+                .await?;
+            if builtin {
+                return Err(invalid(
+                    "built-in task lists cannot be deleted; the provider owns them",
+                ));
+            }
+        }
         let id_for_db = id.clone();
         let (snapshot, account_id) = self
             .ctx
@@ -551,6 +603,177 @@ impl TasksService {
         Ok(tasks)
     }
 
+    /* ───────────────────────── task attachments ───────────────────── */
+
+    /// Resolve what the Graph attachment endpoints need: the account, the
+    /// remote list id and the remote task id.
+    async fn attachment_scope(&self, task_id: &str) -> Result<(Account, String, String)> {
+        let id = task_id.to_string();
+        let task = self
+            .ctx
+            .db
+            .read(move |conn| tasks_repo::get_required(conn, &id))
+            .await?;
+        let account = self.load_account(&task.account_id).await?;
+        if account.oauth_provider != Some(OAuthProvider::Microsoft) {
+            return Err(unsupported(
+                "task attachments are only supported for Microsoft accounts",
+            ));
+        }
+        let Some(mapping) = self.list_mapping(&task.list_id).await? else {
+            return Err(AppError::conflict("task list is not mapped yet"));
+        };
+        let Some(snapshot) = self.snapshot_task(task_id).await? else {
+            return Err(AppError::not_found(format!("task {task_id} not found")));
+        };
+        let Some(remote_id) = snapshot.remote_id else {
+            return Err(AppError::conflict(
+                "the task has not been uploaded yet; sync it first",
+            ));
+        };
+        Ok((account, mapping.remote_id, remote_id))
+    }
+
+    pub async fn task_attachments(&self, task_id: &str) -> Result<Vec<TaskAttachment>> {
+        let (account, list_remote, task_remote) = self.attachment_scope(task_id).await?;
+        let client = GraphTasksClient::new(self.http.clone());
+        let items = client
+            .list_task_attachments(&account.id, &list_remote, &task_remote)
+            .await?;
+        Ok(items
+            .into_iter()
+            .map(|item| {
+                let content_type = item
+                    .content_type
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| attachment_content_type(&item.name).to_string());
+                TaskAttachment {
+                    id: item.id,
+                    name: item.name,
+                    size: item.size,
+                    content_type,
+                }
+            })
+            .collect())
+    }
+
+    pub async fn task_attachment_add(
+        &self,
+        task_id: &str,
+        path: &str,
+    ) -> Result<Vec<TaskAttachment>> {
+        let (account, list_remote, task_remote) = self.attachment_scope(task_id).await?;
+        // Graph accepts inline content only below 3 MB; larger files need an
+        // upload session, which this client does not implement yet. Check the
+        // size before reading, or a picked 2 GB file would be loaded into
+        // memory only to be rejected.
+        const LIMIT: u64 = 3 * 1024 * 1024;
+        let size = tokio::fs::metadata(path)
+            .await
+            .map_err(|error| AppError::io(format!("cannot read {path}: {error}")))?
+            .len();
+        if size >= LIMIT {
+            return Err(invalid(format!(
+                "attachment is too large ({:.1} MB, limit {} MB)",
+                size as f64 / (1024.0 * 1024.0),
+                LIMIT / (1024 * 1024)
+            )));
+        }
+        let bytes = tokio::fs::read(path)
+            .await
+            .map_err(|error| AppError::io(format!("cannot read {path}: {error}")))?;
+        let name = path
+            .rsplit(['/', '\\'])
+            .next()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or("attachment")
+            .to_string();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let client = GraphTasksClient::new(self.http.clone());
+        client
+            .create_task_attachment(
+                &account.id,
+                &list_remote,
+                &task_remote,
+                &name,
+                attachment_content_type(&name),
+                &encoded,
+            )
+            .await?;
+        self.task_attachments(task_id).await
+    }
+
+    pub async fn task_attachment_remove(
+        &self,
+        task_id: &str,
+        attachment_id: &str,
+    ) -> Result<()> {
+        let (account, list_remote, task_remote) = self.attachment_scope(task_id).await?;
+        let client = GraphTasksClient::new(self.http.clone());
+        client
+            .delete_task_attachment(&account.id, &list_remote, &task_remote, attachment_id)
+            .await
+    }
+
+    /// Download one attachment into the local cache and return its path, so
+    /// the command layer can hand it to the OS opener.
+    /// Download one attachment: its display name, content type and bytes.
+    async fn attachment_payload(
+        &self,
+        task_id: &str,
+        attachment_id: &str,
+    ) -> Result<(String, String, Vec<u8>)> {
+        let (account, list_remote, task_remote) = self.attachment_scope(task_id).await?;
+        let client = GraphTasksClient::new(self.http.clone());
+        let meta = client
+            .list_task_attachments(&account.id, &list_remote, &task_remote)
+            .await?
+            .into_iter()
+            .find(|item| item.id == attachment_id);
+        let (name, content_type) = match meta {
+            Some(item) => {
+                let content_type = item
+                    .content_type
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| attachment_content_type(&item.name).to_string());
+                (item.name, content_type)
+            }
+            None => (
+                attachment_id.to_string(),
+                "application/octet-stream".to_string(),
+            ),
+        };
+        let bytes = client
+            .download_task_attachment(&account.id, &list_remote, &task_remote, attachment_id)
+            .await?;
+        Ok((name, content_type, bytes))
+    }
+
+    /// Inline preview payload: a `data:` URL the webview can render directly.
+    pub async fn task_attachment_data(
+        &self,
+        task_id: &str,
+        attachment_id: &str,
+    ) -> Result<String> {
+        let (_, content_type, bytes) = self.attachment_payload(task_id, attachment_id).await?;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        Ok(format!("data:{content_type};base64,{encoded}"))
+    }
+
+    /// Write one attachment to a user-chosen path.
+    pub async fn task_attachment_save(
+        &self,
+        task_id: &str,
+        attachment_id: &str,
+        path: &str,
+    ) -> Result<()> {
+        let (_, _, bytes) = self.attachment_payload(task_id, attachment_id).await?;
+        tokio::fs::write(path, &bytes)
+            .await
+            .map_err(|error| AppError::io(format!("cannot save the attachment: {error}")))?;
+        Ok(())
+    }
+
     pub async fn task_get(&self, id: &str) -> Result<Task> {
         let id = id.to_string();
         let mut task = self
@@ -584,8 +807,12 @@ impl TasksService {
             .read(move |conn| {
                 let mut existing = HashSet::new();
                 for message_id in linked {
-                    if messages_repo::get(conn, &message_id)?.is_some() {
-                        existing.insert(message_id);
+                    // A soft-deleted message (Trash) is gone from the user's
+                    // point of view: keep the task but drop the stale link.
+                    if let Some(message) = messages_repo::get(conn, &message_id)? {
+                        if !message.is_deleted_local {
+                            existing.insert(message_id);
+                        }
                     }
                 }
                 Ok(existing)
@@ -902,7 +1129,11 @@ impl TasksService {
     }
 
     /// Create a To Do task linked to an e-mail and flag the message.
-    pub async fn message_create_task(&self, message_id: &str) -> Result<Task> {
+    pub async fn message_create_task(
+        &self,
+        message_id: &str,
+        options: NewTaskFromMessage,
+    ) -> Result<Task> {
         let id = message_id.to_string();
         let message = self
             .ctx
@@ -910,34 +1141,41 @@ impl TasksService {
             .read(move |conn| messages_repo::get_required(conn, &id))
             .await?;
         let summary = message.summary.clone();
-        let title = if summary.subject.trim().is_empty() {
-            "(无主题)".to_string()
+        let title = if options.title.trim().is_empty() {
+            if summary.subject.trim().is_empty() {
+                "(无主题)".to_string()
+            } else {
+                summary.subject.clone()
+            }
         } else {
-            summary.subject.clone()
+            options.title.trim().to_string()
         };
         let sender = summary
             .r#from
             .as_ref()
             .map(|address| address.to_string())
             .unwrap_or_default();
-        let notes = format!(
-            "发件人：{}\n日期：{}",
-            sender,
-            summary.date.format("%Y-%m-%d %H:%M")
-        );
-        let account_id = summary.account_id.clone();
-        let list_id = self.default_list_for(&account_id).await?;
+        let notes = if options.notes.trim().is_empty() {
+            format!(
+                "发件人：{}\n日期：{}",
+                sender,
+                summary.date.format("%Y-%m-%d %H:%M")
+            )
+        } else {
+            options.notes.clone()
+        };
         let input = TaskInput {
             title,
             notes,
             importance: Importance::Normal,
-            due_date: Some(today()),
-            reminder_at: None,
+            due_date: options.due_date,
+            reminder_at: options.reminder_at,
             recurrence: None,
-            my_day_date: Some(today()),
+            my_day_date: options.my_day_date,
             steps: Vec::new(),
         };
-        let task = self.task_create(&list_id, input).await?;
+        let task = self.task_create(&options.list_id, input).await?;
+        let account_id = summary.account_id.clone();
         let task_id = task.id.clone();
         let message_for_link = summary.id.clone();
         self.ctx
@@ -946,8 +1184,8 @@ impl TasksService {
                 tasks_repo::set_linked_message(conn, &task_id, Some(&message_for_link))
             })
             .await?;
-        // Flag the source message locally and through the mail op queue.
-        if !summary.flagged {
+        // Flag the source message only when the user asked for it.
+        if options.mark_flagged && !summary.flagged {
             let message_ids = vec![summary.id.clone()];
             let folder_id = summary.folder_id.clone();
             let db_id = summary.id.clone();
@@ -1004,23 +1242,6 @@ impl TasksService {
         Ok(())
     }
 
-    async fn default_list_for(&self, account_id: &str) -> Result<String> {
-        let account_id = account_id.to_string();
-        let list = self
-            .ctx
-            .db
-            .read(move |conn| {
-                if let Some(list) = task_lists::default_for_account(conn, &account_id)? {
-                    return Ok(Some(list));
-                }
-                // Fall back to the built-in local list.
-                task_lists::default_for_account(conn, nuncio_core::models::LOCAL_ACCOUNT_ID)
-            })
-            .await?;
-        list.map(|list| list.id)
-            .ok_or_else(|| AppError::not_found("no task list available"))
-    }
-
     async fn enqueue_op(&self, account_id: &str, op: &TaskOp, description: String) -> Result<()> {
         let payload = ops::to_value(op)?;
         let new_op = NewPendingOp::new(account_id, op.kind(), payload, description);
@@ -1061,6 +1282,7 @@ impl TasksService {
             name: String::new(),
             color: None,
             read_only: false,
+            well_known_list_name: nuncio_core::models::WELL_KNOWN_NONE.to_string(),
         }
     }
 
@@ -1091,45 +1313,135 @@ impl TasksService {
             etag: None,
         };
         let current: HashSet<String> = task.steps.iter().map(|step| step.id.clone()).collect();
+        // Errors are collected rather than propagated: one step failing must
+        // not stop the others. Creating first matters, because an update of an
+        // already-mapped step can fail on its own (a stale ETag, a step edited
+        // elsewhere) and used to abort the whole reconciliation, which is why
+        // a second step could never be added after a failed first update.
+        let mut failures: Vec<AppError> = Vec::new();
+
+        // Google Tasks takes the preceding sibling as a query parameter;
+        // without it a new subtask is inserted at the top of the list and the
+        // steps end up in reverse order.
+        let mut previous: Option<String> = None;
         for step in &task.steps {
-            match mappings.iter().find(|(step_id, _)| step_id == &step.id) {
-                Some((_, remote_step)) => {
-                    provider
-                        .update_step(account, list, &parent, remote_step, step)
-                        .await?;
-                }
-                None => {
-                    if let Some(result) = provider.create_step(account, list, &parent, step).await?
-                    {
-                        if let Some(remote_step) = result.remote_id {
-                            let step_id = step.id.clone();
-                            let task_id = task.id.clone();
-                            self.ctx
-                                .db
-                                .write(move |conn| {
+            if let Some((_, remote)) = mappings.iter().find(|(step_id, _)| step_id == &step.id) {
+                previous = Some(remote.clone());
+                continue;
+            }
+            match provider
+                .create_step(account, list, &parent, previous.as_deref(), step)
+                .await
+            {
+                Ok(Some(result)) => {
+                    if let Some(remote_step) = result.remote_id {
+                        previous = Some(remote_step.clone());
+                        let step_id = step.id.clone();
+                        let task_id = task.id.clone();
+                        if let Err(error) = self
+                            .ctx
+                            .db
+                            .write({
+                                let step_id = step_id.clone();
+                                move |conn| {
                                     store::set_step_mapping(conn, &step_id, &task_id, &remote_step)
-                                })
-                                .await?;
+                                }
+                            })
+                            .await
+                        {
+                            failures.push(error);
                         }
                     }
                 }
+                Ok(None) => previous = None,
+                Err(error) => {
+                    failures.push(error);
+                    // The chain is broken for the following siblings; let them
+                    // be inserted without an anchor instead of guessing.
+                    previous = None;
+                }
             }
         }
+
+        for step in &task.steps {
+            let Some((_, remote_step)) = mappings.iter().find(|(step_id, _)| step_id == &step.id)
+            else {
+                // Created above, or creation failed and was recorded already.
+                continue;
+            };
+            match provider
+                .update_step(account, list, &parent, remote_step, step)
+                .await
+            {
+                Ok(()) => {}
+                Err(error) if error.code() == "notFound" => {
+                    // The remote item was deleted elsewhere. Recreate it rather
+                    // than failing the operation forever on a row that is gone.
+                    match provider
+                        .create_step(account, list, &parent, None, step)
+                        .await
+                    {
+                        Ok(Some(result)) => {
+                            if let Some(remote_step) = result.remote_id {
+                                let step_id = step.id.clone();
+                                let task_id = task.id.clone();
+                                if let Err(error) = self
+                                    .ctx
+                                    .db
+                                    .write({
+                                        let step_id = step_id.clone();
+                                        move |conn| {
+                                            store::set_step_mapping(
+                                                conn,
+                                                &step_id,
+                                                &task_id,
+                                                &remote_step,
+                                            )
+                                        }
+                                    })
+                                    .await
+                                {
+                                    failures.push(error);
+                                }
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => failures.push(error),
+                    }
+                }
+                Err(error) => failures.push(error),
+            }
+        }
+
         for (step_id, remote_step) in mappings {
             if current.contains(&step_id) {
                 continue;
             }
-            provider
+            match provider
                 .delete_step(account, list, &parent, &remote_step)
-                .await?;
-            let step_id_clone = step_id.clone();
-            self.ctx
-                .db
-                .write(move |conn| store::delete_step_mapping(conn, &step_id_clone))
-                .await?;
+                .await
+            {
+                Ok(()) => {
+                    let step_id_clone = step_id.clone();
+                    if let Err(error) = self
+                        .ctx
+                        .db
+                        .write(move |conn| store::delete_step_mapping(conn, &step_id_clone))
+                        .await
+                    {
+                        failures.push(error);
+                    }
+                }
+                Err(error) => failures.push(error),
+            }
         }
-        Ok(())
+
+        match failures.into_iter().next() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
+
 }
 
 /* ─────────────────────────── executor ─────────────────────────── */
@@ -1437,8 +1749,16 @@ impl PimOpExecutor for TasksService {
                 };
                 let list = self.load_task_list(list_id).await?;
                 let remote = self.remote_list(&mapping);
+                // A built-in list's name belongs to the provider: a rename is
+                // always rejected, and the rollback would then undo the colour
+                // the user just picked. Colour itself is local-only.
+                let name = if list.is_builtin() {
+                    None
+                } else {
+                    Some(list.name.as_str())
+                };
                 provider
-                    .update_task_list(&account, &remote, Some(&list.name), Some(&list.color))
+                    .update_task_list(&account, &remote, name, Some(&list.color))
                     .await?;
             }
             TaskOp::ListDelete { snapshot } => {
@@ -1450,6 +1770,7 @@ impl PimOpExecutor for TasksService {
                         name: snapshot.list.name.clone(),
                         color: Some(snapshot.list.color.clone()),
                         read_only: snapshot.list.is_read_only,
+                        well_known_list_name: snapshot.list.well_known_list_name.clone(),
                     };
                     provider.delete_task_list(&account, &list).await?;
                 }
@@ -1545,8 +1866,9 @@ impl PimOpExecutor for TasksService {
                     .write(move |conn| {
                         conn.execute(
                             "INSERT OR IGNORE INTO task_list
-                                 (id, account_id, name, color, is_default, is_read_only, sort_order, created_at, updated_at)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+                                 (id, account_id, name, color, is_default, is_read_only,
+                                  well_known_list_name, sort_order, created_at, updated_at)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
                             rusqlite::params![
                                 snapshot.list.id,
                                 snapshot.list.account_id,
@@ -1554,6 +1876,7 @@ impl PimOpExecutor for TasksService {
                                 snapshot.list.color,
                                 snapshot.list.is_default as i64,
                                 snapshot.list.is_read_only as i64,
+                                snapshot.list.well_known_list_name,
                                 snapshot.list.sort_order,
                                 repo::now_string()
                             ],
@@ -1709,7 +2032,91 @@ fn create_remote_list(
             rusqlite::params![list.id],
         )?;
     }
-    Ok(list)
+    apply_well_known(conn, &list.id, &remote.well_known_list_name)?;
+    task_lists::get_required(conn, &list.id)
+}
+
+/// Persist a provider's built-in list marker and keep `is_default` aligned
+/// with it.
+///
+/// `task_lists::create` marks whichever list was inserted first as the
+/// account default, which is only correct by accident. Graph names the
+/// default explicitly (`wellknownListName = defaultList`), so that marker
+/// decides instead.
+fn apply_well_known(conn: &rusqlite::Connection, list_id: &str, well_known: &str) -> Result<()> {
+    let current = task_lists::get_required(conn, list_id)?;
+    if current.well_known_list_name != well_known {
+        conn.execute(
+            "UPDATE task_list SET well_known_list_name = ?2, updated_at = ?3 WHERE id = ?1",
+            rusqlite::params![list_id, well_known, repo::now_string()],
+        )?;
+    }
+    if well_known == nuncio_core::models::WELL_KNOWN_DEFAULT && !current.is_default {
+        task_lists::set_default(conn, list_id)?;
+    }
+    Ok(())
+}
+
+/// Content type for an attachment, guessed from its extension.
+///
+/// Graph stores whatever we send, and the client later opens the cached file
+/// through the OS, so the type only has to be good enough to be sensible.
+fn attachment_content_type(name: &str) -> &'static str {
+    let extension = name
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    match extension.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "heic" => "image/heic",
+        "pdf" => "application/pdf",
+        "txt" | "md" | "log" => "text/plain",
+        "csv" => "text/csv",
+        "json" => "application/json",
+        "zip" => "application/zip",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Local task ids whose edit has not reached the server yet.
+///
+/// A delta response describes the server, which does not know about an edit
+/// that is still queued. Replacing the local steps from that response would
+/// silently discard the user's change before the worker ever uploads it, which
+/// is how a freshly added step could disappear. Only steps are protected here:
+/// the other fields keep their pre-existing last-writer-wins behaviour.
+fn tasks_with_pending_writes(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+) -> Result<HashSet<String>> {
+    let mut ids = HashSet::new();
+    for op in repo::pending_ops::list(conn, Some(account_id))? {
+        if op.kind != ops::KIND_SAVE
+            || !matches!(
+                op.state,
+                PendingOpState::Pending | PendingOpState::InProgress
+            )
+        {
+            continue;
+        }
+        // Decode through `ops` instead of reading a JSON key by hand: the
+        // payload keeps snake_case struct fields (`task_id`) even though the
+        // variant tag is camelCase, so a hand-written `taskId` silently
+        // matched nothing and disabled this whole guard.
+        if let Ok(TaskOp::Save { task_id, .. }) = ops::decode(&op) {
+            ids.insert(task_id);
+        }
+    }
+    Ok(ids)
 }
 
 fn apply_delta(
@@ -1740,6 +2147,7 @@ fn apply_delta(
         }
     }
 
+    let pending_writes = tasks_with_pending_writes(conn, account_id)?;
     let mut seen_remote: HashSet<String> = HashSet::new();
     let mut seen_steps: HashSet<String> = HashSet::new();
     let mut incomplete_steps: HashSet<String> = HashSet::new();
@@ -1764,41 +2172,59 @@ fn apply_delta(
             .as_ref()
             .map(|task| task.id.clone())
             .unwrap_or_else(new_id);
+        let write_in_flight = pending_writes.contains(&id);
         let mut task = remote.task.clone();
         task.id = id.clone();
         task.list_id = list.id.clone();
         task.account_id = account_id.to_string();
         if let Some(existing) = &existing {
-            map::preserve_local_fields(&mut task, existing, caps);
-            task.created_at = existing.created_at;
-            if caps.steps && !remote.steps_complete {
-                task.steps = existing.steps.clone();
+            if write_in_flight {
+                // A queued save owns every user-editable field, not just the
+                // steps: applying this (older) server copy would undo the
+                // edit — a changed reminder, for instance — before the worker
+                // ever uploads it. Only the sync metadata is refreshed below.
+                task = existing.clone();
+                task.id = id.clone();
+                task.list_id = list.id.clone();
+                task.account_id = account_id.to_string();
+            } else {
+                map::preserve_local_fields(&mut task, existing, caps);
+                task.created_at = existing.created_at;
+                if caps.steps && !remote.steps_complete {
+                    task.steps = existing.steps.clone();
+                }
             }
         }
+        let existing_steps: Vec<TaskStep> = existing
+            .as_ref()
+            .map(|task| task.steps.clone())
+            .unwrap_or_default();
         let mut pending_step_mappings: Vec<(String, String)> = Vec::new();
-        if caps.steps && remote.steps_complete {
+        if write_in_flight {
+            task.steps = existing_steps.clone();
+        } else if caps.steps && remote.steps_complete {
             let has_mappings = !store::step_mappings_for_task(conn, &id)?.is_empty();
             if remote.task.steps.is_empty() && has_mappings {
                 // A delta response can omit unchanged subtasks.  Never drop
                 // local steps (and their mappings) in that case: doing so
                 // would make the next reconcile delete them remotely.
-                task.steps = existing
-                    .as_ref()
-                    .map(|task| task.steps.clone())
-                    .unwrap_or_default();
+                task.steps = existing_steps.clone();
             } else {
                 for step in &remote.task.steps {
                     if !step.id.trim().is_empty() {
                         seen_steps.insert(step.id.clone());
                     }
                 }
-                task.steps = map_steps(conn, &id, &task.steps, &mut pending_step_mappings)?;
+                task.steps = map_steps(
+                    conn,
+                    &id,
+                    &task.steps,
+                    &existing_steps,
+                    &mut pending_step_mappings,
+                )?;
             }
         } else if !caps.steps {
-            task.steps = existing
-                .as_ref()
-                .map(|task| task.steps.clone())
-                .unwrap_or_default();
+            task.steps = existing_steps;
         }
         let saved =
             tasks_repo::upsert_remote(conn, &task, remote.etag.as_deref(), Some(&remote_id))?;
@@ -1831,18 +2257,48 @@ fn apply_delta(
             Some(parent_id) => {
                 seen_remote.insert(remote_id.clone());
                 seen_steps.insert(remote_id.clone());
+                if pending_writes.contains(&parent_id) {
+                    // Google reports subtasks as their own rows, so they reach
+                    // this loop rather than the parent branch above. A queued
+                    // save still owns the local steps: applying the older
+                    // remote state here would undo the user's edit before it
+                    // is uploaded.
+                    continue;
+                }
                 let step_id =
                     store::step_local_id(conn, &parent_id, &remote_id)?.unwrap_or_else(new_id);
                 store::set_step_mapping(conn, &step_id, &parent_id, &remote_id)?;
                 let mut parent = tasks_repo::get_required(conn, &parent_id)?;
-                let step = TaskStep {
-                    id: step_id.clone(),
-                    title: remote.task.title.clone(),
-                    is_completed: remote.task.status == TaskStatus::Completed,
-                    sort_order: remote.task.sort_order,
-                };
-                parent.steps.retain(|existing| existing.id != step_id);
-                parent.steps.push(step);
+                // Keep the local position of a step we already know: the
+                // provider does not store a manual order, so its index here
+                // would otherwise overwrite the user's drag.
+                let title = remote.task.title.clone();
+                let is_completed = remote.task.status == TaskStatus::Completed;
+                match parent.steps.iter().position(|step| step.id == step_id) {
+                    Some(index) => {
+                        let sort_order = parent.steps[index].sort_order;
+                        parent.steps[index] = TaskStep {
+                            id: step_id.clone(),
+                            title,
+                            is_completed,
+                            sort_order,
+                        };
+                    }
+                    None => {
+                        let sort_order = parent
+                            .steps
+                            .iter()
+                            .map(|step| step.sort_order + 1)
+                            .max()
+                            .unwrap_or(0);
+                        parent.steps.push(TaskStep {
+                            id: step_id.clone(),
+                            title,
+                            is_completed,
+                            sort_order,
+                        });
+                    }
+                }
                 let meta = tasks_repo::sync_meta(conn, &parent_id)?;
                 tasks_repo::upsert_remote(
                     conn,
@@ -1910,7 +2366,10 @@ fn apply_delta(
                 },
             )?;
             for task in tasks {
-                if incomplete_steps.contains(&task.id) {
+                // Steps of a task whose write is still queued were kept above,
+                // so they are missing from `seen_steps`; pruning them here
+                // would delete the mappings the queued operation relies on.
+                if incomplete_steps.contains(&task.id) || pending_writes.contains(&task.id) {
                     continue;
                 }
                 let mappings = store::step_mappings_for_task(conn, &task.id)?;
@@ -1941,17 +2400,34 @@ fn map_steps(
     conn: &rusqlite::Connection,
     task_id: &str,
     steps: &[TaskStep],
+    existing: &[TaskStep],
     mappings: &mut Vec<(String, String)>,
 ) -> Result<Vec<TaskStep>> {
+    // Step order is a local property: none of the supported providers exposes
+    // a writable order for checklist items (Graph rejects `orderDateTime`
+    // outright), so re-applying the server's order on every sync would undo
+    // the user's drag. Existing steps keep their local order; only steps this
+    // client has never seen are appended in the order the server lists them.
+    let mut orders: HashMap<&str, i64> = existing
+        .iter()
+        .map(|step| (step.id.as_str(), step.sort_order))
+        .collect();
+    let mut next_order = existing
+        .iter()
+        .map(|step| step.sort_order + 1)
+        .max()
+        .unwrap_or(0);
     let mut out = Vec::with_capacity(steps.len());
-    for (index, step) in steps.iter().enumerate() {
+    for step in steps {
         let remote_id = step.id.trim();
         if remote_id.is_empty() {
+            let sort_order = next_order;
+            next_order += 1;
             out.push(TaskStep {
                 id: new_id(),
                 title: step.title.clone(),
                 is_completed: step.is_completed,
-                sort_order: step.sort_order,
+                sort_order,
             });
             continue;
         }
@@ -1959,15 +2435,19 @@ fn map_steps(
         // Mappings are written after the task row exists (FK); collecting them
         // here also covers brand-new tasks with embedded checklist items.
         mappings.push((local_id.clone(), remote_id.to_string()));
+        let sort_order = match orders.remove(local_id.as_str()) {
+            Some(order) => order,
+            None => {
+                let order = next_order;
+                next_order += 1;
+                order
+            }
+        };
         out.push(TaskStep {
             id: local_id,
             title: step.title.clone(),
             is_completed: step.is_completed,
-            sort_order: if step.sort_order == 0 {
-                index as i64
-            } else {
-                step.sort_order
-            },
+            sort_order,
         });
     }
     Ok(out)
@@ -2456,6 +2936,335 @@ mod tests {
             .await
             .expect("query");
         assert_eq!(tasks[0].steps.len(), 1);
+    }
+
+    /// A delta describes the server, which does not know about a write that is
+    /// still queued. Applying it used to replace the local steps and silently
+    /// discard a step the user had just added (the second "添加步骤" that
+    /// vanished).
+    #[tokio::test]
+    async fn delta_keeps_steps_while_a_save_is_queued() {
+        let (ctx, _service) = service().await;
+        let list = ctx
+            .db
+            .read(|conn| task_lists::get_required(conn, "local-tasks"))
+            .await
+            .expect("list");
+        let now = Utc::now();
+        let step = |id: &str, title: &str| TaskStep {
+            id: id.into(),
+            title: title.into(),
+            is_completed: false,
+            sort_order: 0,
+        };
+        let task = Task {
+            id: "local-task".into(),
+            list_id: list.id.clone(),
+            account_id: list.account_id.clone(),
+            title: "测试todo".into(),
+            notes: String::new(),
+            status: TaskStatus::NotStarted,
+            importance: Importance::Normal,
+            due_date: None,
+            reminder_at: None,
+            recurrence: None,
+            my_day_date: None,
+            completed_at: None,
+            created_at: now,
+            updated_at: now,
+            steps: vec![step("s1", "11"), step("s2", "22")],
+            sort_order: 0,
+            linked_message_id: None,
+        };
+        ctx.db
+            .write({
+                let task = task.clone();
+                move |conn| tasks_repo::upsert_remote(conn, &task, None, Some("r1"))
+            })
+            .await
+            .expect("task");
+        ctx.db
+            .write(|conn| {
+                // Serialize through `ops` so the test uses the same payload
+                // shape the real command path writes (`task_id`, not
+                // `taskId`).
+                let payload = ops::to_value(&TaskOp::Save {
+                    task_id: "local-task".into(),
+                    snapshot: None,
+                })
+                .expect("payload");
+                repo::pending_ops::enqueue(
+                    conn,
+                    nuncio_core::models::NewPendingOp::new(
+                        "local",
+                        ops::KIND_SAVE,
+                        payload,
+                        "更新任务",
+                    ),
+                )
+            })
+            .await
+            .expect("queue");
+
+        let mut remote = task.clone();
+        remote.id = String::new();
+        remote.steps = vec![step("remote-1", "11")];
+        let delta = TaskDelta {
+            tasks: vec![RemoteTask {
+                task: remote,
+                remote_id: Some("r1".into()),
+                href: None,
+                etag: None,
+                parent_remote_id: None,
+                steps_complete: true,
+            }],
+            full_sync: false,
+            ..Default::default()
+        };
+        ctx.db
+            .write(move |conn| apply_delta(conn, "local", &list, TaskCapabilities::all(), &delta))
+            .await
+            .expect("delta");
+
+        let stored = ctx
+            .db
+            .read(|conn| tasks_repo::get_required(conn, "local-task"))
+            .await
+            .expect("stored");
+        assert_eq!(
+            stored.steps.len(),
+            2,
+            "a step with a queued write must survive the delta"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_list_marker_sets_the_account_default() {
+        let (ctx, _service) = service().await;
+        let other_id = ctx
+            .db
+            .write(|conn| {
+                // `create` marks the first list of an account as default; this
+                // one is second, so the marker alone has to move the flag.
+                let other = task_lists::create(conn, "local", "Other", "#123456")?;
+                apply_well_known(conn, &other.id, nuncio_core::models::WELL_KNOWN_DEFAULT)?;
+                Ok(other.id)
+            })
+            .await
+            .expect("other list");
+        let (default_id, defaults) = ctx
+            .db
+            .read(|conn| {
+                let default = task_lists::default_for_account(conn, "local")?;
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM task_list WHERE account_id = 'local' AND is_default = 1",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok((default.map(|list| list.id), count))
+            })
+            .await
+            .expect("default");
+        assert_eq!(default_id.as_deref(), Some(other_id.as_str()));
+        assert_eq!(defaults, 1, "only one list may be the default");
+    }
+
+    /// Providers expose no writable step order, so the server's order must not
+    /// overwrite the order the user dragged into place.
+    #[tokio::test]
+    async fn delta_keeps_local_step_order() {
+        let (ctx, _service) = service().await;
+        let list = ctx
+            .db
+            .read(|conn| task_lists::get_required(conn, "local-tasks"))
+            .await
+            .expect("list");
+        let now = Utc::now();
+        let step = |id: &str, title: &str, order: i64| TaskStep {
+            id: id.into(),
+            title: title.into(),
+            is_completed: false,
+            sort_order: order,
+        };
+        let task = Task {
+            id: "local-task".into(),
+            list_id: list.id.clone(),
+            account_id: list.account_id.clone(),
+            title: "测试todo".into(),
+            notes: String::new(),
+            status: TaskStatus::NotStarted,
+            importance: Importance::Normal,
+            due_date: None,
+            reminder_at: None,
+            recurrence: None,
+            my_day_date: None,
+            completed_at: None,
+            created_at: now,
+            updated_at: now,
+            steps: vec![step("s1", "11", 0), step("s2", "22", 1)],
+            sort_order: 0,
+            linked_message_id: None,
+        };
+        ctx.db
+            .write({
+                let task = task.clone();
+                move |conn| {
+                    tasks_repo::upsert_remote(conn, &task, None, Some("r1"))?;
+                    crate::store::set_step_mapping(conn, "s1", "local-task", "remote-1")?;
+                    crate::store::set_step_mapping(conn, "s2", "local-task", "remote-2")?;
+                    Ok(())
+                }
+            })
+            .await
+            .expect("task");
+
+        let mut remote = task.clone();
+        remote.id = String::new();
+        remote.steps = vec![step("remote-2", "22", 0), step("remote-1", "11", 1)];
+        let delta = TaskDelta {
+            tasks: vec![RemoteTask {
+                task: remote,
+                remote_id: Some("r1".into()),
+                href: None,
+                etag: None,
+                parent_remote_id: None,
+                steps_complete: true,
+            }],
+            full_sync: false,
+            ..Default::default()
+        };
+        ctx.db
+            .write(move |conn| apply_delta(conn, "local", &list, TaskCapabilities::all(), &delta))
+            .await
+            .expect("delta");
+
+        let stored = ctx
+            .db
+            .read(|conn| tasks_repo::get_required(conn, "local-task"))
+            .await
+            .expect("stored");
+        let mut ordered = stored.steps.clone();
+        ordered.sort_by_key(|step| step.sort_order);
+        let titles: Vec<String> = ordered.iter().map(|step| step.title.clone()).collect();
+        assert_eq!(titles, vec!["11", "22"], "local step order must survive");
+    }
+
+    /// A delta arriving before the queued save uploads must not undo the edit.
+    /// Reminders were the visible casualty: the reminder reverted and then the
+    /// worker uploaded the reverted value.
+    #[tokio::test]
+    async fn delta_keeps_local_fields_while_a_save_is_queued() {
+        let (ctx, _service) = service().await;
+        let list = ctx
+            .db
+            .read(|conn| task_lists::get_required(conn, "local-tasks"))
+            .await
+            .expect("list");
+        let now = Utc::now();
+        let reminder: chrono::DateTime<Utc> = "2026-11-20T09:15:00Z".parse().expect("date");
+        let stale: chrono::DateTime<Utc> = "2026-11-19T21:15:00Z".parse().expect("date");
+        let task = Task {
+            id: "local-task".into(),
+            list_id: list.id.clone(),
+            account_id: list.account_id.clone(),
+            title: "测试todo".into(),
+            notes: String::new(),
+            status: TaskStatus::NotStarted,
+            importance: Importance::Normal,
+            due_date: None,
+            reminder_at: Some(reminder),
+            recurrence: None,
+            my_day_date: None,
+            completed_at: None,
+            created_at: now,
+            updated_at: now,
+            steps: Vec::new(),
+            sort_order: 0,
+            linked_message_id: None,
+        };
+        ctx.db
+            .write({
+                let task = task.clone();
+                move |conn| {
+                    tasks_repo::upsert_remote(conn, &task, None, Some("r1"))?;
+                    let payload = ops::to_value(&TaskOp::Save {
+                        task_id: "local-task".into(),
+                        snapshot: None,
+                    })
+                    .expect("payload");
+                    repo::pending_ops::enqueue(
+                        conn,
+                        nuncio_core::models::NewPendingOp::new(
+                            "local",
+                            ops::KIND_SAVE,
+                            payload,
+                            "更新任务",
+                        ),
+                    )?;
+                    Ok(())
+                }
+            })
+            .await
+            .expect("task");
+
+        let mut remote = task.clone();
+        remote.id = String::new();
+        remote.reminder_at = Some(stale);
+        let delta = TaskDelta {
+            tasks: vec![RemoteTask {
+                task: remote,
+                remote_id: Some("r1".into()),
+                href: None,
+                etag: None,
+                parent_remote_id: None,
+                steps_complete: true,
+            }],
+            full_sync: false,
+            ..Default::default()
+        };
+        ctx.db
+            .write(move |conn| apply_delta(conn, "local", &list, TaskCapabilities::all(), &delta))
+            .await
+            .expect("delta");
+
+        let stored = ctx
+            .db
+            .read(|conn| tasks_repo::get_required(conn, "local-task"))
+            .await
+            .expect("stored");
+        assert_eq!(
+            stored.reminder_at,
+            Some(reminder),
+            "a queued save must not be undone by an older delta"
+        );
+    }
+
+    /// Microsoft To Do's built-in lists cannot be renamed or deleted. Rejecting
+    /// it before the local write is what prevents the "success toast, then
+    /// rollback toast" pair.
+    #[tokio::test]
+    async fn built_in_lists_cannot_be_renamed_or_deleted() {
+        let (ctx, service) = service().await;
+        ctx.db
+            .write(|conn| {
+                conn.execute(
+                    "UPDATE task_list SET well_known_list_name = 'flaggedEmails' WHERE id = 'local-tasks'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("mark");
+        assert!(service.tasklist_delete("local-tasks").await.is_err());
+        assert!(service
+            .tasklist_update("local-tasks", Some("Renamed"), None)
+            .await
+            .is_err());
+        // A colour is local-only and stays editable.
+        assert!(service
+            .tasklist_update("local-tasks", None, Some("#ff0000"))
+            .await
+            .is_ok());
     }
 
     #[tokio::test]

@@ -108,7 +108,13 @@ pub fn query(conn: &Connection, query: &TaskQuery) -> Result<Vec<Task>> {
         }
         Some(SmartList::Important) => clauses.push("importance = 'high'".into()),
         Some(SmartList::Planned) => clauses.push("due_date IS NOT NULL".into()),
-        Some(SmartList::FlaggedEmail) => clauses.push("linked_message_id IS NOT NULL".into()),
+        // A soft-deleted mail no longer counts: its row stays until the link
+        // is pruned, but the task should leave the smart list immediately.
+        Some(SmartList::FlaggedEmail) => clauses.push(
+            "linked_message_id IS NOT NULL AND linked_message_id IN \
+             (SELECT id FROM message WHERE is_deleted_local = 0)"
+                .into(),
+        ),
         Some(SmartList::Completed) => clauses.push("status = 'completed'".into()),
         Some(SmartList::All) | None => {}
     }
@@ -162,7 +168,9 @@ pub fn smart_counts(conn: &Connection, today: &str) -> Result<SmartListCounts> {
              COALESCE(SUM(CASE WHEN due_date IS NOT NULL AND status <> 'completed' THEN 1 ELSE 0 END), 0),
              COALESCE(SUM(CASE WHEN status <> 'completed' THEN 1 ELSE 0 END), 0),
              COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0),
-             COALESCE(SUM(CASE WHEN linked_message_id IS NOT NULL AND status <> 'completed' THEN 1 ELSE 0 END), 0)
+             COALESCE(SUM(CASE WHEN linked_message_id IS NOT NULL AND status <> 'completed'
+                               AND linked_message_id IN (SELECT id FROM message WHERE is_deleted_local = 0)
+                          THEN 1 ELSE 0 END), 0)
          FROM task",
         params![today],
         |row| {

@@ -96,6 +96,7 @@ import {
   useMessageActions,
 } from "./actions";
 import { onMailCommand } from "./commands";
+import { openTaskFromMessage } from "./taskDialog";
 import { useMailCompose } from "./composeIntegration";
 import { setMessageDragData } from "./dnd";
 import {
@@ -773,17 +774,9 @@ export function MessageList() {
     [tt],
   );
 
-  const createTask = useCallback(
-    async (id: string) => {
-      try {
-        await messagesApi.createTask(id);
-        toast.success(tt("mail.toast.taskCreated"));
-      } catch (error) {
-        toast.error(tt("mail.toast.taskFailed"), errorText(error));
-      }
-    },
-    [tt],
-  );
+  const createTask = useCallback((summary: MessageSummary) => {
+    openTaskFromMessage(summary);
+  }, []);
 
   const saveAsEml = useCallback(
     async (summary: MessageSummary) => {
@@ -1132,7 +1125,7 @@ export function MessageList() {
         id: "create-task",
         label: tt("mail.action.createTask"),
         icon: <TaskListSquareLtr16Regular />,
-        onSelect: () => void createTask(summary.id),
+        onSelect: () => createTask(summary),
       },
       {
         id: "open-window",

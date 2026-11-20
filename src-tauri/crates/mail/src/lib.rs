@@ -37,7 +37,7 @@ pub mod smtp;
 pub mod sync;
 pub mod util;
 
-pub use engine::{Engine, EngineConfig};
+pub use engine::{poll_interval, set_poll_override_secs, Engine, EngineConfig};
 pub use rules::{evaluate as evaluate_rule, matching_rules};
 pub use service::MailService;
 pub use sync::folders::role_for as folder_role_for;

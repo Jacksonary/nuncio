@@ -10,15 +10,21 @@ import {
   useMemo,
   useRef,
   useState,
-  type DragEvent,
   type KeyboardEvent,
   type MouseEvent,
+  type PointerEvent as ReactPointerEvent,
   type ReactNode,
 } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
+  open as openFileDialog,
+  save as saveFileDialog,
+} from "@tauri-apps/plugin-dialog";
+import {
   Add16Regular,
+  ArrowDownload20Regular,
   ArrowRepeatAll20Regular,
+  Attach16Regular,
   CalendarLtr20Regular,
   Checkmark16Regular,
   ChevronRight16Regular,
@@ -32,7 +38,16 @@ import {
   TaskListLtr24Regular,
   WeatherSunny20Regular,
 } from "@fluentui/react-icons";
-import type { Account, IsoDate, RecurrenceRule, Task, TaskInput, TaskList, TaskStep } from "@/ipc/types";
+import type {
+  Account,
+  IsoDate,
+  RecurrenceRule,
+  Task,
+  TaskAttachment,
+  TaskInput,
+  TaskList,
+  TaskStep,
+} from "@/ipc/types";
 import {
   Badge,
   Button,
@@ -43,12 +58,13 @@ import {
   Spinner,
   TextArea,
   TimePicker,
+  toast,
   type MenuEntry,
 } from "@/components";
 import { app, tasks as tasksApi } from "@/ipc/api";
 import { queryKeys } from "@/lib/queryKeys";
 import { useLanguage, useT } from "@/lib/i18n";
-import { formatDateTime } from "@/lib/format";
+import { formatDateTime, formatFileSize } from "@/lib/format";
 import {
   RECURRENCE_PRESETS,
   addDaysIso,
@@ -82,10 +98,9 @@ import {
   setTaskMyDay,
 } from "./actions";
 import { DueDateDialog, RecurrenceDialog } from "./Dialogs";
+import { AttachmentViewer } from "./AttachmentViewer";
 import { useTodoUiStore } from "./uiStore";
 import styles from "./TaskDetail.module.css";
-
-const STEP_DRAG_TYPE = "application/x-nuncio-step";
 
 export interface TaskDetailProps {
   taskId: string | null;
@@ -148,6 +163,15 @@ export function TaskDetail({ taskId, seedTask, lists, accounts, today, onDeleted
   const [title, setTitle] = useState(task?.title ?? "");
   const [notes, setNotes] = useState(task?.notes ?? "");
   const [steps, setSteps] = useState<TaskStep[]>(task?.steps ?? []);
+  const [attachments, setAttachments] = useState<TaskAttachment[]>([]);
+  const [attachmentsTaskId, setAttachmentsTaskId] = useState<string | null>(null);
+  const [attachBusy, setAttachBusy] = useState(false);
+  // Inline previews: images, audio and video render in place, so their bytes
+  // are fetched once the attachment list is known.
+  const [attachmentUrls, setAttachmentUrls] = useState<Record<string, string>>({});
+  const [viewer, setViewer] = useState<{ url: string; name: string } | null>(null);
+  const requestedUrls = useRef(new Set<string>());
+  const objectUrls = useRef<string[]>([]);
   const [newStep, setNewStep] = useState("");
   const [reminderOpen, setReminderOpen] = useState(false);
   const [reminderDate, setReminderDate] = useState<IsoDate | null>(null);
@@ -243,6 +267,82 @@ export function TaskDetail({ taskId, seedTask, lists, accounts, today, onDeleted
   const account = task ? accounts.find((item) => item.id === task.accountId) ?? null : null;
   const support = listFeatureSupport(list, account);
   const readOnly = list?.isReadOnly ?? false;
+  // Task attachments exist only in Microsoft To Do's public API.
+  const supportsAttachments = account?.provider === "outlook";
+
+  useEffect(() => {
+    setAttachments([]);
+    setAttachmentsTaskId(null);
+    setViewer(null);
+    setAttachmentUrls({});
+    requestedUrls.current.clear();
+    for (const url of objectUrls.current) URL.revokeObjectURL(url);
+    objectUrls.current = [];
+    if (!task || !supportsAttachments) return;
+    let cancelled = false;
+    void tasksApi
+      .attachments(task.id)
+      .then((items) => {
+        if (!cancelled) {
+          setAttachments(items);
+          setAttachmentsTaskId(task.id);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setAttachments([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [task?.id, supportsAttachments]);
+
+  useEffect(() => {
+    // The task can change before the new attachment list arrives; without this
+    // guard the effect would request previews for the old list against the new
+    // task id.
+    if (!task || attachmentsTaskId !== task.id) return;
+    const targets = attachments.filter((attachment) => {
+      const kind = previewKind(attachment.contentType);
+      return kind !== null && !requestedUrls.current.has(attachment.id);
+    });
+    if (targets.length === 0) return;
+    for (const target of targets) requestedUrls.current.add(target.id);
+    let cancelled = false;
+    void Promise.all(
+      targets.map(async (attachment) => {
+        try {
+          const dataUrl = await tasksApi.attachmentData(task.id, attachment.id);
+          if (cancelled) return;
+          // Media elements seek poorly from `data:` URLs in WebKit; an object
+          // URL backed by a Blob behaves like a normal file.
+          const objectUrl = URL.createObjectURL(dataUrlToBlob(dataUrl));
+          if (cancelled) {
+            URL.revokeObjectURL(objectUrl);
+            return;
+          }
+          objectUrls.current.push(objectUrl);
+          setAttachmentUrls((current) =>
+            current[attachment.id] ? current : { ...current, [attachment.id]: objectUrl },
+          );
+        } catch {
+          // A preview that cannot load must not break the row; downloading and
+          // removing the attachment still work.
+          requestedUrls.current.delete(attachment.id);
+        }
+      }),
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [task?.id, attachmentsTaskId, attachments]);
+
+  useEffect(() => {
+    return () => {
+      for (const url of objectUrls.current) URL.revokeObjectURL(url);
+      objectUrls.current = [];
+    };
+  }, []);
+
 
   const buildInput = (current: Task, patch: Partial<TaskInput>): TaskInput => {
     const trimmed = title.trim() || current.title;
@@ -305,6 +405,58 @@ export function TaskDetail({ taskId, seedTask, lists, accounts, today, onDeleted
     saveField({ steps: renumbered });
   };
 
+  const addAttachment = async () => {
+    if (!task) return;
+    const selection = await openFileDialog({ multiple: false, directory: false });
+    if (typeof selection !== "string") return;
+    setAttachBusy(true);
+    try {
+      setAttachments(await tasksApi.addAttachment(task.id, selection));
+      toast.success(t("todo.detail.attachmentAdded"));
+    } catch (error) {
+      toast.error(t("todo.detail.attachmentFailed"), errorMessage(error));
+    } finally {
+      setAttachBusy(false);
+    }
+  };
+
+  const downloadAttachment = async (attachment: TaskAttachment) => {
+    if (!task) return;
+    const path = await saveFileDialog({ defaultPath: attachment.name });
+    if (typeof path !== "string") return;
+    try {
+      await tasksApi.saveAttachment(task.id, attachment.id, path);
+      toast.success(t("todo.detail.attachmentSaved"));
+    } catch (error) {
+      toast.error(t("todo.detail.attachmentFailed"), errorMessage(error));
+    }
+  };
+
+  const removeAttachment = async (attachment: TaskAttachment) => {
+    if (!task) return;
+    setAttachBusy(true);
+    try {
+      await tasksApi.removeAttachment(task.id, attachment.id);
+      const url = attachmentUrls[attachment.id];
+      if (url) {
+        URL.revokeObjectURL(url);
+        objectUrls.current = objectUrls.current.filter((item) => item !== url);
+        setAttachmentUrls((current) => {
+          const next = { ...current };
+          delete next[attachment.id];
+          return next;
+        });
+        requestedUrls.current.delete(attachment.id);
+      }
+      setAttachments((current) => current.filter((item) => item.id !== attachment.id));
+      toast.success(t("todo.detail.attachmentRemoved"));
+    } catch (error) {
+      toast.error(t("todo.detail.attachmentFailed"), errorMessage(error));
+    } finally {
+      setAttachBusy(false);
+    }
+  };
+
   const toggleStep = (step: TaskStep) => {
     commitSteps(
       orderedSteps.map((item) =>
@@ -342,33 +494,42 @@ export function TaskDetail({ taskId, seedTask, lists, accounts, today, onDeleted
     commitSteps(next);
   };
 
-  const handleStepDragStart = (event: DragEvent<HTMLElement>, step: TaskStep) => {
-    event.dataTransfer.setData(STEP_DRAG_TYPE, step.id);
-    event.dataTransfer.effectAllowed = "move";
+  // HTML5 drag-and-drop never starts reliably from the small handle inside a
+  // WKWebView (the icon swallows the gesture), so steps are reordered with
+  // pointer events: the handle captures the pointer and whichever row sits
+  // under the cursor becomes the drop target.
+  const beginStepDrag = (event: ReactPointerEvent<HTMLElement>, step: TaskStep) => {
+    if (event.button !== 0 || readOnly) return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
     setStepDragId(step.id);
+    setStepDrop(null);
   };
 
-  const handleStepDragOver = (event: DragEvent<HTMLDivElement>, step: TaskStep) => {
-    if (!stepDragId || stepDragId === step.id) return;
-    event.preventDefault();
-    event.stopPropagation();
-    const rect = event.currentTarget.getBoundingClientRect();
+  const moveStepDrag = (event: ReactPointerEvent<HTMLElement>) => {
+    if (!stepDragId) return;
+    const row = document
+      .elementFromPoint(event.clientX, event.clientY)
+      ?.closest<HTMLElement>("[data-step-id]");
+    const id = row?.dataset.stepId;
+    if (!id) return;
+    if (id === stepDragId) {
+      setStepDrop(null);
+      return;
+    }
+    const rect = row.getBoundingClientRect();
     const position = event.clientY < rect.top + rect.height / 2 ? "before" : "after";
-    setStepDrop({ id: step.id, position });
+    setStepDrop({ id, position });
   };
 
-  const handleStepDrop = (event: DragEvent<HTMLDivElement>, step: TaskStep) => {
-    event.preventDefault();
-    event.stopPropagation();
-    const movedId = event.dataTransfer.getData(STEP_DRAG_TYPE) || stepDragId;
-    const position = stepDrop?.id === step.id ? stepDrop.position : "before";
+  const endStepDrag = () => {
+    if (stepDragId && stepDrop && stepDrop.id !== stepDragId) {
+      const ids = orderedSteps.map((item) => item.id);
+      const insert = reorderIndexFor(ids, stepDragId, stepDrop.id, stepDrop.position);
+      if (insert >= 0) moveStepTo(stepDragId, insert);
+    }
     setStepDragId(null);
     setStepDrop(null);
-    if (!movedId || movedId === step.id) return;
-    const ids = orderedSteps.map((item) => item.id);
-    const insert = reorderIndexFor(ids, movedId, step.id, position);
-    if (insert < 0) return;
-    moveStepTo(movedId, insert);
   };
 
   const handleStepKeyDown = (event: KeyboardEvent<HTMLElement>, step: TaskStep) => {
@@ -627,15 +788,20 @@ export function TaskDetail({ taskId, seedTask, lists, accounts, today, onDeleted
               </span>
             ) : null}
             {!support.steps ? <span className={styles.localHint}>{t("todo.detail.localOnly")}</span> : null}
+            {support.steps && account &&
+            (account.provider === "gmail" || account.provider === "outlook") ? (
+              <span className={styles.localHint} title={t("todo.detail.localOrderHint")}>
+                {t("todo.detail.localOrder")}
+              </span>
+            ) : null}
           </div>
           <div className={styles.stepList}>
             {orderedSteps.map((step) => (
               <div
                 key={step.id}
                 className={styles.stepRow}
+                data-step-id={step.id}
                 data-drop={stepDrop?.id === step.id ? stepDrop.position : undefined}
-                onDragOver={(event) => handleStepDragOver(event, step)}
-                onDrop={(event) => handleStepDrop(event, step)}
               >
                 <button
                   type="button"
@@ -679,12 +845,10 @@ export function TaskDetail({ taskId, seedTask, lists, accounts, today, onDeleted
                     role="button"
                     tabIndex={0}
                     aria-label={t("todo.detail.stepMove")}
-                    draggable
-                    onDragStart={(event) => handleStepDragStart(event, step)}
-                    onDragEnd={() => {
-                      setStepDragId(null);
-                      setStepDrop(null);
-                    }}
+                    onPointerDown={(event) => beginStepDrag(event, step)}
+                    onPointerMove={moveStepDrag}
+                    onPointerUp={endStepDrag}
+                    onPointerCancel={endStepDrag}
                     onKeyDown={(event) => handleStepKeyDown(event, step)}
                   >
                     <Reorder20Regular aria-hidden="true" />
@@ -833,6 +997,76 @@ export function TaskDetail({ taskId, seedTask, lists, accounts, today, onDeleted
           />
         </section>
 
+        {supportsAttachments ? (
+          <section className={styles.section} aria-label={t("todo.detail.attachments")}>
+            <div className={styles.sectionHeader}>
+              <span className={styles.sectionTitle}>{t("todo.detail.attachments")}</span>
+              {attachments.length > 0 ? (
+                <span className={styles.sectionMeta}>{attachments.length}</span>
+              ) : null}
+            </div>
+            {attachments.map((attachment) => {
+              const kind = previewKind(attachment.contentType);
+              const url = attachmentUrls[attachment.id];
+              return (
+                <div key={attachment.id} className={styles.attachmentBlock}>
+                  <div className={styles.attachmentRow}>
+                    <Attach16Regular className={styles.attachmentIcon} aria-hidden="true" />
+                    <span className={styles.attachmentName} title={attachment.name}>
+                      {attachment.name}
+                    </span>
+                    <span className={styles.attachmentSize}>
+                      {formatFileSize(attachment.size)}
+                    </span>
+                    <IconButton
+                      size="small"
+                      icon={<ArrowDownload20Regular />}
+                      label={t("todo.detail.attachmentDownload")}
+                      disabled={attachBusy}
+                      onClick={() => void downloadAttachment(attachment)}
+                    />
+                    <IconButton
+                      size="small"
+                      icon={<Dismiss16Regular />}
+                      label={t("todo.detail.attachmentRemove")}
+                      disabled={attachBusy || readOnly}
+                      onClick={() => void removeAttachment(attachment)}
+                    />
+                  </div>
+                  {kind === "image" && url ? (
+                    <button
+                      type="button"
+                      className={styles.attachmentThumb}
+                      aria-label={t("todo.detail.attachmentView")}
+                      title={t("todo.detail.attachmentView")}
+                      onClick={() => setViewer({ url, name: attachment.name })}
+                    >
+                      <img src={url} alt={attachment.name} />
+                    </button>
+                  ) : kind === "audio" && url ? (
+                    <audio className={styles.attachmentAudio} controls src={url} />
+                  ) : kind === "video" && url ? (
+                    <video className={styles.attachmentVideo} controls src={url} />
+                  ) : null}
+                </div>
+              );
+            })}
+            <div>
+              <Button
+                size="small"
+                appearance="subtle"
+                icon={<Add16Regular />}
+                disabled={attachBusy || readOnly}
+                onClick={() => void addAttachment()}
+              >
+                {attachBusy
+                  ? t("todo.detail.attachmentBusy")
+                  : t("todo.detail.addAttachment")}
+              </Button>
+            </div>
+          </section>
+        ) : null}
+
         <div className={styles.infoBlock}>
           <span>{t("todo.detail.created", { date: formatDateTime(task.createdAt) })}</span>
           {task.completedAt ? (
@@ -889,8 +1123,38 @@ export function TaskDetail({ taskId, seedTask, lists, accounts, today, onDeleted
         initial={recurrenceInitial}
         onSave={(rule) => applyRecurrence(rule)}
       />
+      {viewer ? (
+        <AttachmentViewer
+          url={viewer.url}
+          name={viewer.name}
+          onClose={() => setViewer(null)}
+        />
+      ) : null}
     </div>
   );
+}
+
+/** Decode a `data:` URL into a Blob without `fetch` (CSP blocks `data:` in
+ *  `connect-src`, and media needs a Blob URL to seek). */
+function dataUrlToBlob(dataUrl: string): Blob {
+  const comma = dataUrl.indexOf(",");
+  const header = comma >= 0 ? dataUrl.slice(0, comma) : "";
+  const base64 = comma >= 0 ? dataUrl.slice(comma + 1) : "";
+  const mime = /data:([^;]+)/.exec(header)?.[1] ?? "application/octet-stream";
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return new Blob([bytes], { type: mime });
+}
+
+/** Which inline player, if any, an attachment's content type deserves. */
+function previewKind(contentType: string): "image" | "audio" | "video" | null {
+  if (contentType.startsWith("image/")) return "image";
+  if (contentType.startsWith("audio/")) return "audio";
+  if (contentType.startsWith("video/")) return "video";
+  return null;
 }
 
 function presetLabelKey(preset: RecurrencePreset): string {

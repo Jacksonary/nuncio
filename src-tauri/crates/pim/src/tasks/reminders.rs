@@ -16,8 +16,13 @@ use nuncio_core::CoreContext;
 use crate::error::Result;
 use crate::reminders::{ReminderHit, ReminderKind, ReminderSource};
 
-/// How late a reminder may fire after its trigger (mirrors the calendar source).
-const GRACE: Duration = Duration::minutes(15);
+/// How late a task reminder may fire after its trigger.
+///
+/// Unlike a meeting, a task reminder is routinely missed because the app was
+/// closed or the machine was asleep, so it is delivered the next time the app
+/// runs instead of being dropped after a few minutes. Half a day keeps that
+/// useful without replaying a stale backlog.
+const GRACE: Duration = Duration::hours(12);
 
 /// Upper bound on snooze rows examined per pass.
 const SNOOZE_LIMIT: usize = 500;
@@ -176,6 +181,45 @@ mod tests {
         assert!(!hits[0].all_day);
     }
 
+    /// A reminder missed while the app was closed still fires on the next
+    /// launch, but a stale one from days ago does not.
+    #[tokio::test]
+    async fn catches_up_a_missed_reminder() {
+        let ctx = ctx().await;
+        let now = Utc.with_ymd_and_hms(2026, 11, 12, 17, 0, 0).unwrap();
+        ctx.db
+            .write(move |conn| {
+                tasks_repo::create(
+                    conn,
+                    "local-tasks",
+                    &TaskInput {
+                        title: "Missed".into(),
+                        reminder_at: Some(now - Duration::hours(7)),
+                        ..TaskInput::default()
+                    },
+                )?;
+                let stale = tasks_repo::create(
+                    conn,
+                    "local-tasks",
+                    &TaskInput {
+                        title: "Stale".into(),
+                        reminder_at: Some(now - Duration::hours(20)),
+                        ..TaskInput::default()
+                    },
+                )?;
+                assert_eq!(stale.title, "Stale");
+                Ok(())
+            })
+            .await
+            .expect("tasks");
+        let hits = TaskReminderSource
+            .due(&ctx, now, now + Duration::hours(48))
+            .await
+            .expect("hits");
+        assert_eq!(hits.len(), 1, "only the recent miss is delivered");
+        assert_eq!(hits[0].title, "Missed");
+    }
+
     #[tokio::test]
     async fn skips_future_and_fired() {
         let ctx = ctx().await;
@@ -280,7 +324,7 @@ mod tests {
         assert!(hits.is_empty());
 
         // After the snooze deadline it fires again even though the original
-        // reminder time is outside the 15 minute catch-up window.
+        // reminder time is already in the past.
         let later = now + Duration::minutes(30);
         let hits = TaskReminderSource
             .due(&ctx, later, later + Duration::hours(48))

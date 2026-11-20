@@ -102,6 +102,12 @@
   font-size: var(--font-body);
 }
 
+/* The field wrapper draws the ring; a plain `outline: none` loses to the
+   later `:focus-visible` rule in global.css. */
+.input:focus-visible {
+  outline: none;
+}
+
 .input::placeholder {
   color: var(--text-tertiary);
 }

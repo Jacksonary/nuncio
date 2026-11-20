@@ -515,6 +515,7 @@ mod tests {
             color: "#654321".into(),
             is_default: true,
             is_read_only: false,
+            well_known_list_name: "none".into(),
             incomplete_count: 3,
             sort_order: 2,
         });

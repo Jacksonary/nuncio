@@ -140,7 +140,8 @@ export const messages = {
   trustSender: (value: string) => call<void>("message_trust_sender", { value }),
   unsubscribe: (id: T.Id) => call<void>("message_unsubscribe", { id }),
   /** Create a To Do task linked to this message (flagged e-mail). */
-  createTask: (id: T.Id) => call<T.Task>("message_create_task", { id }),
+  createTask: (id: T.Id, input: T.NewTaskFromMessage) =>
+    call<T.Task>("message_create_task", { id, input }),
 };
 
 export const attachments = {
@@ -270,6 +271,16 @@ export const tasks = {
   search: (text: string) => call<T.Task[]>("task_search", { text }),
   dismissReminder: (id: T.Id) => call<void>("task_dismiss_reminder", { id }),
   snoozeReminder: (id: T.Id, minutes: number) => call<void>("task_snooze_reminder", { id, minutes }),
+  attachments: (taskId: T.Id) => call<T.TaskAttachment[]>("task_attachments", { taskId }),
+  addAttachment: (taskId: T.Id, path: string) =>
+    call<T.TaskAttachment[]>("task_attachment_add", { taskId, path }),
+  removeAttachment: (taskId: T.Id, attachmentId: T.Id) =>
+    call<void>("task_attachment_remove", { taskId, attachmentId }),
+  /** Inline `data:` URL for previewing an image, audio or video attachment. */
+  attachmentData: (taskId: T.Id, attachmentId: T.Id) =>
+    call<string>("task_attachment_data", { taskId, attachmentId }),
+  saveAttachment: (taskId: T.Id, attachmentId: T.Id, path: string) =>
+    call<void>("task_attachment_save", { taskId, attachmentId, path }),
 };
 
 /* ───────────────────────────── Events ──────────────────────────── */

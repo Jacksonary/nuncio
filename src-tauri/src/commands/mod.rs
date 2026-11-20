@@ -163,6 +163,11 @@ macro_rules! nuncio_commands {
             $crate::commands::tasks::task_search,
             $crate::commands::tasks::task_dismiss_reminder,
             $crate::commands::tasks::task_snooze_reminder,
+            $crate::commands::tasks::task_attachments,
+            $crate::commands::tasks::task_attachment_add,
+            $crate::commands::tasks::task_attachment_remove,
+            $crate::commands::tasks::task_attachment_data,
+            $crate::commands::tasks::task_attachment_save,
             $crate::commands::tasks::message_create_task,
         ]
     };

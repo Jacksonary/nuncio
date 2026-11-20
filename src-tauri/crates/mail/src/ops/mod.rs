@@ -29,6 +29,34 @@ pub const KIND_FOLDER_SUBSCRIBE: &str = "folderSubscribe";
 pub const KIND_FOLDER_MARK_READ: &str = "folderMarkRead";
 pub const KIND_SEND: &str = "send";
 
+/// Kinds owned by the mail engine.
+///
+/// `pending_op` is shared by every module (mail, contacts, calendar, tasks) and
+/// is keyed by account, not by kind. Each worker must therefore claim only its
+/// own rows: without this filter the mail worker picks up `pim.*` operations,
+/// fails them with "unknown pending operation kind", and either rolls nothing
+/// back (IMAP/Graph) or marks them done without ever contacting the server
+/// (POP3). PIM modules keep the `pim.` namespace reserved for themselves.
+pub fn is_mail_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        KIND_SET_FLAGS
+            | KIND_MOVE
+            | KIND_DELETE
+            | KIND_ARCHIVE
+            | KIND_MARK_JUNK
+            | KIND_APPEND_DRAFT
+            | KIND_DELETE_REMOTE_DRAFT
+            | KIND_APPEND_TO_SENT
+            | KIND_FOLDER_CREATE
+            | KIND_FOLDER_RENAME
+            | KIND_FOLDER_DELETE
+            | KIND_FOLDER_SUBSCRIBE
+            | KIND_FOLDER_MARK_READ
+            | KIND_SEND
+    )
+}
+
 /// Local flag state captured before an optimistic change, so a permanently
 /// failed `UID STORE` can be rolled back.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -617,6 +645,41 @@ mod tests {
         let payload: SetFlagsOp = repo::pending_ops::payload(&ops[0]).expect("payload");
         assert_eq!(payload.uids, vec![1, 2]);
         assert_eq!(payload.seen, Some(true));
+    }
+
+    #[test]
+    fn mail_kind_claim_does_not_include_pim() {
+        for kind in [
+            KIND_SET_FLAGS,
+            KIND_MOVE,
+            KIND_DELETE,
+            KIND_ARCHIVE,
+            KIND_MARK_JUNK,
+            KIND_APPEND_DRAFT,
+            KIND_DELETE_REMOTE_DRAFT,
+            KIND_APPEND_TO_SENT,
+            KIND_FOLDER_CREATE,
+            KIND_FOLDER_RENAME,
+            KIND_FOLDER_DELETE,
+            KIND_FOLDER_SUBSCRIBE,
+            KIND_FOLDER_MARK_READ,
+            KIND_SEND,
+        ] {
+            assert!(is_mail_kind(kind), "{kind} must be claimed by mail");
+        }
+        // `pending_op` is shared with contacts, calendar and tasks. The mail
+        // worker must leave those rows for their own workers.
+        for kind in [
+            "pim.task.save",
+            "pim.task.delete",
+            "pim.task.list.delete",
+            "pim.contact.save",
+            "pim.contact.group.delete",
+            "pim.event.update",
+            "pim.calendar.create",
+        ] {
+            assert!(!is_mail_kind(kind), "{kind} must not be claimed by mail");
+        }
     }
 
     #[test]

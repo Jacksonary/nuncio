@@ -920,7 +920,11 @@ fn smart_task_lists_and_counts() {
         assert_eq!(completed.len(), 1);
         assert!(completed[0].completed_at.is_some());
 
-        // Flagged email smart list.
+        // Flagged email smart list. The link only counts while the message
+        // row exists and is not in the trash.
+        let folder = repo::folders::create(conn, "local", None, "Temp")?;
+        let summary = MessageSummary::new("m1", "local", folder.id, "thread-m1", Utc::now());
+        repo::messages::upsert(conn, &StoredMessage::new(summary))?;
         repo::tasks::set_linked_message(conn, &first.id, Some("m1"))?;
         let flagged = repo::tasks::query(
             conn,
@@ -928,6 +932,15 @@ fn smart_task_lists_and_counts() {
         )?;
         assert_eq!(flagged.len(), 1);
         assert_eq!(repo::tasks::smart_counts(conn, &today)?.flagged_email, 1);
+
+        // A message in the trash drops out of the smart list immediately.
+        repo::messages::delete_local(conn, &["m1".to_string()], false)?;
+        assert_eq!(
+            repo::tasks::query(conn, &TaskQuery::smart(SmartList::FlaggedEmail, today.clone()))?
+                .len(),
+            0
+        );
+        assert_eq!(repo::tasks::smart_counts(conn, &today)?.flagged_email, 0);
 
         // My Day setter + list incomplete count.
         repo::tasks::set_my_day(conn, &second.id, Some("2026-11-12"))?;

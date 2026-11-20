@@ -74,6 +74,7 @@ import {
   useMessageActions,
 } from "./actions";
 import { onMailCommand } from "./commands";
+import { openTaskFromMessage } from "./taskDialog";
 import { useMailCompose } from "./composeIntegration";
 import { safeFilename, parseUnifiedFolderId } from "./logic";
 import { useConversationView } from "./conversationPrefs";
@@ -726,14 +727,9 @@ function MessageCard({
     }
   }, [apply, isOutbox, summary.id]);
 
-  const createTask = useCallback(async () => {
-    try {
-      await messagesApi.createTask(summary.id);
-      toast.success(tt("mail.toast.taskCreated"));
-    } catch (error) {
-      toast.error(tt("mail.toast.taskFailed"), errorText(error));
-    }
-  }, [summary.id, tt]);
+  const createTask = useCallback(() => {
+    openTaskFromMessage(summary);
+  }, [summary]);
 
   const saveAs = useCallback(async () => {
     if (external) return;

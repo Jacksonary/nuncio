@@ -14,6 +14,7 @@ import { flushUnsavedDraft, registerComposeSave } from "@/lib/pendingWrites";
 import { toast } from "@/components/Toast";
 import { formatListDate, formatTime } from "@/lib/format";
 import { t } from "@/lib/i18n";
+import { playReminderChime } from "@/lib/sound";
 import { queryClient } from "@/lib/queryClient";
 import {
   accountScopedPrefixes,
@@ -169,6 +170,18 @@ function rememberReminder(
   payload: EventPayloads["reminder://due"],
 ): void {
   const timeText = reminderTimeText(payload);
+  // The backend skips the system notification while the window is in the
+  // foreground, so this card is the only cue — give it a sound too. Follow the
+  // same switches as the notifier and stay silent when the window is in the
+  // background, where the system notification already carries a sound.
+  const settings = queryClient.getQueryData<AppSettings>(queryKeys.settings());
+  const enabled = settings?.notifications.enabled ?? true;
+  const moduleOn =
+    payload.kind === "task"
+      ? (settings?.notifications.taskReminders ?? true)
+      : (settings?.notifications.eventReminders ?? true);
+  const soundOn = settings?.notifications.sound ?? true;
+  if (enabled && moduleOn && soundOn && document.hasFocus()) playReminderChime();
   if (payload.kind === "event") {
     toast.reminder(
       payload.title,
@@ -176,6 +189,7 @@ function rememberReminder(
         t("shell.reminder.title"),
       {
         duration: 0,
+        key: `reminder:${payload.kind}:${payload.id}`,
         actions: [
           {
             label: t("shell.reminder.open"),
@@ -217,6 +231,7 @@ function rememberReminder(
         : t("shell.reminder.taskBody"),
       {
         duration: 0,
+        key: `reminder:${payload.kind}:${payload.id}`,
         actions: [
           {
             label: t("shell.reminder.open"),
@@ -437,7 +452,16 @@ export function installEventBridge(): () => void {
     queryClient.setQueryData(queryKeys.settings(), settings);
   });
 
-  subscribe("mail://changed", invalidateMailData);
+  subscribe("mail://changed", (payload) => {
+    invalidateMailData();
+    // Deleting a mail clears the task that was created from it (the prune
+    // happens on the next task read), so the todo lists must refresh too.
+    if (payload.kind === "deleted") {
+      invalidate(queryKeyPrefixes.tasks);
+      invalidate(queryKeyPrefixes.taskLists);
+      invalidate(queryKeyPrefixes.smartCounts);
+    }
+  });
 
   subscribe("calendar://changed", () => {
     invalidate(queryKeyPrefixes.events);

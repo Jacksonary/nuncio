@@ -17,7 +17,7 @@
 mod account_actor;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -33,6 +33,22 @@ use tracing::{debug, info, warn};
 use crate::smtp;
 use crate::sync;
 use account_actor::{AccountCommand, AccountRuntime};
+
+/// App-driven poll cadence override in seconds; 0 keeps the configured value.
+static POLL_OVERRIDE_SECS: AtomicU64 = AtomicU64::new(0);
+
+/// Poll faster while the window is focused; `0` restores the configured cadence.
+pub fn set_poll_override_secs(seconds: u64) {
+    POLL_OVERRIDE_SECS.store(seconds, Ordering::Relaxed);
+}
+
+/// Effective cadence for servers that cannot push (Graph, IMAP without IDLE).
+pub fn poll_interval(configured: Duration) -> Duration {
+    match POLL_OVERRIDE_SECS.load(Ordering::Relaxed) {
+        0 => configured,
+        seconds => Duration::from_secs(seconds.max(10)),
+    }
+}
 
 /// Tunables for connection liveness and transient-failure reporting.
 ///

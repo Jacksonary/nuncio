@@ -234,6 +234,13 @@ export function Popover({
 
   useEffect(() => {
     if (!open) return;
+    const close = () => onClose();
+    window.addEventListener("nuncio:module-changed", close);
+    return () => window.removeEventListener("nuncio:module-changed", close);
+  }, [open, onClose]);
+
+  useEffect(() => {
+    if (!open) return;
     const entry: OpenSurface = { token: surfaceToken, depth, element: contentRef.current };
     openSurfaces.push(entry);
     return () => {

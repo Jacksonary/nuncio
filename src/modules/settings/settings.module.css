@@ -878,6 +878,12 @@
   cursor: text;
 }
 
+/* `.editor:focus-within` already draws the ring around the whole editor; the
+   global `:focus-visible` outline would add a second one inside it. */
+.editorSurface:focus-visible {
+  outline: none;
+}
+
 .editorSurface:empty::before {
   content: attr(data-placeholder);
   color: var(--text-tertiary);

@@ -207,17 +207,34 @@ impl GoogleTasksClient {
         Ok(items)
     }
 
+    /// Insert a task. `parent` and `previous` are query parameters, not part of
+    /// the body: `Task.parent` is read-only in the API, so a nested task must
+    /// name its parent here or it is created at the top level instead.
     pub async fn insert_task(
         &self,
         account_id: &str,
         list_id: &str,
         body: &serde_json::Value,
+        parent: Option<&str>,
+        previous: Option<&str>,
     ) -> Result<GTask> {
         let url = self.url(&format!("/lists/{}/tasks", encode(list_id)));
+        let mut params: Vec<(&str, &str)> = Vec::new();
+        if let Some(parent) = parent {
+            params.push(("parent", parent));
+        }
+        if let Some(previous) = previous {
+            params.push(("previous", previous));
+        }
         let response = self
             .http
             .send_authed(account_id, TokenResource::GoogleApis, |token| {
-                self.http.raw().post(&url).bearer_auth(token).json(body)
+                self.http
+                    .raw()
+                    .post(&url)
+                    .query(&params)
+                    .bearer_auth(token)
+                    .json(body)
             })
             .await?;
         if !response.status().is_success() {
@@ -487,6 +504,7 @@ fn list_from_google(item: &GTaskList) -> RemoteTaskList {
         },
         color: None,
         read_only: false,
+        well_known_list_name: nuncio_core::models::WELL_KNOWN_NONE.to_string(),
     }
 }
 
@@ -608,7 +626,7 @@ impl TaskProvider for GoogleTasksProvider {
         let body = task_body(task, true);
         let created = self
             .client
-            .insert_task(&account.id, &list.remote_id, &body)
+            .insert_task(&account.id, &list.remote_id, &body, None, None)
             .await?;
         Ok(RemoteWriteResult {
             remote_id: Some(created.id).filter(|id| !id.is_empty()),
@@ -704,19 +722,28 @@ impl TaskProvider for GoogleTasksProvider {
         account: &Account,
         list: &RemoteTaskList,
         parent: &RemoteTaskRef,
+        previous: Option<&str>,
         step: &TaskStep,
     ) -> Result<Option<RemoteWriteResult>> {
         let Some(parent_id) = parent.remote_id.as_deref() else {
             return Ok(None);
         };
+        // `parent` is a query parameter. Passing it in the body silently
+        // creates a top-level task instead of a subtask, which is why steps
+        // showed up flattened (and duplicated) in the Google UI.
         let body = serde_json::json!({
             "title": step.title,
             "status": if step.is_completed { "completed" } else { "needsAction" },
-            "parent": parent_id,
         });
         let created = self
             .client
-            .insert_task(&account.id, &list.remote_id, &body)
+            .insert_task(
+                &account.id,
+                &list.remote_id,
+                &body,
+                Some(parent_id),
+                previous,
+            )
             .await?;
         Ok(Some(RemoteWriteResult {
             remote_id: Some(created.id).filter(|id| !id.is_empty()),

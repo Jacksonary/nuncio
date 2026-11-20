@@ -234,6 +234,122 @@ impl GraphTasksClient {
         Ok(page.value)
     }
 
+    /* ───────────────────────── task attachments ───────────────────── */
+
+    fn attachments_url(list_id: &str, task_id: &str) -> String {
+        format!(
+            "/me/todo/lists/{}/tasks/{}/attachments",
+            encode(list_id),
+            encode(task_id)
+        )
+    }
+
+    pub async fn list_task_attachments(
+        &self,
+        account_id: &str,
+        list_id: &str,
+        task_id: &str,
+    ) -> Result<Vec<GTaskAttachment>> {
+        let url = self.url(&Self::attachments_url(list_id, task_id));
+        let response = self
+            .http
+            .send_authed(account_id, TokenResource::MicrosoftGraph, |token| {
+                self.http.raw().get(&url).bearer_auth(token)
+            })
+            .await?;
+        if !response.status().is_success() {
+            return Err(Self::failure(response).await);
+        }
+        let page: GAttachmentPage = response
+            .json()
+            .await
+            .map_err(|error| invalid(format!("invalid Graph attachment JSON: {error}")))?;
+        Ok(page.value)
+    }
+
+    pub async fn create_task_attachment(
+        &self,
+        account_id: &str,
+        list_id: &str,
+        task_id: &str,
+        name: &str,
+        content_type: &str,
+        content_bytes: &str,
+    ) -> Result<GTaskAttachment> {
+        let url = self.url(&Self::attachments_url(list_id, task_id));
+        let body = serde_json::json!({
+            "@odata.type": "#microsoft.graph.taskFileAttachment",
+            "name": name,
+            "contentType": content_type,
+            "contentBytes": content_bytes,
+        });
+        let response = self
+            .http
+            .send_authed(account_id, TokenResource::MicrosoftGraph, |token| {
+                self.http.raw().post(&url).bearer_auth(token).json(&body)
+            })
+            .await?;
+        if !response.status().is_success() {
+            return Err(Self::failure(response).await);
+        }
+        response
+            .json()
+            .await
+            .map_err(|error| invalid(format!("invalid Graph attachment JSON: {error}")))
+    }
+
+    pub async fn delete_task_attachment(
+        &self,
+        account_id: &str,
+        list_id: &str,
+        task_id: &str,
+        attachment_id: &str,
+    ) -> Result<()> {
+        let url = self.url(&format!(
+            "{}/{}",
+            Self::attachments_url(list_id, task_id),
+            encode(attachment_id)
+        ));
+        let response = self
+            .http
+            .send_authed(account_id, TokenResource::MicrosoftGraph, |token| {
+                self.http.raw().delete(&url).bearer_auth(token)
+            })
+            .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        HttpClient::ensure_success(response).await
+    }
+
+    pub async fn download_task_attachment(
+        &self,
+        account_id: &str,
+        list_id: &str,
+        task_id: &str,
+        attachment_id: &str,
+    ) -> Result<Vec<u8>> {
+        let url = self.url(&format!(
+            "{}/{}/$value",
+            Self::attachments_url(list_id, task_id),
+            encode(attachment_id)
+        ));
+        let response = self
+            .http
+            .send_authed(account_id, TokenResource::MicrosoftGraph, |token| {
+                self.http.raw().get(&url).bearer_auth(token)
+            })
+            .await?;
+        if !response.status().is_success() {
+            return Err(Self::failure(response).await);
+        }
+        response
+            .bytes()
+            .await
+            .map(|bytes| bytes.to_vec())
+            .map_err(|error| invalid(format!("cannot read the attachment body: {error}")))
+    }
+
     pub async fn create_task(
         &self,
         account_id: &str,
@@ -245,6 +361,32 @@ impl GraphTasksClient {
             .http
             .send_authed(account_id, TokenResource::MicrosoftGraph, |token| {
                 self.http.raw().post(&url).bearer_auth(token).json(body)
+            })
+            .await?;
+        if !response.status().is_success() {
+            return Err(Self::failure(response).await);
+        }
+        response
+            .json()
+            .await
+            .map_err(|error| invalid(format!("invalid Graph todo JSON: {error}")))
+    }
+
+    pub async fn get_task(
+        &self,
+        account_id: &str,
+        list_id: &str,
+        task_id: &str,
+    ) -> Result<GTodoTask> {
+        let url = self.url(&format!(
+            "/me/todo/lists/{}/tasks/{}",
+            encode(list_id),
+            encode(task_id)
+        ));
+        let response = self
+            .http
+            .send_authed(account_id, TokenResource::MicrosoftGraph, |token| {
+                self.http.raw().get(&url).bearer_auth(token)
             })
             .await?;
         if !response.status().is_success() {
@@ -269,23 +411,52 @@ impl GraphTasksClient {
             encode(list_id),
             encode(task_id)
         ));
-        let response = self
-            .http
-            .send_authed(account_id, TokenResource::MicrosoftGraph, |token| {
-                let request = self.http.raw().patch(&url).bearer_auth(token).json(body);
-                match etag {
-                    Some(etag) if !etag.trim().is_empty() => request.header("If-Match", etag),
-                    _ => request,
+        // The stored ETag goes stale whenever something else touches the task:
+        // another client, or a checklist item write, which rewrites the parent.
+        // The op worker retries with the same payload and therefore the same
+        // ETag, so a conflict would repeat until the operation failed for good.
+        // Refresh once and retry; the updated task we return carries the new
+        // ETag, which the caller writes back.
+        let mut current_etag = etag.map(str::to_string);
+        let mut refreshed = false;
+        loop {
+            let response = self
+                .http
+                .send_authed(account_id, TokenResource::MicrosoftGraph, |token| {
+                    let request = self.http.raw().patch(&url).bearer_auth(token).json(body);
+                    match current_etag.as_deref() {
+                        Some(etag) if !etag.trim().is_empty() => request.header("If-Match", etag),
+                        _ => request,
+                    }
+                })
+                .await?;
+            let status = response.status();
+            let conflict = status == reqwest::StatusCode::CONFLICT
+                || status == reqwest::StatusCode::PRECONDITION_FAILED;
+            if conflict && !refreshed {
+                refreshed = true;
+                match self.get_task(account_id, list_id, task_id).await {
+                    Ok(fresh) => {
+                        current_etag = fresh.etag;
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            %error,
+                            "cannot refresh the Graph task ETag after a conflict"
+                        );
+                        return Err(Self::failure(response).await);
+                    }
                 }
-            })
-            .await?;
-        if !response.status().is_success() {
-            return Err(Self::failure(response).await);
+            }
+            if !status.is_success() {
+                return Err(Self::failure(response).await);
+            }
+            return response
+                .json()
+                .await
+                .map_err(|error| invalid(format!("invalid Graph todo JSON: {error}")));
         }
-        response
-            .json()
-            .await
-            .map_err(|error| invalid(format!("invalid Graph todo JSON: {error}")))
     }
 
     pub async fn delete_task(
@@ -293,21 +464,20 @@ impl GraphTasksClient {
         account_id: &str,
         list_id: &str,
         task_id: &str,
-        etag: Option<&str>,
+        _etag: Option<&str>,
     ) -> Result<()> {
         let url = self.url(&format!(
             "/me/todo/lists/{}/tasks/{}",
             encode(list_id),
             encode(task_id)
         ));
+        // No `If-Match`: a delete is unconditional intent, and a stale ETag
+        // would otherwise keep the row alive until the op failed permanently.
+        // A task id is never reused, so there is nothing to protect.
         let response = self
             .http
             .send_authed(account_id, TokenResource::MicrosoftGraph, |token| {
-                let request = self.http.raw().delete(&url).bearer_auth(token);
-                match etag {
-                    Some(etag) if !etag.trim().is_empty() => request.header("If-Match", etag),
-                    _ => request,
-                }
+                self.http.raw().delete(&url).bearer_auth(token)
             })
             .await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
@@ -401,6 +571,26 @@ pub struct GTodoListPage {
     pub value: Vec<GTodoList>,
     #[serde(default, rename = "@odata.nextLink")]
     pub next_link: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GTaskAttachment {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub content_type: Option<String>,
+    #[serde(default)]
+    pub size: i64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GAttachmentPage {
+    #[serde(default)]
+    value: Vec<GTaskAttachment>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -633,7 +823,25 @@ pub fn task_body(task: &Task, for_create: bool) -> serde_json::Value {
     body
 }
 
+/// Map a Graph list, keeping its built-in marker.
+///
+/// Graph reports To Do's own lists (`defaultList`, `flaggedEmails`) alongside
+/// user lists. They cannot be renamed or deleted, so the marker has to survive
+/// into the local row; importing them as ordinary lists is what produced a
+/// "Flagged Emails" entry that the web UI does not show and that failed on
+/// every delete.
 fn list_from_graph(item: &GTodoList) -> RemoteTaskList {
+    // `unknownFutureValue` is Graph's evolution sentinel: it names no known
+    // built-in list, so it is treated as an ordinary one rather than blocking
+    // operations on a list we cannot reason about.
+    let well_known_list_name = match item.wellknown_list_name.as_deref() {
+        Some(nuncio_core::models::WELL_KNOWN_DEFAULT) => nuncio_core::models::WELL_KNOWN_DEFAULT,
+        Some(nuncio_core::models::WELL_KNOWN_FLAGGED_EMAILS) => {
+            nuncio_core::models::WELL_KNOWN_FLAGGED_EMAILS
+        }
+        _ => nuncio_core::models::WELL_KNOWN_NONE,
+    }
+    .to_string();
     RemoteTaskList {
         local_id: String::new(),
         remote_id: item.id.clone(),
@@ -645,6 +853,7 @@ fn list_from_graph(item: &GTodoList) -> RemoteTaskList {
         },
         color: None,
         read_only: false,
+        well_known_list_name,
     }
 }
 
@@ -885,6 +1094,7 @@ impl TaskProvider for GraphTasksProvider {
         account: &Account,
         list: &RemoteTaskList,
         parent: &RemoteTaskRef,
+        _previous: Option<&str>,
         step: &TaskStep,
     ) -> Result<Option<RemoteWriteResult>> {
         let Some(parent_id) = parent.remote_id.as_deref() else {
@@ -1026,11 +1236,35 @@ mod tests {
     }
 
     #[test]
-    fn maps_wellknown_default_list() {
-        let list: GTodoList = serde_json::from_str(
-            r#"{"id":"l1","displayName":"Tasks","wellknownListName":"defaultList"}"#,
-        )
-        .expect("list");
-        assert_eq!(list_from_graph(&list).name, "Tasks");
+    fn maps_wellknown_lists() {
+        let parse = |json: &str| {
+            let item: GTodoList = serde_json::from_str(json).expect("list");
+            list_from_graph(&item)
+        };
+        let tasks = parse(r#"{"id":"l1","displayName":"Tasks","wellknownListName":"defaultList"}"#);
+        assert_eq!(tasks.name, "Tasks");
+        assert_eq!(
+            tasks.well_known_list_name,
+            nuncio_core::models::WELL_KNOWN_DEFAULT
+        );
+        let flagged =
+            parse(r#"{"id":"l2","displayName":"Flagged Emails","wellknownListName":"flaggedEmails"}"#);
+        assert_eq!(
+            flagged.well_known_list_name,
+            nuncio_core::models::WELL_KNOWN_FLAGGED_EMAILS
+        );
+        // A user list, an unknown sentinel and a missing field all stay
+        // ordinary lists so nothing is locked down by accident.
+        for json in [
+            r#"{"id":"l3","displayName":"Errands","wellknownListName":"none"}"#,
+            r#"{"id":"l4","displayName":"Errands","wellknownListName":"unknownFutureValue"}"#,
+            r#"{"id":"l5","displayName":"Errands"}"#,
+        ] {
+            assert_eq!(
+                parse(json).well_known_list_name,
+                nuncio_core::models::WELL_KNOWN_NONE,
+                "{json}"
+            );
+        }
     }
 }

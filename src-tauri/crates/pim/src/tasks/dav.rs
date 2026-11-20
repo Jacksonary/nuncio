@@ -53,6 +53,7 @@ fn list_from_remote(remote: crate::provider::RemoteCalendar) -> RemoteTaskList {
         name: remote.name,
         color: remote.color,
         read_only: remote.read_only,
+        well_known_list_name: nuncio_core::models::WELL_KNOWN_NONE.to_string(),
     }
 }
 
@@ -260,6 +261,7 @@ mod tests {
             name: "Tasks".into(),
             color: None,
             read_only: false,
+            well_known_list_name: nuncio_core::models::WELL_KNOWN_NONE.to_string(),
         };
         assert_eq!(collection(&list), "https://dav/tasks/");
         assert_eq!(

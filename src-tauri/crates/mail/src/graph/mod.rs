@@ -23,9 +23,32 @@ use std::time::Duration;
 use nuncio_core::models::{Account, OAuthProvider};
 use nuncio_core::traits::TokenResource;
 use nuncio_core::{AppError, CoreContext, Result};
-use reqwest::header::{HeaderValue, AUTHORIZATION};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, RETRY_AFTER};
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, warn};
+
+/// Last `Retry-After` hint returned by the service, in seconds (0 = none).
+static RETRY_AFTER_SECS: AtomicU64 = AtomicU64::new(0);
+
+fn note_retry_after(headers: &HeaderMap) {
+    let seconds = headers
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    if seconds > 0 {
+        RETRY_AFTER_SECS.store(seconds, Ordering::Relaxed);
+    }
+}
+
+/// Consume the service's retry hint, if it asked us to back off.
+pub fn take_retry_after_secs() -> Option<u64> {
+    match RETRY_AFTER_SECS.swap(0, Ordering::Relaxed) {
+        0 => None,
+        seconds => Some(seconds),
+    }
+}
 
 /// Graph v1.0 root, including the API version.
 pub const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
@@ -175,6 +198,12 @@ impl GraphMailClient {
             .await
             .map_err(|error| request_error("Graph request", error))?;
 
+        if matches!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+        ) {
+            note_retry_after(response.headers());
+        }
         if response.status() == StatusCode::UNAUTHORIZED {
             match retry {
                 Some(mut retry) => {

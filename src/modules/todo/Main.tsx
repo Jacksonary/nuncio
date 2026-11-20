@@ -55,7 +55,9 @@ import {
   emptyTaskInput,
   groupListsByAccount,
   groupPlanned,
+  isBuiltinList,
   isMyDayToday,
+  listFeatureSupport,
   nextWeekIso,
   plannedBucketLabelKey,
   reorderIds,
@@ -582,7 +584,7 @@ export function TodoMain() {
             id: "list-rename",
             label: t("todo.list.rename"),
             icon: <Edit20Regular />,
-            disabled: currentReadOnly,
+            disabled: currentReadOnly || isBuiltinList(currentList),
             onSelect: () => setRenameOpen(true),
           },
           {
@@ -597,7 +599,7 @@ export function TodoMain() {
             label: t("todo.list.delete"),
             icon: <Delete20Regular />,
             danger: true,
-            disabled: currentReadOnly || currentList.isDefault,
+            disabled: currentReadOnly || currentList.isDefault || isBuiltinList(currentList),
             onSelect: () => void removeCurrentList(),
           },
         ] satisfies MenuEntry[])
@@ -785,10 +787,13 @@ export function TodoMain() {
     const task = row.task;
     const list = listsById.get(task.listId) ?? null;
     const readOnly = list?.isReadOnly ?? false;
+    const account = accounts.find((item) => item.id === task.accountId) ?? null;
+    const support = listFeatureSupport(list, account);
     return (
       <TaskRow
         task={task}
         list={list}
+        importanceSynced={support.importance}
         today={today}
         locale={locale}
         t={t}

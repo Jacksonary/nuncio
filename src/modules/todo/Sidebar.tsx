@@ -35,7 +35,13 @@ import { formatDate, parseIsoDate } from "@/lib/format";
 import { deleteTaskList, moveTaskToList } from "./actions";
 import { hasTaskDrag, readDraggedTaskId } from "./dnd";
 import { useTaskPollIntervalMs, useToday } from "./hooks";
-import { SMART_LISTS, groupListsByAccount, smartCount, smartListLabelKey } from "./logic";
+import {
+  SMART_LISTS,
+  groupListsByAccount,
+  isBuiltinList,
+  smartCount,
+  smartListLabelKey,
+} from "./logic";
 import { ColorListDialog, CreateListDialog, RenameListDialog } from "./Dialogs";
 import { useTodoUiStore } from "./uiStore";
 import styles from "./Sidebar.module.css";
@@ -178,7 +184,7 @@ export function TodoSidebar() {
       id: "rename",
       label: t("todo.list.rename"),
       icon: <Edit20Regular />,
-      disabled: list.isReadOnly,
+      disabled: list.isReadOnly || isBuiltinList(list),
       onSelect: () => setDialog({ kind: "rename", list }),
     },
     {
@@ -194,7 +200,7 @@ export function TodoSidebar() {
       label: t("todo.list.delete"),
       icon: <Delete20Regular />,
       danger: true,
-      disabled: list.isReadOnly || list.isDefault,
+      disabled: list.isReadOnly || list.isDefault || isBuiltinList(list),
       onSelect: () => void removeList(list),
     },
   ];

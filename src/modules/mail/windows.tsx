@@ -14,7 +14,9 @@ import type { Draft } from "@/ipc/types";
 import { useT } from "@/lib/i18n";
 import { useShellStore } from "@/lib/store";
 import { ComposeView, InlineComposePane } from "./composeIntegration";
+import { CreateTaskDialog } from "./CreateTaskDialog";
 import { ReadingPane } from "./ReadingPane";
+import { useMailTaskDialog } from "./taskDialog";
 import styles from "./mail.module.css";
 
 function errorText(error: unknown): string {
@@ -83,8 +85,17 @@ export function MessageWindow({ messageId, emlPath }: MessageWindowProps) {
         print={print}
         onRemoved={() => setRemoved(true)}
       />
+      <MessageWindowTaskDialog />
     </div>
   );
+}
+
+/// The standalone message window has its own module tree, so the shared dialog
+/// has to be mounted here as well; otherwise "Create task" opens nothing.
+function MessageWindowTaskDialog() {
+  const source = useMailTaskDialog((state) => state.source);
+  const close = useMailTaskDialog((state) => state.close);
+  return <CreateTaskDialog open={source !== null} source={source} onClose={close} />;
 }
 
 export function ComposeWindow({ draftId, accountId }: ComposeWindowProps) {

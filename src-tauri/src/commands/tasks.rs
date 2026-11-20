@@ -2,7 +2,10 @@
 
 use tauri::State;
 
-use nuncio_core::models::{Importance, SmartListCounts, Task, TaskInput, TaskList, TaskQuery};
+use nuncio_core::models::{
+    Importance, NewTaskFromMessage, SmartListCounts, Task, TaskAttachment, TaskInput, TaskList,
+    TaskQuery,
+};
 
 use crate::state::AppState;
 
@@ -157,6 +160,66 @@ pub async fn task_snooze_reminder(
 pub async fn message_create_task(
     state: State<'_, AppState>,
     id: String,
+    input: NewTaskFromMessage,
 ) -> nuncio_core::Result<Task> {
-    state.pim.message_create_task(&id).await
+    state.pim.message_create_task(&id, input).await
+}
+
+/* ─────────────────────── task attachments ─────────────────────── */
+
+#[tauri::command]
+pub async fn task_attachments(
+    state: State<'_, AppState>,
+    task_id: String,
+) -> nuncio_core::Result<Vec<TaskAttachment>> {
+    state.pim.tasks().task_attachments(&task_id).await
+}
+
+#[tauri::command]
+pub async fn task_attachment_add(
+    state: State<'_, AppState>,
+    task_id: String,
+    path: String,
+) -> nuncio_core::Result<Vec<TaskAttachment>> {
+    state.pim.tasks().task_attachment_add(&task_id, &path).await
+}
+
+#[tauri::command]
+pub async fn task_attachment_remove(
+    state: State<'_, AppState>,
+    task_id: String,
+    attachment_id: String,
+) -> nuncio_core::Result<()> {
+    state
+        .pim
+        .tasks()
+        .task_attachment_remove(&task_id, &attachment_id)
+        .await
+}
+
+#[tauri::command]
+pub async fn task_attachment_data(
+    state: State<'_, AppState>,
+    task_id: String,
+    attachment_id: String,
+) -> nuncio_core::Result<String> {
+    state
+        .pim
+        .tasks()
+        .task_attachment_data(&task_id, &attachment_id)
+        .await
+}
+
+#[tauri::command]
+pub async fn task_attachment_save(
+    state: State<'_, AppState>,
+    task_id: String,
+    attachment_id: String,
+    path: String,
+) -> nuncio_core::Result<()> {
+    state
+        .pim
+        .tasks()
+        .task_attachment_save(&task_id, &attachment_id, &path)
+        .await
 }

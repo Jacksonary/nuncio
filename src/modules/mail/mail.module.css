@@ -543,14 +543,22 @@
   background: var(--surface-hover);
 }
 
+/* Selection has to read at a glance on the dark surface: a tinted fill plus
+   the accent bar, clearly stronger than the hover grey. */
 .messageRowCurrent {
-  box-shadow: inset 2px 0 0 var(--accent-border);
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+  box-shadow: inset 3px 0 0 var(--accent-border);
 }
 
 .messageRowSelected,
 .messageRowSelected:hover {
-  background: var(--accent-subtle);
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
   box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.messageRowSelected .rowSubject,
+.messageRowSelected .rowSender {
+  color: var(--text);
 }
 
 .messageRow:focus-visible {
@@ -722,8 +730,18 @@
   transition: opacity var(--duration-fast) var(--ease);
 }
 
-.messageRow:hover .rowHoverActions,
-.messageRow:focus-within .rowHoverActions {
+/* Hover reveals the row actions; keyboard focus must too. `:focus-within`
+   also matched a row that merely kept focus after a mouse click, so the
+   actions stayed pinned to the message that was open in the reading pane.
+   `:has(:focus-visible)` keeps the keyboard path without that side effect. */
+.messageRow:hover .rowHoverActions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* Kept in its own rule: a browser without `:has()` drops this rule only,
+   instead of invalidating the hover rule above with it. */
+.messageRow:has(:focus-visible) .rowHoverActions {
   opacity: 1;
   pointer-events: auto;
 }

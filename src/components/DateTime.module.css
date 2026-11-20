@@ -214,3 +214,30 @@
   outline: 2px solid var(--focus-outline);
   outline-offset: -2px;
 }
+
+/* Free-form time entry above the 15-minute list. */
+.timeManual {
+  padding: var(--sp-1) var(--sp-1) 0;
+}
+
+.timeInput {
+  width: 100%;
+  min-height: 30px;
+  padding: 0 var(--sp-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-s);
+  background: var(--control-bg);
+  color: var(--text);
+  font-size: var(--font-body);
+  font-variant-numeric: tabular-nums;
+}
+
+.timeInput::placeholder {
+  color: var(--text-tertiary);
+  font-variant-numeric: normal;
+}
+
+.timeInput:focus-visible {
+  outline: 2px solid var(--focus-outline);
+  outline-offset: -2px;
+}

@@ -33,10 +33,18 @@ export interface ToastOptions {
   actions?: ToastAction[];
   /** Auto-dismiss delay in ms; 0 keeps it open until dismissed. */
   duration?: number;
+  /**
+   * Identity for replacement. A toast with the same key updates the existing
+   * card instead of stacking a second copy — reminders for one task must not
+   * pile up one per fire.
+   */
+  key?: string;
 }
 
-export interface ToastItem extends Required<Omit<ToastOptions, "message" | "actions">> {
+export interface ToastItem
+  extends Required<Omit<ToastOptions, "message" | "actions" | "key">> {
   id: number;
+  key?: string;
   message?: string;
   actions?: ToastAction[];
 }
@@ -47,6 +55,9 @@ const DEFAULT_DURATION: Record<ToastType, number> = {
   error: 8000,
   reminder: 0,
 };
+
+/** Oldest cards beyond this are dropped so a burst cannot cover the window. */
+const MAX_TOASTS = 4;
 
 let items: ToastItem[] = [];
 let nextId = 1;
@@ -84,19 +95,58 @@ function dismiss(id: number): void {
 
 function show(options: ToastOptions): number {
   const type = options.type ?? "info";
+  const duration = options.duration ?? DEFAULT_DURATION[type];
+  if (options.key) {
+    const existing = items.find((item) => item.key === options.key);
+    if (existing) {
+      clearTimer(existing.id);
+      const updated: ToastItem = {
+        ...existing,
+        type,
+        title: options.title,
+        message: options.message,
+        actions: options.actions,
+        duration,
+      };
+      items = items.map((item) => (item.id === existing.id ? updated : item));
+      emit();
+      if (duration > 0) {
+        timers.set(existing.id, window.setTimeout(() => dismiss(existing.id), duration));
+      }
+      return existing.id;
+    }
+  }
   const id = nextId++;
   const item: ToastItem = {
     id,
+    key: options.key,
     type,
     title: options.title,
     message: options.message,
     actions: options.actions,
-    duration: options.duration ?? DEFAULT_DURATION[type],
+    duration,
   };
   items = [...items, item];
+  if (items.length > MAX_TOASTS) {
+    // Drop the oldest plain card first: an Undo or a reminder is actionable
+    // and must not silently disappear because a burst of errors arrived.
+    let excess = items.length - MAX_TOASTS;
+    const removable = items.filter(
+      (entry) => entry.type !== "reminder" && (entry.actions?.length ?? 0) === 0,
+    );
+    const dropped = new Set<number>();
+    for (const candidate of [...removable, ...items]) {
+      if (excess === 0) break;
+      if (dropped.has(candidate.id)) continue;
+      dropped.add(candidate.id);
+      clearTimer(candidate.id);
+      excess -= 1;
+    }
+    items = items.filter((entry) => !dropped.has(entry.id));
+  }
   emit();
-  if (item.duration > 0) {
-    const timer = window.setTimeout(() => dismiss(id), item.duration);
+  if (duration > 0) {
+    const timer = window.setTimeout(() => dismiss(id), duration);
     timers.set(id, timer);
   }
   return id;

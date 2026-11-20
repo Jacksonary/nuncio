@@ -299,6 +299,7 @@ export async function deleteTaskWithUndo(task: Task): Promise<boolean> {
       title: t("todo.toast.deleted"),
       message: snapshot.title,
       duration: 8000,
+      key: `todo:delete:${task.id}`,
       actions: [
         {
           label: t("todo.toast.undo"),

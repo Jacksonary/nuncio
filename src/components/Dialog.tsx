@@ -121,6 +121,13 @@ export function Dialog({
     [dismissible, onClose],
   );
 
+  useEffect(() => {
+    if (!open) return;
+    const close = () => onClose();
+    window.addEventListener("nuncio:module-changed", close);
+    return () => window.removeEventListener("nuncio:module-changed", close);
+  }, [open, onClose]);
+
   if (!open || typeof document === "undefined") return null;
 
   return createPortal(

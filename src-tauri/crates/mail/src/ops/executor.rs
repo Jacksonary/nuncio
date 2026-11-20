@@ -20,12 +20,12 @@ use tracing::{debug, info};
 use crate::graph::{ops as graph_ops, GraphMailClient};
 use crate::imap::conn::{ImapConnection, COMMAND_TIMEOUT};
 use crate::ops::{
-    AppendDraftOp, AppendToSentOp, ArchiveOp, DeleteOp, DeleteRemoteDraftOp, FolderCreateOp,
-    FolderDeleteOp, FolderMarkReadOp, FolderRenameOp, FolderSubscribeOp, MarkJunkOp, MoveOp,
-    SendOp, SetFlagsOp, KIND_APPEND_DRAFT, KIND_APPEND_TO_SENT, KIND_ARCHIVE, KIND_DELETE,
-    KIND_DELETE_REMOTE_DRAFT, KIND_FOLDER_CREATE, KIND_FOLDER_DELETE, KIND_FOLDER_MARK_READ,
-    KIND_FOLDER_RENAME, KIND_FOLDER_SUBSCRIBE, KIND_MARK_JUNK, KIND_MOVE, KIND_SEND,
-    KIND_SET_FLAGS,
+    is_mail_kind, AppendDraftOp, AppendToSentOp, ArchiveOp, DeleteOp, DeleteRemoteDraftOp,
+    FolderCreateOp, FolderDeleteOp, FolderMarkReadOp, FolderRenameOp, FolderSubscribeOp,
+    MarkJunkOp, MoveOp, SendOp, SetFlagsOp, KIND_APPEND_DRAFT, KIND_APPEND_TO_SENT, KIND_ARCHIVE,
+    KIND_DELETE, KIND_DELETE_REMOTE_DRAFT, KIND_FOLDER_CREATE, KIND_FOLDER_DELETE,
+    KIND_FOLDER_MARK_READ, KIND_FOLDER_RENAME, KIND_FOLDER_SUBSCRIBE, KIND_MARK_JUNK, KIND_MOVE,
+    KIND_SEND, KIND_SET_FLAGS,
 };
 use crate::util::{imap_error, uid_set};
 
@@ -47,9 +47,13 @@ async fn recover_in_progress(ctx: &CoreContext, account_id: &str) -> Result<()> 
     let cutoff = Utc::now() - chrono::Duration::minutes(10);
     ctx.db
         .write(move |db| {
+            // PIM operations share this table but are owned by their own
+            // workers; resetting one mid-flight would let the mail worker claim
+            // it on the next pass.
             db.execute(
                 "UPDATE pending_op SET state = 'pending'
-                 WHERE account_id = ?1 AND state = 'inProgress' AND updated_at < ?2",
+                 WHERE account_id = ?1 AND state = 'inProgress' AND updated_at < ?2
+                   AND kind NOT LIKE 'pim.%'",
                 rusqlite::params![account_id, nuncio_core::repo::dt_string(cutoff)],
             )?;
             Ok(())
@@ -76,7 +80,8 @@ pub async fn run_due(
     let due: Vec<PendingOp> = ops
         .into_iter()
         .filter(|op| {
-            op.state == PendingOpState::Pending
+            is_mail_kind(&op.kind)
+                && op.state == PendingOpState::Pending
                 && op.next_retry_at.map(|at| at <= now).unwrap_or(true)
         })
         .take(MAX_OPS_PER_PASS)
@@ -868,7 +873,8 @@ pub async fn run_due_graph(ctx: &CoreContext, account: &Account) -> Result<ExecO
     let due: Vec<PendingOp> = ops
         .into_iter()
         .filter(|op| {
-            op.state == PendingOpState::Pending
+            is_mail_kind(&op.kind)
+                && op.state == PendingOpState::Pending
                 && op.next_retry_at.map(|at| at <= now).unwrap_or(true)
         })
         .take(MAX_OPS_PER_PASS)
@@ -1950,7 +1956,8 @@ pub async fn run_due_local(ctx: &CoreContext, account: &Account) -> Result<usize
     let due: Vec<PendingOp> = ops
         .into_iter()
         .filter(|op| {
-            op.state == PendingOpState::Pending
+            is_mail_kind(&op.kind)
+                && op.state == PendingOpState::Pending
                 && op.next_retry_at.map(|at| at <= now).unwrap_or(true)
         })
         .take(MAX_OPS_PER_PASS)
@@ -2180,5 +2187,88 @@ mod tests {
             Ok(())
         })
         .expect("rollback");
+    }
+
+    async fn context_with_account() -> CoreContext {
+        let dir = std::env::temp_dir().join(format!(
+            "nuncio-mail-executor-{}",
+            nuncio_core::models::new_id()
+        ));
+        let ctx = CoreContext::for_test(nuncio_core::Paths::new(dir))
+            .await
+            .expect("ctx");
+        ctx.db
+            .write({
+                let account = account();
+                move |db| repo::accounts::insert(db, &account)
+            })
+            .await
+            .expect("account");
+        ctx
+    }
+
+    async fn state_of(ctx: &CoreContext, id: &str) -> PendingOpState {
+        let id = id.to_string();
+        ctx.db
+            .read(move |db| repo::pending_ops::get(db, &id))
+            .await
+            .expect("read")
+            .expect("op")
+            .state
+    }
+
+    /// `pending_op` is shared with contacts, calendar and tasks. The mail
+    /// worker used to claim every row for the account, fail `pim.*` with
+    /// "unknown pending operation kind" (IMAP/Graph) or mark it done without
+    /// contacting any server (POP3), which is why task edits and checklist
+    /// steps never reached Microsoft To Do.
+    #[tokio::test]
+    async fn mail_queue_does_not_claim_pim_operations() {
+        let ctx = context_with_account().await;
+        let account = account();
+        let queued = ctx
+            .db
+            .write(|db| {
+                repo::pending_ops::enqueue(
+                    db,
+                    nuncio_core::models::NewPendingOp::new(
+                        "acc",
+                        "pim.task.save",
+                        serde_json::json!({ "op": "save", "taskId": "task-1", "snapshot": null }),
+                        "更新任务「测试todo」",
+                    ),
+                )
+            })
+            .await
+            .expect("queue");
+
+        let outcome = run_due_graph(&ctx, &account).await.expect("graph pass");
+        assert_eq!(outcome.done, 0);
+        assert_eq!(outcome.failed, 0);
+        assert_eq!(outcome.retried, 0);
+        let done = run_due_local(&ctx, &account).await.expect("local pass");
+        assert_eq!(done, 0);
+        assert_eq!(state_of(&ctx, &queued.id).await, PendingOpState::Pending);
+
+        // A PIM row left `inProgress` by a crash belongs to the PIM worker;
+        // mail must not reset it and grab it on the next pass.
+        ctx.db
+            .write({
+                let id = queued.id.clone();
+                move |db| {
+                    db.execute(
+                        "UPDATE pending_op SET state = 'inProgress', updated_at = ?2 WHERE id = ?1",
+                        rusqlite::params![
+                            id,
+                            nuncio_core::repo::dt_string(Utc::now() - chrono::Duration::hours(1))
+                        ],
+                    )?;
+                    Ok(())
+                }
+            })
+            .await
+            .expect("age");
+        run_due_graph(&ctx, &account).await.expect("second pass");
+        assert_eq!(state_of(&ctx, &queued.id).await, PendingOpState::InProgress);
     }
 }

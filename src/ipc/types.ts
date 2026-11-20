@@ -665,8 +665,29 @@ export interface TaskList {
   color: string;
   isDefault: boolean;
   isReadOnly: boolean;
+  /** `none` for user lists; provider built-ins cannot be renamed or deleted. */
+  wellKnownListName: string;
   incompleteCount: number;
   sortOrder: number;
+}
+
+/** Options sent when turning an e-mail into a task. */
+export interface NewTaskFromMessage {
+  title: string;
+  notes: string;
+  listId: Id;
+  dueDate: IsoDate | null;
+  reminderAt: IsoDateTime | null;
+  myDayDate: IsoDate | null;
+  markFlagged: boolean;
+}
+
+/** A file attached to a task; supported by Microsoft To Do only. */
+export interface TaskAttachment {
+  id: Id;
+  name: string;
+  size: number;
+  contentType: string;
 }
 
 export interface TaskStep {

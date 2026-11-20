@@ -7,8 +7,8 @@ use crate::models::{new_id, TaskList};
 use crate::repo::{get_bool, get_string, now_string};
 use crate::Result;
 
-const COLUMNS: &str =
-    "l.id, l.account_id, l.name, l.color, l.is_default, l.is_read_only, l.sort_order";
+const COLUMNS: &str = "l.id, l.account_id, l.name, l.color, l.is_default, l.is_read_only, \
+     l.well_known_list_name, l.sort_order";
 
 fn row_to_list(row: &Row<'_>) -> Result<TaskList> {
     Ok(TaskList {
@@ -18,6 +18,7 @@ fn row_to_list(row: &Row<'_>) -> Result<TaskList> {
         color: get_string(row, "color")?,
         is_default: get_bool(row, "is_default")?,
         is_read_only: get_bool(row, "is_read_only")?,
+        well_known_list_name: get_string(row, "well_known_list_name")?,
         incomplete_count: row.get("incomplete_count")?,
         sort_order: row.get("sort_order")?,
     })
@@ -88,8 +89,10 @@ pub fn create(conn: &Connection, account_id: &str, name: &str, color: &str) -> R
     let id = new_id();
     let now = now_string();
     conn.execute(
-        "INSERT INTO task_list (id, account_id, name, color, is_default, is_read_only, sort_order, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?7)",
+        "INSERT INTO task_list
+             (id, account_id, name, color, is_default, is_read_only, well_known_list_name,
+              sort_order, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, 'none', ?6, ?7, ?7)",
         params![
             id,
             account_id,
@@ -116,14 +119,16 @@ pub fn insert(conn: &Connection, list: &TaskList) -> Result<TaskList> {
     }
     conn.execute(
         "INSERT INTO task_list
-             (id, account_id, name, color, is_default, is_read_only, sort_order, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+             (id, account_id, name, color, is_default, is_read_only, well_known_list_name,
+              sort_order, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
          ON CONFLICT(id) DO UPDATE SET
              account_id = excluded.account_id,
              name = excluded.name,
              color = excluded.color,
              is_default = excluded.is_default,
              is_read_only = excluded.is_read_only,
+             well_known_list_name = excluded.well_known_list_name,
              sort_order = excluded.sort_order,
              updated_at = excluded.updated_at",
         params![
@@ -133,6 +138,7 @@ pub fn insert(conn: &Connection, list: &TaskList) -> Result<TaskList> {
             list.color,
             list.is_default as i64,
             list.is_read_only as i64,
+            list.well_known_list_name,
             list.sort_order,
             now_string()
         ],

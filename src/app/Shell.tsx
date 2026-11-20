@@ -87,6 +87,30 @@ export function Shell() {
   const moduleDef = modules[activeModule];
   const mac = isMac();
 
+  // Keep a module mounted once it has been opened. Remounting on every switch
+  // threw away list scroll position, expanded threads and filters; only the
+  // selected message survived because it lives in the shell store.
+  const [mountedModules, setMountedModules] = useState<AppModule[]>([
+    activeModule,
+  ]);
+  useEffect(() => {
+    setMountedModules((current) =>
+      current.includes(activeModule) ? current : [...current, activeModule],
+    );
+  }, [activeModule]);
+
+  // Portalled surfaces (dialogs, popovers, the image viewer) live outside the
+  // module subtree, so hiding the module does not hide them. Announcing the
+  // switch lets them close themselves.
+  useEffect(() => {
+    // A focused control inside the module that is being hidden would keep the
+    // focus (and trip aria-hidden warnings); move it out before hiding.
+    if (document.activeElement instanceof HTMLElement) {
+      document.activeElement.blur();
+    }
+    window.dispatchEvent(new Event("nuncio:module-changed"));
+  }, [activeModule]);
+
   const accountsQuery = useQuery({
     queryKey: queryKeys.accounts(),
     queryFn: accounts.list,
@@ -347,9 +371,32 @@ export function Shell() {
             </div>
           ) : null}
 
-          <div key={activeModule} className={styles.mainBody}>
-            <moduleDef.Main />
-          </div>
+          {mountedModules.map((moduleId) => {
+            const definition = modules[moduleId];
+            const active = moduleId === activeModule;
+            return (
+              <div
+                key={moduleId}
+                className={styles.mainBody}
+                // Hidden with visibility rather than display:none: a
+                // display:none subtree loses its scroll offsets, which is
+                // exactly the state this change is meant to keep.
+                style={
+                  active
+                    ? undefined
+                    : {
+                        position: "absolute",
+                        inset: 0,
+                        visibility: "hidden",
+                        pointerEvents: "none",
+                      }
+                }
+                aria-hidden={active ? undefined : true}
+              >
+                <definition.Main />
+              </div>
+            );
+          })}
         </main>
       </div>
 

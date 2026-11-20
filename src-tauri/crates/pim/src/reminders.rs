@@ -289,6 +289,10 @@ impl ReminderEngine {
 
     /// Run until the returned future is aborted by the service.
     pub async fn run(self) {
+        // The first tick writes `fired` markers before emitting; a reminder
+        // that fires before the webview installed its listener would be lost
+        // for good. Give the window a moment to subscribe.
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         loop {
             let tick = self.tick().await;
             if let Err(error) = tick {

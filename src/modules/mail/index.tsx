@@ -14,10 +14,12 @@ import { useShellStore } from "@/lib/store";
 import { dispatchMailCommand, onMailCommand, resolveMailShortcut } from "./commands";
 import { InlineComposePane, useMailCompose } from "./composeIntegration";
 import { parseUnifiedFolderId, unifiedFolderId } from "./logic";
+import { CreateTaskDialog } from "./CreateTaskDialog";
 import { MessageList } from "./MessageList";
 import { ReadingPane } from "./ReadingPane";
 import { useAllFolders, useUnifiedAccounts, useMailAccounts } from "./queries";
 import { MailSidebar } from "./Sidebar";
+import { useMailTaskDialog } from "./taskDialog";
 import styles from "./mail.module.css";
 
 /** Elements whose native Enter/Space activation must not be hijacked. */
@@ -25,6 +27,8 @@ const INTERACTIVE_SELECTOR =
   "button, a, [role='button'], [role='menuitem'], [role='menuitemcheckbox'], [role='tab']";
 
 function MailMain() {
+  const taskSource = useMailTaskDialog((state) => state.source);
+  const closeTaskDialog = useMailTaskDialog((state) => state.close);
   const mailAccounts = useMailAccounts();
   const unifiedAccounts = useUnifiedAccounts();
   const folders = useAllFolders(mailAccounts);
@@ -136,6 +140,9 @@ function MailMain() {
       ) {
         return;
       }
+      // The module stays mounted while another module is on screen, so its
+      // global shortcuts must not fire from behind the scenes.
+      if (useShellStore.getState().activeModule !== "mail") return;
       event.preventDefault();
       event.stopPropagation();
       dispatchMailCommand(command);
@@ -146,6 +153,11 @@ function MailMain() {
 
   return (
     <div className={styles.mailMain}>
+      <CreateTaskDialog
+        open={taskSource !== null}
+        source={taskSource}
+        onClose={closeTaskDialog}
+      />
       <Splitter
         storageKey="mail.list"
         primary={<MessageList />}

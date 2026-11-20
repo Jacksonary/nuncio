@@ -9,6 +9,7 @@ import {
   emptyTaskInput,
   filterBySmart,
   groupPlanned,
+  isBuiltinList,
   listFeatureSupport,
   moveStep,
   nextWeekIso,
@@ -71,6 +72,7 @@ function makeList(partial: Partial<TaskList> & { id: string }): TaskList {
     color: "#0f6cbd",
     isDefault: false,
     isReadOnly: false,
+    wellKnownListName: "none",
     incompleteCount: 0,
     sortOrder: 0,
     ...rest,
@@ -483,5 +485,17 @@ describe("date labels", () => {
     const iso = combineReminder("2026-11-12", "14:30");
     expect(splitReminder(iso)).toEqual({ date: "2026-11-12", time: "14:30" });
     expect(splitReminder(null)).toEqual({ date: null, time: null });
+  });
+});
+
+describe("isBuiltinList", () => {
+  it("only marks provider-owned lists as built in", () => {
+    expect(isBuiltinList(makeList({ id: "a" }))).toBe(false);
+    expect(
+      isBuiltinList(makeList({ id: "b", wellKnownListName: "flaggedEmails" })),
+    ).toBe(true);
+    expect(
+      isBuiltinList(makeList({ id: "c", wellKnownListName: "defaultList" })),
+    ).toBe(true);
   });
 });

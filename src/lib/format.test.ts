@@ -12,6 +12,7 @@ import {
   isValidEmail,
   parseAddressInput,
   parseIsoDate,
+  parseLooseTime,
   parseTimeOfDay,
   toIsoDate,
 } from "@/lib/format";
@@ -134,5 +135,25 @@ describe("date helpers", () => {
     expect(parseTimeOfDay("24:00")).toBeNull();
     expect(formatTimeOfDay(545)).toBe("09:05");
     expect(formatTimeOfDay(1440 + 30)).toBe("00:30");
+  });
+});
+
+describe("parseLooseTime", () => {
+  it("accepts the shorthands people type", () => {
+    expect(parseLooseTime("09:05")).toBe("09:05");
+    expect(parseLooseTime("9:05")).toBe("09:05");
+    expect(parseLooseTime("9：05")).toBe("09:05");
+    expect(parseLooseTime("905")).toBe("09:05");
+    expect(parseLooseTime("0905")).toBe("09:05");
+    expect(parseLooseTime("9")).toBe("09:00");
+    expect(parseLooseTime("17:15")).toBe("17:15");
+  });
+
+  it("rejects text that is not a time of day", () => {
+    expect(parseLooseTime("")).toBeNull();
+    expect(parseLooseTime("24:00")).toBeNull();
+    expect(parseLooseTime("12:60")).toBeNull();
+    expect(parseLooseTime("noon")).toBeNull();
+    expect(parseLooseTime("12345")).toBeNull();
   });
 });

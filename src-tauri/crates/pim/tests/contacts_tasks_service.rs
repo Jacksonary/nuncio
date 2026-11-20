@@ -6,7 +6,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use nuncio_core::models::{
     new_id, Contact, ContactField, ContactFieldType, ContactListQuery, Importance, MessageSummary,
-    StoredMessage, TaskInput, TaskQuery,
+    NewTaskFromMessage, StoredMessage, TaskInput, TaskQuery,
 };
 use nuncio_core::repo;
 use nuncio_core::traits::testing::NoopMailSender;
@@ -177,7 +177,7 @@ async fn task_commands_round_trip() {
 }
 
 #[tokio::test]
-async fn message_create_task_links_and_flags() {
+async fn message_create_task_links_without_flagging() {
     let (ctx, service) = service().await;
     let (message_id, folder_id) = ctx
         .db
@@ -198,8 +198,18 @@ async fn message_create_task_links_and_flags() {
         .await
         .expect("message");
 
+    let options = |mark_flagged: bool| NewTaskFromMessage {
+        title: "Quarterly report".into(),
+        notes: String::new(),
+        list_id: "local-tasks".into(),
+        due_date: Some("2026-11-12".into()),
+        reminder_at: None,
+        my_day_date: Some("2026-11-12".into()),
+        mark_flagged,
+    };
+
     let task = service
-        .message_create_task(&message_id)
+        .message_create_task(&message_id, options(false))
         .await
         .expect("task");
     assert_eq!(task.title, "Quarterly report");
@@ -215,7 +225,9 @@ async fn message_create_task_links_and_flags() {
         })
         .await
         .expect("message");
-    assert!(message.summary.flagged);
+    // Flagging is opt-in: creating a task must not change the mail unless the
+    // dialog's checkbox was ticked.
+    assert!(!message.summary.flagged);
 
     let ops = ctx
         .db
@@ -234,4 +246,104 @@ async fn message_create_task_links_and_flags() {
         .expect("query");
     assert!(tasks.iter().any(|item| item.id == task.id));
     let _ = folder_id;
+}
+
+#[tokio::test]
+async fn message_create_task_flags_only_when_asked() {
+    let (ctx, service) = service().await;
+    let message_id = ctx
+        .db
+        .write(|conn| {
+            let folder = repo::folders::create(conn, "local", None, "Inbox")?;
+            let summary =
+                MessageSummary::new(new_id(), "local", folder.id.clone(), "thread-f", Utc::now());
+            let mut stored = StoredMessage::new(summary);
+            stored.summary.subject = "Please flag".into();
+            repo::messages::upsert(conn, &stored)?;
+            Ok(stored.summary.id.clone())
+        })
+        .await
+        .expect("message");
+
+    service
+        .message_create_task(
+            &message_id,
+            NewTaskFromMessage {
+                title: String::new(),
+                notes: String::new(),
+                list_id: "local-tasks".into(),
+                due_date: None,
+                reminder_at: None,
+                my_day_date: None,
+                mark_flagged: true,
+            },
+        )
+        .await
+        .expect("task");
+
+    let message = ctx
+        .db
+        .read({
+            let id = message_id.clone();
+            move |conn| repo::messages::get_required(conn, &id)
+        })
+        .await
+        .expect("message");
+    assert!(message.summary.flagged);
+}
+
+#[tokio::test]
+async fn soft_deleted_message_drops_the_task_link() {
+    let (ctx, service) = service().await;
+    let message_id = ctx
+        .db
+        .write(|conn| {
+            let folder = repo::folders::create(conn, "local", None, "Inbox")?;
+            let summary =
+                MessageSummary::new(new_id(), "local", folder.id.clone(), "thread-d", Utc::now());
+            let mut stored = StoredMessage::new(summary);
+            stored.summary.subject = "Deleted later".into();
+            repo::messages::upsert(conn, &stored)?;
+            Ok(stored.summary.id.clone())
+        })
+        .await
+        .expect("message");
+
+    let task = service
+        .message_create_task(
+            &message_id,
+            NewTaskFromMessage {
+                title: "Keep the task".into(),
+                notes: String::new(),
+                list_id: "local-tasks".into(),
+                due_date: None,
+                reminder_at: None,
+                my_day_date: None,
+                mark_flagged: false,
+            },
+        )
+        .await
+        .expect("task");
+
+    // Deleting the mail only hides the row; the task must stop pointing at it.
+    ctx.db
+        .write({
+            let id = message_id.clone();
+            move |conn| repo::messages::delete_local(conn, &[id], false)
+        })
+        .await
+        .expect("delete");
+
+    let tasks = service
+        .task_query(TaskQuery::list("local-tasks", "2026-11-12"))
+        .await
+        .expect("query");
+    let stored = tasks.iter().find(|item| item.id == task.id).expect("task");
+    assert!(stored.linked_message_id.is_none(), "stale link must be cleared");
+
+    let counts = service
+        .task_smart_counts("2026-11-12".into())
+        .await
+        .expect("counts");
+    assert_eq!(counts.flagged_email, 0, "deleted mail must not count");
 }

@@ -77,6 +77,25 @@ async fn initialize(app: &AppHandle) -> nuncio_core::Result<AppState> {
     let mail = MailService::new(ctx.clone());
     let pim = PimService::new(ctx.clone(), Arc::new(mail.clone()))?;
 
+    // Servers that cannot push (Graph, IMAP without IDLE) are polled. Poll at
+    // 30 s while the window is focused and fall back to the configured
+    // cadence (2 min) otherwise, so a background app does not wake the CPU
+    // (or the network) for nothing.
+    if let Some(window) = app.get_webview_window("main") {
+        window.on_window_event(|event| {
+            if let tauri::WindowEvent::Focused(focused) = event {
+                nuncio_mail::set_poll_override_secs(if *focused { 30 } else { 0 });
+            }
+        });
+        // The focus event only fires on a change; a window that starts focused
+        // would otherwise keep the background cadence until the first blur.
+        nuncio_mail::set_poll_override_secs(if window.is_focused().unwrap_or(false) {
+            30
+        } else {
+            0
+        });
+    }
+
     Ok(AppState::new(
         app.clone(),
         ctx,

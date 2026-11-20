@@ -19,6 +19,9 @@ pub struct RemoteTaskList {
     pub name: String,
     pub color: Option<String>,
     pub read_only: bool,
+    /// Provider-reported built-in marker (`none`, `defaultList`,
+    /// `flaggedEmails`). Built-in lists cannot be renamed or deleted.
+    pub well_known_list_name: String,
 }
 
 impl RemoteTaskList {
@@ -30,6 +33,7 @@ impl RemoteTaskList {
             name: name.into(),
             color: None,
             read_only: false,
+            well_known_list_name: nuncio_core::models::WELL_KNOWN_NONE.to_string(),
         }
     }
 }
@@ -205,11 +209,14 @@ pub trait TaskProvider: Send + Sync {
     /// Create a sub-step on the provider (Google subtask, Graph checklist
     /// item).  `None` means the provider stores steps inside the task payload
     /// (CalDAV).
+    /// Create a subtask. `previous` is the sibling it should follow, for
+    /// providers whose API takes an explicit position (Google Tasks).
     async fn create_step(
         &self,
         _account: &Account,
         _list: &RemoteTaskList,
         _parent: &RemoteTaskRef,
+        _previous: Option<&str>,
         _step: &TaskStep,
     ) -> Result<Option<RemoteWriteResult>> {
         Ok(None)
