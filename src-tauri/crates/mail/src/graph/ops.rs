@@ -30,6 +30,7 @@ use reqwest::header::CONTENT_TYPE;
 use reqwest::{Response, StatusCode};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
+use std::future::Future;
 use tracing::{debug, warn};
 
 use super::GraphMailClient;
@@ -55,6 +56,85 @@ const MAX_FOLDER_PAGES: usize = 500;
 #[derive(Debug, Deserialize)]
 struct IdResponse {
     id: String,
+}
+
+/// The folder a message currently belongs to, plus the draft flag.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MessageFolder {
+    parent_folder_id: Option<String>,
+    is_draft: Option<bool>,
+}
+
+/// What a targeted `GET /me/messages/{id}` proved about a message.
+///
+/// A 404 and a 200 without `parentFolderId` are *not* interchangeable: only
+/// the former says the id is unreachable. Collapsing both to `None` made a
+/// response that merely omitted the field look like a successful delete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MessageFolderState {
+    /// Graph answered 404: the id is not reachable. This is **not** a delete
+    /// receipt - a moved message also changes id, so the copy may still exist
+    /// under a new id. Callers must keep the outcome unknown.
+    Gone,
+    /// Graph answered 200 and named the folder that currently holds it, and
+    /// reported whether it is still a draft.
+    InFolder {
+        folder_id: String,
+        /// `None` means the field was omitted; the caller cannot confirm the
+        /// row is still a draft.
+        is_draft: Option<bool>,
+    },
+    /// Graph answered 200 but omitted `parentFolderId`. That is no evidence
+    /// about the message's location or existence; the caller must keep the
+    /// outcome unknown and verify again later.
+    Unverified,
+}
+
+impl MessageFolderState {
+    fn from_parent_folder(parent_folder_id: Option<String>, is_draft: Option<bool>) -> Self {
+        match parent_folder_id {
+            Some(folder_id) => Self::InFolder {
+                folder_id,
+                is_draft,
+            },
+            None => Self::Unverified,
+        }
+    }
+}
+
+/// Where Graph says a message currently lives.
+///
+/// A refused permanent delete must not drop the local identity: Microsoft may
+/// also have executed the delete before the failure surfaced, and the delta
+/// cursor cannot be relied on to tell us (an unchanged folder produces no
+/// delta). This targeted GET answers the question directly.
+///
+/// [`MessageFolderState::Gone`] means the id is unreachable (404). It is **not**
+/// a delete receipt: a moved message gets a new Graph id, so the copy may still
+/// exist. Callers keep the outcome unknown; only a 2xx from the delete request
+/// itself settles it. A 200 that omits `parentFolderId` stays
+/// [`MessageFolderState::Unverified`] and is never treated as deletion
+/// evidence either. Any other error is returned unchanged and the caller keeps
+/// the row.
+pub async fn message_parent_folder(
+    client: &GraphMailClient,
+    ctx: &CoreContext,
+    account_id: &str,
+    remote_id: &str,
+) -> Result<MessageFolderState> {
+    let url = client.url(&format!(
+        "/me/messages/{}?$select=parentFolderId,isDraft",
+        GraphMailClient::encode(remote_id)
+    ));
+    match client.get::<MessageFolder>(ctx, account_id, &url).await {
+        Ok(message) => Ok(MessageFolderState::from_parent_folder(
+            message.parent_folder_id,
+            message.is_draft,
+        )),
+        Err(error) if error.code() == "notFound" => Ok(MessageFolderState::Gone),
+        Err(error) => Err(error),
+    }
 }
 
 /// One page of `GET /me/mailFolders/{id}/messages`.
@@ -150,16 +230,47 @@ pub async fn set_flags(
     read: Option<bool>,
     flagged: Option<bool>,
 ) -> Result<()> {
+    set_flags_checked(client, ctx, account_id, remote_id, read, flagged, || {
+        std::future::ready(Ok::<bool, AppError>(true))
+    })
+    .await
+    .map(|_| ())
+}
+
+/// [`set_flags`] with a last-moment eligibility check.
+///
+/// `guard` is invoked after the token is read and again after a 401 refresh,
+/// immediately before each actual PATCH (see
+/// [`GraphMailClient::send_authed_checked`]). It returns `Ok(false)` when the
+/// request must be skipped; the result is then `Ok(false)` and no PATCH was
+/// sent with valid evidence. A `true` result means the PATCH was executed and
+/// the provider accepted it.
+pub async fn set_flags_checked<C, Fut>(
+    client: &GraphMailClient,
+    ctx: &CoreContext,
+    account_id: &str,
+    remote_id: &str,
+    read: Option<bool>,
+    flagged: Option<bool>,
+    guard: C,
+) -> Result<bool>
+where
+    C: Fn() -> Fut,
+    Fut: Future<Output = Result<bool>>,
+{
     let Some(body) = flags_body(read, flagged) else {
-        return Ok(());
+        return Ok(true);
     };
     let url = client.url(&format!(
         "/me/messages/{}",
         GraphMailClient::encode(remote_id)
     ));
-    let response = client
-        .send_authed(ctx, account_id, |http| http.patch(&url).json(&body))
-        .await?;
+    let Some(response) = client
+        .send_authed_checked(ctx, account_id, |http| http.patch(&url).json(&body), guard)
+        .await?
+    else {
+        return Ok(false);
+    };
     expect_success(response).await?;
     debug!(
         account = account_id,
@@ -168,7 +279,7 @@ pub async fn set_flags(
         flagged = ?flagged,
         "updated Graph message flags"
     );
-    Ok(())
+    Ok(true)
 }
 
 /// Move one message to another folder and return the id Graph assigned to the
@@ -198,10 +309,20 @@ pub async fn move_message(
         .send_authed(ctx, account_id, |http| http.post(&url).json(&body))
         .await?;
     let response = expect_success(response).await?;
-    let moved: IdResponse = response
-        .json()
-        .await
-        .map_err(|error| invalid_json("moved message", error))?;
+    let moved: IdResponse = response.json().await.map_err(|error| {
+        // The move already returned 2xx: Graph accepted and executed it. A body
+        // that cannot be decoded only hides the *new id*; it is not a refusal,
+        // and recording the message as "not executed" would let undo move or
+        // restore a message that has already left its folder.
+        AppError::service(format!(
+            "Graph accepted the move but returned no usable message id: {error}"
+        ))
+    })?;
+    if moved.id.trim().is_empty() {
+        return Err(AppError::service(
+            "Graph accepted the move but returned an empty message id",
+        ));
+    }
     debug!(
         account = account_id,
         remote_id,
@@ -240,18 +361,34 @@ pub async fn delete_message(
     Ok(())
 }
 
+/// What a `permanentDelete` request proved.
+///
+/// A 2xx is the provider's delete **receipt**. A 404 only says the *id* is not
+/// reachable: the message may have been hard-deleted, but it may equally have
+/// been moved to a new Graph id. The caller must not treat the two as
+/// interchangeable, because erasing local state on a stale id loses a message
+/// that still exists elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermanentDeleteOutcome {
+    /// The provider accepted the hard delete (2xx).
+    Deleted,
+    /// The provider answered 404: the id is unreachable, not a receipt.
+    NotFound,
+}
+
 /// Permanently delete one message (the IMAP permanent-delete / expunge path).
 ///
 /// Graph exposes this as the `permanentDelete` action, not as a second DELETE:
 /// it moves the item into the mailbox dumpster's `purges` folder, where mail
 /// clients can no longer see it.  The request has no body and answers 204.
-/// A 404 is success for the same idempotency reason as [`delete_message`].
+/// A 404 is reported as [`PermanentDeleteOutcome::NotFound`] rather than
+/// success: see that type for why the caller must verify it.
 pub async fn permanent_delete_message(
     client: &GraphMailClient,
     ctx: &CoreContext,
     account_id: &str,
     remote_id: &str,
-) -> Result<()> {
+) -> Result<PermanentDeleteOutcome> {
     let url = client.url(&format!(
         "/me/messages/{}/permanentDelete",
         GraphMailClient::encode(remote_id)
@@ -260,15 +397,18 @@ pub async fn permanent_delete_message(
         .send_authed(ctx, account_id, |http| http.post(&url))
         .await?;
     if response.status() == StatusCode::NOT_FOUND {
-        debug!(account = account_id, remote_id, "message already gone");
-        return Ok(());
+        debug!(
+            account = account_id,
+            remote_id, "message id is not reachable"
+        );
+        return Ok(PermanentDeleteOutcome::NotFound);
     }
     expect_success(response).await?;
     debug!(
         account = account_id,
         remote_id, "permanently deleted Graph message"
     );
-    Ok(())
+    Ok(PermanentDeleteOutcome::Deleted)
 }
 
 /// Create a mail folder and return its Graph id.
@@ -476,10 +616,20 @@ pub async fn append_draft(
         })
         .await?;
     let response = expect_success(response).await?;
-    let created: IdResponse = response
-        .json()
-        .await
-        .map_err(|error| invalid_json("created draft", error))?;
+    let created: IdResponse = response.json().await.map_err(|error| {
+        // The request was accepted (2xx): the draft may exist even though the
+        // response body cannot be read. Reporting a protocol refusal here made
+        // the executor reset to `Idle` and POST a second copy, so this is an
+        // *unknown outcome*, not a definite rejection.
+        AppError::service(format!(
+            "Graph accepted the draft create but returned no usable message id: {error}"
+        ))
+    })?;
+    if created.id.trim().is_empty() {
+        return Err(AppError::service(
+            "Graph accepted the draft create but returned an empty message id",
+        ));
+    }
     debug!(
         account = account_id,
         draft = %created.id,
@@ -562,6 +712,30 @@ mod tests {
         assert_eq!(
             create_folder_body("2026", Some("parent-id")),
             json!({ "displayName": "2026", "parentFolderId": "parent-id" })
+        );
+    }
+
+    #[test]
+    fn a_missing_parent_folder_is_not_deletion_evidence() {
+        // A 200 that names the folder is a location, and carries the draft
+        // flag so a cleanup can require "still a draft".
+        assert_eq!(
+            MessageFolderState::from_parent_folder(Some("drafts".into()), Some(true)),
+            MessageFolderState::InFolder {
+                folder_id: "drafts".into(),
+                is_draft: Some(true)
+            }
+        );
+        // A 200 that omits the folder proves nothing about existence.
+        assert_eq!(
+            MessageFolderState::from_parent_folder(None, Some(true)),
+            MessageFolderState::Unverified
+        );
+        // Only the 404 path maps to `Gone` (see `message_parent_folder`), and
+        // even that is about reachability, not a delete receipt.
+        assert_ne!(
+            MessageFolderState::from_parent_folder(None, Some(true)),
+            MessageFolderState::Gone
         );
     }
 

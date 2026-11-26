@@ -263,6 +263,28 @@ export function snapDelta(minutes: number, step = SNAP_MINUTES): number {
   return Math.round(minutes / step) * step;
 }
 
+/**
+ * The range a create gesture (press and drag on empty time) commits to.
+ *
+ * A drag shorter than one snap step is a click: it creates the configured
+ * default duration anchored at the press point, exactly like Google Calendar
+ * and Outlook. The ghost preview must use this same range, otherwise a click
+ * shows a few-minute sliver while the event that appears in the dialog is the
+ * full default duration.
+ */
+export function createRange(
+  anchorMin: number,
+  currentMin: number,
+  defaultDurationMinutes: number,
+): { start: number; end: number } {
+  const min = Math.min(anchorMin, currentMin);
+  const max = Math.max(anchorMin, currentMin);
+  if (max - min >= SNAP_MINUTES) return { start: min, end: max };
+  const duration = Math.max(SNAP_MINUTES, defaultDurationMinutes);
+  const start = Math.min(min, 1440 - duration);
+  return { start, end: start + duration };
+}
+
 export function workHourBounds(settings: CalendarSettings): { start: number; end: number } {
   const start = parseTimeOfDay(settings.workHoursStart) ?? 9 * 60;
   const end = parseTimeOfDay(settings.workHoursEnd) ?? 18 * 60;

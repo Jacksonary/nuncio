@@ -36,6 +36,13 @@ const hotkeys: HotkeyDefinition[] = [
     preventDefault: true,
   },
   {
+    id: "people.selectAll",
+    keys: "Mod+A",
+    handler: () => usePeopleUiStore.getState().requestSelectAll(),
+    enabled: noDialogOpen,
+    preventDefault: true,
+  },
+  {
     id: "people.delete",
     keys: "Delete",
     handler: () => {

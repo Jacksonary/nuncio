@@ -3,7 +3,7 @@
 use chrono::{Duration, Utc};
 use nuncio_core::models::{FolderRole, MessageSummary};
 use nuncio_core::{CoreContext, Result};
-use tracing::debug;
+use tracing::info;
 
 use crate::rules;
 
@@ -26,6 +26,16 @@ pub async fn after_new_mail(
         && folder.role == FolderRole::Inbox
         && account.notifications_enabled
         && settings.notifications.enabled;
+    // A full scan is not "new mail": it is the first look at a folder, so it
+    // never notifies. Say so once in the log, otherwise a missing reminder is
+    // indistinguishable from a working one.
+    if initial && folder.role == FolderRole::Inbox && !new_messages.is_empty() {
+        info!(
+            account = %account.id,
+            count = new_messages.len(),
+            "initial sync: new mail not notified"
+        );
+    }
     if should_notify {
         let now = Utc::now();
         let cutoff = now - Duration::hours(24);
@@ -37,7 +47,7 @@ pub async fn after_new_mail(
             .cloned()
             .collect();
         if !items.is_empty() {
-            debug!(account = %account.id, count = items.len(), "notifying new mail");
+            info!(account = %account.id, count = items.len(), "notifying new mail");
             ctx.notifier.new_mail(account, &items);
         }
     }

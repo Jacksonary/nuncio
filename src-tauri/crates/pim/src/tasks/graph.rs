@@ -1017,12 +1017,18 @@ impl TaskProvider for GraphTasksProvider {
                 etag: item.etag.clone(),
                 parent_remote_id: None,
                 steps_complete,
+                // Graph ids are real provider identifiers, never href-derived.
+                uid_is_derived: false,
             });
         }
         Ok(TaskDelta {
             tasks,
             deleted_remote_ids,
             deleted_hrefs: Vec::new(),
+            // The delta endpoint is not an href listing; a full sync
+            // re-delivers every task, so presence comes from `seen_remote`.
+            listed_hrefs: Vec::new(),
+            incomplete: false,
             sync_token: delta_link,
             ctag: None,
             full_sync,
@@ -1044,6 +1050,7 @@ impl TaskProvider for GraphTasksProvider {
             remote_id: Some(created.id).filter(|id| !id.is_empty()),
             etag: created.etag,
             href: None,
+            uid_is_derived: false,
         })
     }
 
@@ -1053,6 +1060,7 @@ impl TaskProvider for GraphTasksProvider {
         list: &RemoteTaskList,
         current: &RemoteTaskRef,
         task: &Task,
+        _assigned_uid: Option<&str>,
     ) -> Result<RemoteWriteResult> {
         let Some(id) = current.remote_id.clone() else {
             return Err(AppError::conflict("task has no Graph id"));
@@ -1072,6 +1080,7 @@ impl TaskProvider for GraphTasksProvider {
             remote_id: Some(updated.id).filter(|id| !id.is_empty()).or(Some(id)),
             etag: updated.etag,
             href: None,
+            uid_is_derived: false,
         })
     }
 
@@ -1112,6 +1121,7 @@ impl TaskProvider for GraphTasksProvider {
             remote_id: Some(created.id).filter(|id| !id.is_empty()),
             etag: None,
             href: None,
+            uid_is_derived: false,
         }))
     }
 
@@ -1247,8 +1257,9 @@ mod tests {
             tasks.well_known_list_name,
             nuncio_core::models::WELL_KNOWN_DEFAULT
         );
-        let flagged =
-            parse(r#"{"id":"l2","displayName":"Flagged Emails","wellknownListName":"flaggedEmails"}"#);
+        let flagged = parse(
+            r#"{"id":"l2","displayName":"Flagged Emails","wellknownListName":"flaggedEmails"}"#,
+        );
         assert_eq!(
             flagged.well_known_list_name,
             nuncio_core::models::WELL_KNOWN_FLAGGED_EMAILS

@@ -33,6 +33,8 @@ pub mod service;
 mod status;
 pub mod store;
 pub mod tasks;
+#[cfg(test)]
+mod test_support;
 pub mod util;
 pub mod webcal;
 

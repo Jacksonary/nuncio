@@ -8,8 +8,8 @@ use tracing::{debug, info, warn};
 
 use nuncio_core::events;
 use nuncio_core::models::{
-    AddressBook, AppInfo, Calendar, Contact, Folder, Platform, StorageUsage,
-    StoredEvent, Task, TaskList,
+    AddressBook, AppInfo, Calendar, Contact, Folder, Platform, StorageUsage, StoredEvent, Task,
+    TaskList,
 };
 use nuncio_core::repo::pim_maps::PimMapRecord;
 use nuncio_core::{repo, AppError};
@@ -81,7 +81,11 @@ pub async fn app_clear_cache(state: State<'_, AppState>) -> nuncio_core::Result<
     // match on the directory itself rather than a hard-coded `/` prefix.
     let staging_like = format!(
         "{}%",
-        paths.staging_dir().display().to_string().replace('\'', "''")
+        paths
+            .staging_dir()
+            .display()
+            .to_string()
+            .replace('\'', "''")
     );
     let body_sql = format!(
         "SELECT body_path FROM message
@@ -182,7 +186,12 @@ async fn prune_empty_dirs(root: &std::path::Path) {
             continue;
         };
         while let Ok(Some(entry)) = entries.next_entry().await {
-            if entry.file_type().await.map(|kind| kind.is_dir()).unwrap_or(false) {
+            if entry
+                .file_type()
+                .await
+                .map(|kind| kind.is_dir())
+                .unwrap_or(false)
+            {
                 stack.push(entry.path());
             }
         }

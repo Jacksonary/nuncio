@@ -1,9 +1,6 @@
 /** Data: storage usage, cache, encrypted backup export/import, logs. */
 import { useState } from "react";
 import {
-  ArrowDownload24Regular,
-  ArrowUpload24Regular,
-  DocumentArrowDown24Regular,
   FolderOpen24Regular,
   HardDrive24Regular,
 } from "@fluentui/react-icons";
@@ -208,16 +205,12 @@ export function DataPage({ onBack }: { onBack: () => void }) {
       <Section title={t("settings.data.backup")} hint={t("settings.data.backupHint")}>
         <Card>
           <SettingRow label={t("settings.data.export")} description={t("settings.data.exportDesc")}>
-            <Button
-              appearance="primary"
-              icon={<ArrowDownload24Regular />}
-              onClick={() => setBackupMode("export")}
-            >
+            <Button appearance="primary" onClick={() => setBackupMode("export")}>
               {t("settings.data.exportAction")}
             </Button>
           </SettingRow>
           <SettingRow label={t("settings.data.import")} description={t("settings.data.importDesc")}>
-            <Button icon={<ArrowUpload24Regular />} onClick={() => setBackupMode("import")}>
+            <Button onClick={() => setBackupMode("import")}>
               {t("settings.data.importAction")}
             </Button>
           </SettingRow>
@@ -231,11 +224,7 @@ export function DataPage({ onBack }: { onBack: () => void }) {
             label={t("settings.data.exportVcf")}
             description={t("settings.data.exportVcfDesc")}
           >
-            <Button
-              icon={<ArrowDownload24Regular />}
-              loading={exportingContacts}
-              onClick={() => void exportAllContacts()}
-            >
+            <Button loading={exportingContacts} onClick={() => void exportAllContacts()}>
               {t("settings.data.exportVcfAction")}
             </Button>
           </SettingRow>
@@ -252,7 +241,6 @@ export function DataPage({ onBack }: { onBack: () => void }) {
               disabled={calendarOptions.length === 0}
             />
             <Button
-              icon={<ArrowDownload24Regular />}
               loading={exportingCalendar}
               disabled={!activeCalendarId}
               onClick={() => void exportCalendar()}
@@ -388,7 +376,6 @@ function BackupDialog({ mode, onClose, busy, setBusy, onImported }: BackupDialog
       open={mode !== null}
       onClose={close}
       title={exportMode ? t("settings.data.exportTitle") : t("settings.data.importTitle")}
-      icon={exportMode ? <DocumentArrowDown24Regular /> : <ArrowUpload24Regular />}
       dismissible={!busy}
       closeOnBackdrop={!busy}
       footer={

@@ -3,7 +3,9 @@
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use crate::error::AppError;
-use crate::models::{new_id, Address, Draft, DraftAttachment, Importance, ReplyMode};
+use crate::models::{
+    new_id, Address, Draft, DraftAttachment, Importance, RemoteDraftIdentity, ReplyMode,
+};
 use crate::repo::{
     get_bool, get_opt_dt, get_opt_string, get_string, json_opt, json_or_default, json_text,
     now_string,
@@ -13,7 +15,7 @@ use crate::Result;
 const COLUMNS: &str = "\
     id, account_id, identity_id, from_json, to_json, cc_json, bcc_json, subject, html,\
     attachments_json, reply_mode, source_message_id, in_reply_to, references_json, importance,\
-    request_read_receipt, remote_draft_message_id, updated_at";
+    request_read_receipt, remote_draft_message_id, remote_draft_json, sync_suppressed, updated_at";
 
 fn row_to_draft(row: &Row<'_>) -> Result<Draft> {
     let from: Option<String> = row.get("from_json")?;
@@ -51,6 +53,13 @@ fn row_to_draft(row: &Row<'_>) -> Result<Draft> {
         importance: importance.parse().unwrap_or(Importance::Normal),
         request_read_receipt: get_bool(row, "request_read_receipt")?,
         remote_draft_message_id: get_opt_string(row, "remote_draft_message_id")?,
+        remote_draft: get_opt_string(row, "remote_draft_json")?
+            .map(|json| serde_json::from_str::<RemoteDraftIdentity>(&json))
+            .transpose()
+            .map_err(|error| {
+                AppError::internal(format!("invalid draft remote identity: {error}"))
+            })?,
+        sync_suppressed: get_bool(row, "sync_suppressed")?,
         updated_at: get_opt_dt(row, "updated_at")?,
     })
 }
@@ -96,8 +105,9 @@ pub fn save(conn: &Connection, draft: &Draft) -> Result<Draft> {
         "INSERT INTO draft (
             id, account_id, identity_id, from_json, to_json, cc_json, bcc_json, subject, html,
             attachments_json, reply_mode, source_message_id, in_reply_to, references_json,
-            importance, request_read_receipt, remote_draft_message_id, created_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+            importance, request_read_receipt, remote_draft_message_id, remote_draft_json,
+            sync_suppressed, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
          ON CONFLICT(id) DO UPDATE SET
              account_id = excluded.account_id,
              identity_id = excluded.identity_id,
@@ -115,6 +125,8 @@ pub fn save(conn: &Connection, draft: &Draft) -> Result<Draft> {
              importance = excluded.importance,
              request_read_receipt = excluded.request_read_receipt,
              remote_draft_message_id = excluded.remote_draft_message_id,
+             remote_draft_json = excluded.remote_draft_json,
+             sync_suppressed = excluded.sync_suppressed,
              updated_at = excluded.updated_at",
         params![
             id,
@@ -134,6 +146,15 @@ pub fn save(conn: &Connection, draft: &Draft) -> Result<Draft> {
             draft.importance.as_str(),
             draft.request_read_receipt as i64,
             draft.remote_draft_message_id,
+            draft
+                .remote_draft
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|error| {
+                    AppError::internal(format!("cannot encode remote draft identity: {error}"))
+                })?,
+            draft.sync_suppressed as i64,
             created_at,
             updated_at
         ],
@@ -151,6 +172,40 @@ fn get_dt_from_string(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 pub fn delete(conn: &Connection, id: &str) -> Result<()> {
     conn.execute("DELETE FROM draft WHERE id = ?1", params![id])?;
     Ok(())
+}
+
+/// Stop retrying remote sync for a draft the user chose to keep locally.
+///
+/// Returns the number of rows changed so a caller can refuse a stale request
+/// for a draft that no longer exists.
+pub fn set_sync_suppressed(conn: &Connection, id: &str, suppressed: bool) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE draft SET sync_suppressed = ?2, updated_at = ?3 WHERE id = ?1",
+        params![id, suppressed as i64, now_string()],
+    )?)
+}
+
+/// Replace the pinned remote identity of a draft. A missing draft is a no-op.
+pub fn set_remote_draft(
+    conn: &Connection,
+    id: &str,
+    identity: Option<&RemoteDraftIdentity>,
+) -> Result<usize> {
+    let json = identity
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| {
+            AppError::internal(format!("cannot encode remote draft identity: {error}"))
+        })?;
+    Ok(conn.execute(
+        "UPDATE draft SET remote_draft_json = ?2, updated_at = ?3 WHERE id = ?1",
+        params![id, json, now_string()],
+    )?)
+}
+
+/// Whether the draft still exists and is suppressed from remote sync.
+pub fn is_sync_suppressed(conn: &Connection, id: &str) -> Result<bool> {
+    Ok(get(conn, id)?.is_some_and(|draft| draft.sync_suppressed))
 }
 
 pub fn set_remote_id(conn: &Connection, id: &str, remote_id: Option<&str>) -> Result<()> {

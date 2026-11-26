@@ -258,6 +258,11 @@ export interface MessageSummary {
   threadCount: number;
   /** Unread messages in the conversation. */
   threadUnread: number;
+  /**
+   * For a draft projection: `pendingConfirmation` while the remote copy is
+   * unverified, `localOnly` after the user chose to keep it local.
+   */
+  draftSyncState?: "pendingConfirmation" | "localOnly" | null;
 }
 
 export type MailScope =
@@ -383,6 +388,20 @@ export interface DraftAttachment {
   contentId: string | null;
 }
 
+/**
+ * Durable identity of the server copy a draft supersedes. Only `confirmed`
+ * (an APPENDUID for this client's APPEND) and `explicit` (the user opened that
+ * exact server draft) authorize a later delete; `candidate` must be kept.
+ */
+export interface RemoteDraftIdentity {
+  attribution: "none" | "confirmed" | "explicit" | "candidate";
+  folderId: Id | null;
+  uid: number | null;
+  uidvalidity: number | null;
+  /** Local message row that projected the copy when the identity was pinned. */
+  projectionId: Id | null;
+}
+
 export interface Draft {
   /** Local draft id (null until first save). */
   id: Id | null;
@@ -405,6 +424,10 @@ export interface Draft {
   requestReadReceipt: boolean;
   /** Remote message id of the draft in the Drafts folder, if synced. */
   remoteDraftMessageId: Id | null;
+  /** Pinned identity of the server copy this draft supersedes. */
+  remoteDraft?: RemoteDraftIdentity | null;
+  /** The user chose to keep this draft local after an unconfirmed sync. */
+  syncSuppressed?: boolean;
   updatedAt: IsoDateTime | null;
 }
 
@@ -830,6 +853,18 @@ export interface SyncStatus {
   state: SyncState;
   /** e.g. { done: 120, total: 800 } during initial sync. */
   progress: { done: number; total: number } | null;
+  /**
+   * True while a provider imports a folder's first full pass. A large Graph
+   * mailbox can take several paginated rounds, so the UI says the work is
+   * ongoing instead of implying the sync is stuck.
+   */
+  fullSync: boolean;
+  /**
+   * Monotonic sequence assigned when the backend commits a change. Events are
+   * published after the backend releases its lock, so they can arrive out of
+   * order; keep the snapshot with the highest `seq` per account+module.
+   */
+  seq: number;
   message: string | null;
   lastSyncAt: IsoDateTime | null;
 }

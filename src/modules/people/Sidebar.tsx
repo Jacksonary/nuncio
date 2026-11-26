@@ -6,8 +6,6 @@ import { useCallback, useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   Add16Regular,
-  ArrowExport16Regular,
-  ArrowImport16Regular,
   BookContacts20Regular,
   ContactCard20Regular,
   Edit16Regular,
@@ -222,14 +220,12 @@ export function PeopleSidebar() {
       {
         id: "import",
         label: t("people.sidebar.importIntoBook"),
-        icon: <ArrowImport16Regular />,
         disabled: book.isReadOnly,
         onSelect: () => openImport(book.id),
       },
       {
         id: "export",
         label: t("people.sidebar.exportBook"),
-        icon: <ArrowExport16Regular />,
         onSelect: () =>
           void exportContactsByScope({
             addressBookId: book.id,
@@ -380,22 +376,20 @@ export function PeopleSidebar() {
         <Button
           size="small"
           appearance="subtle"
-          icon={<ArrowImport16Regular />}
           onClick={() => openImport(selection.addressBookId)}
           disabled={writableAddressBooks(books).length === 0}
           title={t("people.sidebar.import")}
         >
-          {t("people.import.title")}
+          {t("people.sidebar.importAction")}
         </Button>
         <Button
           size="small"
           appearance="subtle"
-          icon={<ArrowExport16Regular />}
           onClick={exportCurrent}
           title={t("people.sidebar.exportCurrent")}
           disabled={books.length === 0}
         >
-          {t("people.export.title")}
+          {t("people.sidebar.exportAction")}
         </Button>
       </div>
 

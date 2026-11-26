@@ -237,7 +237,8 @@
   font-variant-numeric: normal;
 }
 
+/* Same focus language as `Input`: the field's own border turns accent. */
 .timeInput:focus-visible {
-  outline: 2px solid var(--focus-outline);
-  outline-offset: -2px;
+  border-color: var(--accent);
+  outline: none;
 }

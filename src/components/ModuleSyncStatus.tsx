@@ -59,9 +59,11 @@ function attention(kind: AttentionKind, entries: SyncStatus[]): SyncPresentation
  * Precedence puts the states that need attention above routine syncing so a
  * transient sync on one account cannot hide a broken one on another.
  *
- * `syncing` is deliberately NOT rendered: the module's own refresh button
+ * A routine `syncing` status is NOT rendered: the module's own refresh button
  * already spins during a sync, and a second spinner plus a "syncing…" caption
- * beside it says the same thing twice.
+ * beside it says the same thing twice. The exception is a first full import
+ * (`fullSync`), which can run long enough that the user needs to be told the
+ * work is expected rather than stalled.
  */
 export function presentationFor(
   statuses: SyncStatus[],
@@ -81,9 +83,15 @@ export function presentationFor(
 
   // Read the state rather than rendering it: the refresh button shows the
   // in-flight sync, so this only needs to suppress the attention states while
-  // a sync is running.
-  if (inState("syncing").length > 0) {
-    return { kind: "syncing", labelKey: null, detail: null };
+  // a sync is running. A first full import is the one case worth a caption,
+  // because it can legitimately take several rounds on a large mailbox.
+  const syncing = inState("syncing");
+  if (syncing.length > 0) {
+    return {
+      kind: "syncing",
+      labelKey: syncing.some((status) => status.fullSync) ? "sync.fullSync" : null,
+      detail: null,
+    };
   }
 
   // No entry at all means the module has never synced. That is not a problem
@@ -173,8 +181,17 @@ export function ModuleSyncStatus({ module, accountIds, className }: ModuleSyncSt
   const triggerRef = useRef<HTMLButtonElement | null>(null);
 
   // Nothing to say while idle, and the refresh button already spins during a
-  // sync — rendering a second spinner and a caption beside it is noise.
-  if (presentation.kind === "idle" || presentation.kind === "syncing") return null;
+  // routine sync — rendering a second spinner and a caption beside it is noise.
+  if (presentation.kind === "idle") return null;
+  if (presentation.kind === "syncing") {
+    if (!presentation.labelKey) return null;
+    return (
+      <span className={cn(styles.status, styles.syncing, className)} role="status">
+        <span className={styles.dot} aria-hidden="true" />
+        <span className={styles.label}>{t(presentation.labelKey)}</span>
+      </span>
+    );
+  }
 
   const tone = presentation.kind === "retrying" ? styles.warning : styles.danger;
   const label = presentation.labelKey ? t(presentation.labelKey) : "";

@@ -364,10 +364,7 @@ mod tests {
         // `RSS 源` is the legacy RSS folder; Graph reports no wellKnownName for
         // it, so it must not be caught by a name-based rule.
         assert!(!is_hidden_system_folder(&graph_folder(
-            "id",
-            "RSS 源",
-            None,
-            0
+            "id", "RSS 源", None, 0
         )));
     }
 

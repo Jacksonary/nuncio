@@ -30,5 +30,7 @@ webpki-roots = { workspace = true }
 lettre = { workspace = true }
 futures = { workspace = true }
 base64 = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 regex = { workspace = true }
 bytes = { workspace = true }

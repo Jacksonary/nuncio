@@ -1,7 +1,7 @@
 //! Folder commands: listing, unified counts, create/rename/move/delete,
 //! favorites/sync flags, mark-all-read and emptying trash/junk.
 
-use nuncio_core::models::{Folder, FolderRole, ProviderKind, UnifiedCounts};
+use nuncio_core::models::{Folder, FolderRole, NewPendingOp, ProviderKind, UnifiedCounts};
 use nuncio_core::{events, repo, AppError, Result};
 use tracing::debug;
 
@@ -285,31 +285,62 @@ impl MailService {
     /// Mark every message in the folder as read (server `STORE 1:* +FLAGS`).
     pub async fn folder_mark_all_read(&self, id: &str) -> Result<()> {
         let folder = self.folder(id).await?;
-        let id_owned = folder.id.clone();
+        let account = self.account(&folder.account_id).await?;
+        let remote = !is_local_only(account.provider);
+        let folder_id = folder.id.clone();
+        let account_id = account.id.clone();
+        // One id serves as both the queued operation id and the writer owner.
+        // The executor can then tell, per message, whether this folder-wide
+        // intent is still the newest `seen` write.
+        let writer_id = nuncio_core::models::new_id();
+        let writer_for_db = writer_id.clone();
+        let writer_for_op = writer_id.clone();
+        let payload_json = if remote {
+            Some(
+                serde_json::to_value(FolderMarkReadOp {
+                    folder_id: folder_id.clone(),
+                })
+                .map_err(|error| {
+                    AppError::internal(format!("cannot encode folderMarkRead: {error}"))
+                })?,
+            )
+        } else {
+            None
+        };
+        // The local value, the writer rows and the queue row are one
+        // transaction. A user action that commits just after this one records
+        // its own writer, so the retried folder operation skips that row.
         self.inner
             .ctx
             .db
             .write(move |db| {
-                repo::messages::mark_all_read(db, &id_owned)?;
+                let ids = repo::messages::ids_in_folder(db, &folder_id)?;
+                repo::messages::mark_all_read(db, &folder_id)?;
+                for message_id in &ids {
+                    repo::messages::record_flag_writer(
+                        db,
+                        message_id,
+                        "seen",
+                        &writer_for_db,
+                        Some(true),
+                        "folderMarkRead",
+                    )?;
+                }
+                if let Some(payload) = payload_json {
+                    repo::pending_ops::enqueue_with_id(
+                        db,
+                        &writer_for_op,
+                        NewPendingOp::new(
+                            account_id,
+                            KIND_FOLDER_MARK_READ,
+                            payload,
+                            "Mark folder as read",
+                        ),
+                    )?;
+                }
                 Ok(())
             })
             .await?;
-        let account = self.account(&folder.account_id).await?;
-        if !is_local_only(account.provider) {
-            let payload = FolderMarkReadOp {
-                folder_id: folder.id.clone(),
-            };
-            ops::enqueue_operation(
-                &self.inner.ctx,
-                &account.id,
-                KIND_FOLDER_MARK_READ,
-                serde_json::to_value(payload).map_err(|error| {
-                    AppError::internal(format!("cannot encode folderMarkRead: {error}"))
-                })?,
-                "Mark folder as read",
-            )
-            .await?;
-        }
         self.emit_changed(
             &folder.account_id,
             vec![folder.id],
@@ -321,7 +352,11 @@ impl MailService {
     }
 
     /// Permanently delete everything in a trash/junk folder.
-    pub async fn folder_empty(&self, id: &str) -> Result<()> {
+    ///
+    /// Returns `false` when the messages could not be removed from the server
+    /// (no UIDPLUS): only their `\Deleted` flag was set and the local rows were
+    /// left untouched, so the caller must not report the folder as emptied.
+    pub async fn folder_empty(&self, id: &str) -> Result<bool> {
         let folder = self.folder(id).await?;
         if !matches!(folder.role, FolderRole::Trash | FolderRole::Junk) {
             return Err(AppError::invalid_input(
@@ -329,7 +364,7 @@ impl MailService {
             ));
         }
         let account = self.account(&folder.account_id).await?;
-        if is_local_only(account.provider) {
+        let expunged = if is_local_only(account.provider) {
             let folder_id = folder.id.clone();
             self.inner
                 .ctx
@@ -339,6 +374,7 @@ impl MailService {
                     Ok(())
                 })
                 .await?;
+            true
         } else if crate::graph::uses_graph(&account) {
             // Graph has no EXPUNGE. Deleting every message one by one is the
             // only equivalent, and it is expensive enough that the user should
@@ -355,7 +391,7 @@ impl MailService {
                 .expunge_folder(&account.id, &folder.id)
                 .await
             {
-                Ok(()) => {}
+                Ok(expunged) => expunged,
                 Err(error) if matches!(error.code(), "notFound" | "internal") => {
                     // Graph accounts never had an IMAP session to fall back to;
                     // connecting would surface an authentication error that has
@@ -365,35 +401,46 @@ impl MailService {
                     }
                     let mut connection =
                         crate::imap::connect_account(&self.inner.ctx, &account).await?;
-                    connection.select(&folder.remote_path).await?;
-                    crate::ops::executor::store(
-                        &mut connection,
-                        "1:*",
-                        "+FLAGS.SILENT (\\Deleted)",
-                    )
-                    .await?;
-                    crate::ops::executor::expire(&mut connection, "1:*").await?;
-                    let folder_id = folder.id.clone();
-                    self.inner
-                        .ctx
-                        .db
-                        .write(move |db| {
-                            repo::messages::delete_all_in_folder(db, &folder_id)?;
-                            Ok(())
-                        })
+                    // Same rule as the actor path: without a directed expunge
+                    // there is no safe way to empty the folder, so do nothing
+                    // and report `false` to the UI instead of flagging every
+                    // message `\Deleted`.
+                    if !connection.caps.directed_expunge() {
+                        false
+                    } else {
+                        connection.select(&folder.remote_path).await?;
+                        crate::ops::executor::store(
+                            &mut connection,
+                            "1:*",
+                            "+FLAGS.SILENT (\\Deleted)",
+                        )
                         .await?;
+                        crate::ops::executor::expire(&mut connection, "1:*").await?;
+                        let folder_id = folder.id.clone();
+                        self.inner
+                            .ctx
+                            .db
+                            .write(move |db| {
+                                repo::messages::delete_all_in_folder(db, &folder_id)?;
+                                Ok(())
+                            })
+                            .await?;
+                        true
+                    }
                 }
                 Err(error) => return Err(error),
             }
+        };
+        if expunged {
+            self.emit_changed(
+                &folder.account_id,
+                vec![folder.id],
+                Vec::new(),
+                events::MailChangeKind::Deleted,
+            );
+            self.update_badge().await;
         }
-        self.emit_changed(
-            &folder.account_id,
-            vec![folder.id],
-            Vec::new(),
-            events::MailChangeKind::Deleted,
-        );
-        self.update_badge().await;
-        Ok(())
+        Ok(expunged)
     }
 
     /// Synchronize a single folder immediately.
@@ -429,7 +476,10 @@ impl MailService {
 
     /// Load the next batch of older mail for a real folder (IMAP / Graph).
     /// POP3 and local accounts answer `{ loaded: 0, hasMore: false }`.
-    pub async fn folder_load_older(&self, id: &str) -> Result<nuncio_core::models::LoadOlderResult> {
+    pub async fn folder_load_older(
+        &self,
+        id: &str,
+    ) -> Result<nuncio_core::models::LoadOlderResult> {
         let folder = self.folder(id).await?;
         let account = self.account(&folder.account_id).await?;
         if is_local_only(account.provider) {

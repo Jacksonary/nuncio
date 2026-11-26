@@ -1,0 +1,16 @@
+-- Persist the identity source of every stored contact row.
+--
+-- Tombstones and create receipts already record whether their `remote_id` is a
+-- real provider UID or a placeholder derived from the href (`A.vcf`). The
+-- *local* row did not, so cleanup and upsert compared only the string values:
+-- a real UID that happened to equal a placeholder (and/or shared the resource
+-- URL) was treated as the same identity. Delete-cleanup could then remove a
+-- replacement card, and an upsert could merge two different cards into one.
+--
+-- Default 0 keeps every pre-existing row a real UID, matching how the tombstone
+-- and receipt columns were introduced (derived identities are written
+-- explicitly by the sync paths from now on). Rows written before this migration
+-- whose identity was really href-derived therefore stay "real" until the next
+-- provider delivery overwrites the flag; treating them as real can retain a
+-- stale row but never deletes a live one.
+ALTER TABLE contact ADD COLUMN uid_is_derived INTEGER NOT NULL DEFAULT 0;

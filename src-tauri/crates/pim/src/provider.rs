@@ -124,6 +124,21 @@ pub struct EventDelta {
     /// `true` when the provider performed a full resync: the sync engine then
     /// removes local provider events that were not seen in this batch.
     pub full_sync: bool,
+    /// The provider named at least one object whose identity (ETag/body) could
+    /// not be read this round (for example a per-resource `503` or a failed
+    /// property). The batch is still applied, but the cursor must not advance:
+    /// the unread change has to be requested again, and a deletion must never
+    /// be inferred from an unreadable listing entry.
+    pub incomplete: bool,
+    /// When the request that produced this batch started.
+    ///
+    /// The sync engine sets it *before* reading the cursor and calling the
+    /// provider. The apply transaction uses it to detect objects written or
+    /// settled locally while the request was in flight: such a batch describes
+    /// an older server state and must not overwrite the local row. `None`
+    /// (direct unit-test calls) is treated as "every operation may have raced",
+    /// which is the safe choice for that helper.
+    pub window_start: Option<DateTime<Utc>>,
 }
 
 /// Calendar backend.  Implementations are cheap to construct.

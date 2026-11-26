@@ -757,6 +757,7 @@ impl ContactProvider for GraphContactsProvider {
                 remote_id: Some(item.id.clone()),
                 href: None,
                 etag: item.etag.clone().or_else(|| item.change_key.clone()),
+                uid_is_derived: false,
                 raw_vcard: None,
                 group_names,
             });
@@ -766,12 +767,15 @@ impl ContactProvider for GraphContactsProvider {
             contacts,
             deleted_remote_ids,
             deleted_hrefs: Vec::new(),
+            listed_hrefs: Vec::new(),
             groups: Vec::new(),
             groups_full: false,
             favorites_authoritative: false,
             sync_token: delta_link,
             ctag: None,
             full_sync,
+            incomplete: false,
+            window_start: None,
         })
     }
 
@@ -800,6 +804,7 @@ impl ContactProvider for GraphContactsProvider {
             remote_id,
             etag: created.etag.or(created.change_key),
             href: None,
+            uid_is_derived: false,
         })
     }
 
@@ -810,6 +815,7 @@ impl ContactProvider for GraphContactsProvider {
         current: &RemoteContactRef,
         contact: &Contact,
         group_names: &[String],
+        _assigned_uid: Option<&str>,
     ) -> Result<RemoteWriteResult> {
         let Some(id) = current.remote_id.clone() else {
             return Err(AppError::conflict("contact has no Graph id"));
@@ -834,6 +840,7 @@ impl ContactProvider for GraphContactsProvider {
             remote_id: Some(updated.id).filter(|id| !id.is_empty()).or(Some(id)),
             etag: updated.etag.or(updated.change_key),
             href: None,
+            uid_is_derived: false,
         })
     }
 

@@ -473,6 +473,7 @@ function RuleEditor({ rule, isNew, accounts, folders, onCancel, onSaved, onDelet
             {value.actions.length === 0 ? (
               <p className={styles.hint}>{t("settings.rules.noActions")}</p>
             ) : null}
+            <p className={styles.hint}>{t("settings.rules.orderHint")}</p>
           </div>
         </Card>
       </Section>

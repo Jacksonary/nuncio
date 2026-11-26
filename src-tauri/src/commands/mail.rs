@@ -91,7 +91,7 @@ pub async fn folder_mark_all_read(
 }
 
 #[tauri::command]
-pub async fn folder_empty(state: State<'_, AppState>, id: String) -> nuncio_core::Result<()> {
+pub async fn folder_empty(state: State<'_, AppState>, id: String) -> nuncio_core::Result<bool> {
     state.mail.folder_empty(&id).await
 }
 
@@ -160,6 +160,17 @@ pub async fn message_act_threads(
         .mail
         .message_act_threads(&account_id, &thread_ids, &action)
         .await
+}
+
+/// Retry the targeted server reconciliation for messages that the list shows
+/// with a `reconcileReason`. The call never erases anything by itself; it runs
+/// the same evidence-based sync pass again.
+#[tauri::command]
+pub async fn message_reconcile(
+    state: State<'_, AppState>,
+    ids: Vec<String>,
+) -> nuncio_core::Result<usize> {
+    state.mail.message_reconcile(&ids).await
 }
 
 /// Undo by the id returned from `message_act`; without one, the most recent
@@ -323,6 +334,18 @@ pub async fn compose_discard(
     draft_id: String,
 ) -> nuncio_core::Result<()> {
     state.mail.compose_discard(&draft_id).await
+}
+
+/// Keep a draft local after its remote copy could not be confirmed.
+///
+/// This stops the APPEND verification retries and queues no remote cleanup.
+/// Nothing is deleted on the server.
+#[tauri::command]
+pub async fn compose_keep_local_draft(
+    state: State<'_, AppState>,
+    message_id: String,
+) -> nuncio_core::Result<()> {
+    state.mail.compose_keep_local_draft(&message_id).await
 }
 
 #[tauri::command]

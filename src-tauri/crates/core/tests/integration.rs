@@ -595,7 +595,13 @@ fn search_cjk_body_and_structured_filters() {
     add_message(&db, &third);
 
     db.write_sync(|conn| {
-        repo::messages::set_body(conn, "m1", Some("/tmp/m1.eml"), Some("这是深度学习笔记"))?;
+        repo::messages::set_body(
+            conn,
+            "m1",
+            Some("/tmp/m1.eml"),
+            Some("这是深度学习笔记"),
+            None,
+        )?;
         Ok(())
     })
     .expect("body");
@@ -681,6 +687,211 @@ fn search_cjk_body_and_structured_filters() {
         Ok(())
     })
     .expect("search");
+}
+
+/// Moving a row locally and moving it optimistically are different states.
+///
+/// Only a move whose server operation was queued may clear the folder-local
+/// identity and set `target_pending`; a plain local move (Local/POP3, folder
+/// migration, rollback) must keep both, or every later action refuses it.
+#[test]
+fn plain_and_pending_moves_keep_distinct_identity_state() {
+    let db = setup();
+    add_account(&db, "acc", "me@example.com", true);
+    let inbox = add_folder(&db, "inbox", "acc", "INBOX", FolderRole::Inbox);
+    let archive = add_folder(&db, "archive", "acc", "Archive", FolderRole::Archive);
+    let mut message = make_message("m1", "acc", &inbox.id, "t1", ts(1, 9), "One", false, false);
+    message.uid = Some(42);
+    message.uidvalidity = Some(7);
+    add_message(&db, &message);
+
+    db.write_sync(|conn| {
+        repo::messages::move_to_folder(conn, &["m1".to_string()], &archive.id)?;
+        let moved = repo::messages::get_required(conn, "m1")?;
+        assert_eq!(moved.summary.folder_id, archive.id);
+        assert_eq!(moved.uid, Some(42), "a plain move keeps the source UID");
+        assert_eq!(moved.uidvalidity, Some(7));
+        assert!(
+            repo::messages::target_pending_ids(conn, &["m1".to_string()])?.is_empty(),
+            "a plain move must not wait for a target sync"
+        );
+
+        repo::messages::move_to_folder_pending(conn, &["m1".to_string()], &inbox.id)?;
+        let moved = repo::messages::get_required(conn, "m1")?;
+        assert_eq!(moved.summary.folder_id, inbox.id);
+        assert!(moved.uid.is_none(), "an optimistic move clears the UID");
+        assert!(moved.uidvalidity.is_none());
+        assert_eq!(
+            repo::messages::target_pending_ids(conn, &["m1".to_string()])?,
+            vec!["m1".to_string()]
+        );
+        Ok(())
+    })
+    .expect("plain and pending moves");
+}
+
+/// A UIDVALIDITY reset drops cached metadata, but a row waiting for the server
+/// to confirm a permanent delete is not cached metadata: dropping it would lose
+/// its attachment records and FTS document and leave a refused operation with
+/// nothing to restore. Its old UID must be cleared, though, because it belongs
+/// to the replaced generation.
+#[test]
+fn uidvalidity_reset_preserves_pending_permanent_delete_rows() {
+    let db = setup();
+    add_account(&db, "acc", "me@example.com", true);
+    let inbox = add_folder(&db, "inbox", "acc", "INBOX", FolderRole::Inbox);
+
+    let mut target = make_message(
+        "m1",
+        "acc",
+        "inbox",
+        "t1",
+        ts(1, 9),
+        "Keep me",
+        false,
+        false,
+    );
+    target.uid = Some(7);
+    target.uidvalidity = Some(3);
+    target.summary.has_attachments = true;
+    add_message(&db, &target);
+    let mut other = make_message(
+        "m2",
+        "acc",
+        "inbox",
+        "t2",
+        ts(1, 10),
+        "Drop me",
+        false,
+        false,
+    );
+    other.uid = Some(8);
+    other.uidvalidity = Some(3);
+    add_message(&db, &other);
+
+    db.write_sync(|conn| {
+        let mut attachment = Attachment {
+            id: String::new(),
+            message_id: "m1".into(),
+            filename: "report.pdf".into(),
+            mime_type: "application/pdf".into(),
+            size: 42,
+            content_id: None,
+            is_inline: false,
+            is_downloaded: true,
+        };
+        repo::attachments::insert(conn, &mut attachment)?;
+        repo::messages::set_body(
+            conn,
+            "m1",
+            Some("/tmp/nuncio-m1.eml"),
+            Some("pending delete body token"),
+            None,
+        )?;
+        repo::folders::set_sync_flags(conn, &inbox.id, Some(3), Some(9), None)?;
+        repo::messages::hide_for_permanent_delete(conn, &["m1".to_string()])?;
+
+        repo::messages::clear_folder(conn, &inbox.id)?;
+
+        let kept = repo::messages::get_required(conn, "m1")?;
+        assert!(kept.is_deleted_local, "the row stays hidden, not deleted");
+        assert!(kept.uid.is_none(), "the old generation's UID is cleared");
+        assert!(kept.uidvalidity.is_none());
+        assert_eq!(
+            repo::messages::target_pending_ids(conn, &["m1".to_string()])?,
+            vec!["m1".to_string()],
+            "no UID action may run until a sync rebinds the row"
+        );
+        assert_eq!(
+            repo::attachments::list(conn, "m1")?.len(),
+            1,
+            "attachment records survive the reset"
+        );
+        let body: String = conn.query_row(
+            "SELECT body FROM fts_mail WHERE message_id = 'm1'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(
+            body.contains("pending delete body token"),
+            "the FTS document survives the reset"
+        );
+        // A row that is not waiting for a delete is still dropped.
+        assert!(repo::messages::get(conn, "m2")?.is_none());
+        Ok(())
+    })
+    .expect("uidvalidity reset");
+}
+
+/// A row left waiting for a targeted reconciliation (a permanent-delete
+/// rollback that could not trust its UID) must survive the UIDVALIDITY reset
+/// too. Otherwise the reset erases the very row the rollback just restored,
+/// together with its attachments and FTS document.
+#[test]
+fn uidvalidity_reset_preserves_rows_awaiting_reconciliation() {
+    let db = setup();
+    add_account(&db, "acc", "me@example.com", true);
+    let inbox = add_folder(&db, "inbox", "acc", "INBOX", FolderRole::Inbox);
+
+    let mut target = make_message(
+        "m1",
+        "acc",
+        "inbox",
+        "t1",
+        ts(1, 9),
+        "Restore me",
+        false,
+        false,
+    );
+    target.uid = Some(7);
+    target.uidvalidity = Some(3);
+    target.summary.has_attachments = true;
+    add_message(&db, &target);
+
+    db.write_sync(|conn| {
+        let mut attachment = Attachment {
+            id: String::new(),
+            message_id: "m1".into(),
+            filename: "report.pdf".into(),
+            mime_type: "application/pdf".into(),
+            size: 42,
+            content_id: None,
+            is_inline: false,
+            is_downloaded: true,
+        };
+        repo::attachments::insert(conn, &mut attachment)?;
+        repo::messages::set_body(conn, "m1", None, Some("reconcile token"), None)?;
+        repo::folders::set_sync_flags(conn, &inbox.id, Some(3), Some(9), None)?;
+        repo::messages::mark_reconcile_owned(
+            conn,
+            &["m1".to_string()],
+            repo::messages::RECONCILE_REBIND,
+            "op-rebind",
+            1,
+            Some(3),
+            Some(3),
+        )?;
+
+        repo::messages::clear_folder(conn, &inbox.id)?;
+
+        let kept = repo::messages::get_required(conn, "m1")?;
+        assert!(kept.uid.is_none(), "the old generation's UID is cleared");
+        assert!(kept.uidvalidity.is_none());
+        assert_eq!(
+            repo::messages::pending_identity_rows(conn, &inbox.id)?.len(),
+            1,
+            "the row still waits for its targeted reconciliation"
+        );
+        assert_eq!(repo::attachments::list(conn, "m1")?.len(), 1);
+        let body: String = conn.query_row(
+            "SELECT body FROM fts_mail WHERE message_id = 'm1'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(body.contains("reconcile token"));
+        Ok(())
+    })
+    .expect("uidvalidity reset with awaiting row");
 }
 
 #[test]
@@ -802,6 +1013,8 @@ fn attachments_drafts_and_outbox() {
             importance: Importance::Normal,
             request_read_receipt: false,
             remote_draft_message_id: None,
+            remote_draft: None,
+            sync_suppressed: false,
             updated_at: None,
         };
         let saved = repo::drafts::save(conn, &draft)?;
@@ -936,8 +1149,11 @@ fn smart_task_lists_and_counts() {
         // A message in the trash drops out of the smart list immediately.
         repo::messages::delete_local(conn, &["m1".to_string()], false)?;
         assert_eq!(
-            repo::tasks::query(conn, &TaskQuery::smart(SmartList::FlaggedEmail, today.clone()))?
-                .len(),
+            repo::tasks::query(
+                conn,
+                &TaskQuery::smart(SmartList::FlaggedEmail, today.clone())
+            )?
+            .len(),
             0
         );
         assert_eq!(repo::tasks::smart_counts(conn, &today)?.flagged_email, 0);
@@ -1223,6 +1439,7 @@ fn pending_ops_undo_rules_and_trusted_senders() {
             ),
         )?;
         assert_eq!(op.state, PendingOpState::Pending);
+        assert_eq!(op.sequence, 1, "the first operation gets sequence 1");
         assert_eq!(repo::pending_ops::next_due(conn, ts(1, 10), 10)?.len(), 1);
         assert_eq!(repo::pending_ops::pending_count(conn, None)?, 1);
 
@@ -1241,6 +1458,17 @@ fn pending_ops_undo_rules_and_trusted_senders() {
             conn,
             NewPendingOp::new("acc", "imap.move", serde_json::json!({}), "Move"),
         )?;
+        assert!(
+            second.sequence > op.sequence,
+            "the explicit sequence follows insertion order"
+        );
+        // Even when `created_at` collides (second precision), listing follows
+        // the explicit sequence, never the implicit rowid.
+        let listed: Vec<String> = repo::pending_ops::list(conn, Some("acc"))?
+            .into_iter()
+            .map(|op| op.id)
+            .collect();
+        assert_eq!(listed, vec![op.id.clone(), second.id.clone()]);
         repo::pending_ops::mark_failed(conn, &second.id, "permanent")?;
         assert_eq!(
             repo::pending_ops::get_required(conn, &second.id)?.state,
@@ -1330,6 +1558,680 @@ fn pending_ops_undo_rules_and_trusted_senders() {
     .expect("ops");
 }
 
+/// A short-lived build persisted `quarantined` as a state string. Older
+/// binaries do not know it and fall back to `pending`, which would send the
+/// legacy DELETE. Reading must map it to `cancelled` (never selected), and the
+/// payload marker must keep the row through pruning as the audit record.
+#[test]
+fn legacy_quarantined_state_reads_as_cancelled_and_is_never_due() {
+    let db = setup();
+    add_account(&db, "acc", "me@example.com", true);
+    db.write_sync(|conn| {
+        let payload = serde_json::json!({
+            "folderId": "drafts",
+            "uid": 7,
+            "quarantined": true,
+            "quarantineReason": "legacy row",
+        });
+        conn.execute(
+            "INSERT INTO pending_op
+                 (id, account_id, kind, payload_json, state, attempts, next_retry_at,
+                  description, last_error, created_at, updated_at, seq)
+             VALUES ('legacy-op', 'acc', 'deleteRemoteDraft', ?1, 'quarantined', 0,
+                     NULL, 'legacy delete', NULL, ?2, ?2, 1)",
+            rusqlite::params![
+                serde_json::to_string(&payload).expect("payload"),
+                repo::dt_string(ts(1, 1))
+            ],
+        )?;
+
+        let op = repo::pending_ops::get_required(conn, "legacy-op")?;
+        assert_eq!(op.state, PendingOpState::Cancelled);
+        assert_eq!(op.state.as_str(), "cancelled");
+        assert!(
+            repo::pending_ops::next_due(conn, ts(1, 10), 10)?.is_empty(),
+            "a legacy quarantined row must never be selected for execution"
+        );
+
+        // Downgrade safety: the row must be rewritten on disk, so an OLDER
+        // binary (which maps unknown strings to pending) can never execute it.
+        let rewritten = repo::pending_ops::normalize_quarantined_state(conn)?;
+        assert_eq!(rewritten, 1, "the legacy string is normalized exactly once");
+        let raw: String = conn.query_row(
+            "SELECT state FROM pending_op WHERE id = 'legacy-op'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(raw, "cancelled", "no `quarantined` string may survive");
+        assert_eq!(repo::pending_ops::normalize_quarantined_state(conn)?, 0);
+
+        // Pruned only AFTER normalization: the row is now `cancelled` and the
+        // audit intent lives solely in the payload marker, so this is the
+        // state the retention rule actually has to protect.
+        repo::pending_ops::prune_finished(conn, ts(1, 10))?;
+        assert!(
+            repo::pending_ops::get(conn, "legacy-op")?.is_some(),
+            "the normalized cancelled+quarantined row survives pruning"
+        );
+        Ok(())
+    })
+    .expect("legacy quarantined state");
+}
+
+/// A failed APPEND whose phase is still `unknown` and that has no receipt may
+/// describe a remote create that already happened. Pruning it would let a
+/// later autosave upload a second copy, so the row must survive housekeeping.
+#[test]
+fn pruning_retains_an_unknown_append_without_a_receipt() {
+    let db = setup();
+    add_account(&db, "acc", "a@example.com", false);
+    db.write_sync(|conn| {
+        let unknown = repo::pending_ops::enqueue(
+            conn,
+            NewPendingOp::new(
+                "acc",
+                "appendDraft",
+                serde_json::json!({
+                    "draftId": "d-unknown",
+                    "folderId": "drafts",
+                    "rfc822Path": "/tmp/unknown.eml",
+                    "appendState": "unknown",
+                }),
+                "Save draft to server",
+            ),
+        )?;
+        repo::pending_ops::mark_failed(conn, &unknown.id, "lost completion")?;
+
+        let acked = repo::pending_ops::enqueue(
+            conn,
+            NewPendingOp::new(
+                "acc",
+                "appendDraft",
+                serde_json::json!({
+                    "draftId": "d-acked",
+                    "folderId": "drafts",
+                    "rfc822Path": "/tmp/acked.eml",
+                    "appendState": "acked",
+                    "appendedRemoteId": "remote-1",
+                }),
+                "Save draft to server",
+            ),
+        )?;
+        repo::pending_ops::mark_failed(conn, &acked.id, "local commit failed")?;
+
+        repo::pending_ops::prune_finished(conn, Utc::now() + chrono::Duration::days(1))?;
+        assert!(
+            repo::pending_ops::get(conn, &unknown.id)?.is_some(),
+            "the unknown create is kept as the guard against a duplicate upload"
+        );
+        assert!(
+            repo::pending_ops::get(conn, &acked.id)?.is_none(),
+            "a row with an explicit receipt may be pruned"
+        );
+        Ok(())
+    })
+    .expect("prune unknown append");
+}
+
+/// Housekeeping must use the settlement time, not the enqueue time: an
+/// operation that waited longer than the retention window in the queue but
+/// succeeded just now is the only evidence that the object changed to the
+/// uploaded value. Pruning it immediately would let a delta requested before
+/// the upload overwrite the row with the older server copy.
+#[test]
+fn pruning_uses_settlement_time_not_enqueue_time() {
+    let db = setup();
+    add_account(&db, "acc", "a@example.com", false);
+    db.write_sync(|conn| {
+        let now = Utc::now();
+        let long_queued = repo::pending_ops::enqueue(
+            conn,
+            NewPendingOp::new(
+                "acc",
+                "pim.contact.save",
+                serde_json::json!({"contactId": "c-1"}),
+                "Old but just settled",
+            ),
+        )?;
+        // It sat in the queue for nine days before finally succeeding now.
+        conn.execute(
+            "UPDATE pending_op SET created_at = ?2, updated_at = ?2 WHERE id = ?1",
+            rusqlite::params![
+                long_queued.id,
+                repo::dt_string(now - chrono::Duration::days(9))
+            ],
+        )?;
+        repo::pending_ops::mark_done(conn, &long_queued.id)?;
+
+        // A control row that settled long ago as well, so it may go.
+        let stale = repo::pending_ops::enqueue(
+            conn,
+            NewPendingOp::new(
+                "acc",
+                "pim.contact.save",
+                serde_json::json!({"contactId": "c-2"}),
+                "Settled long ago",
+            ),
+        )?;
+        conn.execute(
+            "UPDATE pending_op SET state = 'done', created_at = ?2, updated_at = ?2 WHERE id = ?1",
+            rusqlite::params![stale.id, repo::dt_string(now - chrono::Duration::days(9))],
+        )?;
+
+        repo::pending_ops::prune_finished(conn, now - chrono::Duration::days(7))?;
+        assert!(
+            repo::pending_ops::get(conn, &long_queued.id)?.is_some(),
+            "an operation settled within the window must survive pruning"
+        );
+        assert!(
+            repo::pending_ops::get(conn, &stale.id)?.is_none(),
+            "an operation settled before the window may be pruned"
+        );
+        Ok(())
+    })
+    .expect("prune by settlement time");
+}
+
+/// A confirmed move's destination lives on the projection row, so it must be
+/// written only while the row is still unbound and disappear with the binding.
+#[test]
+fn move_target_identity_is_bound_to_the_projection_row() {
+    let db = setup();
+    add_account(&db, "acc", "a@example.com", false);
+    add_folder(&db, "fld", "acc", "Inbox", FolderRole::Inbox);
+    add_message(
+        &db,
+        &make_message("proj", "acc", "fld", "t", ts(2, 1), "m", true, false),
+    );
+    db.write_sync(|conn| {
+        // The optimistic move's projection state.
+        conn.execute(
+            "UPDATE message SET uid = NULL, gm_msgid = NULL, target_pending = 1
+              WHERE id = 'proj'",
+            [],
+        )?;
+
+        assert_eq!(
+            repo::messages::set_move_target_identity(
+                conn, "acc", "proj", "fld", "m-new", "op-1", 1
+            )?,
+            1,
+            "the unbound projection accepts its confirmed destination"
+        );
+        assert_eq!(
+            repo::messages::confirmed_move_projection_targets(conn, "acc", "fld")?,
+            std::collections::HashMap::from([("m-new".to_string(), "proj".to_string())])
+        );
+
+        // A second confirmation (for example a retry) is harmless.
+        assert_eq!(
+            repo::messages::set_move_target_identity(
+                conn, "acc", "proj", "fld", "m-new", "op-1", 1
+            )?,
+            1
+        );
+
+        // Binding the row clears the temporary identity in the same write.
+        repo::messages::set_uid_identity(conn, "proj", Some(42), Some(1))?;
+        let (uid, target_pending, remote, folder): (
+            Option<i64>,
+            i64,
+            Option<String>,
+            Option<String>,
+        ) = conn.query_row(
+            "SELECT uid, target_pending, move_target_remote_id, move_target_folder_id
+                   FROM message WHERE id = 'proj'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!((uid, target_pending), (Some(42), 0));
+        assert_eq!((remote, folder), (None, None), "the identity is cleared");
+        assert!(repo::messages::confirmed_move_projection_targets(conn, "acc", "fld")?.is_empty());
+
+        // A bound row is not a projection any more; no identity is revived.
+        assert_eq!(
+            repo::messages::set_move_target_identity(
+                conn, "acc", "proj", "fld", "m-new", "op-1", 1
+            )?,
+            0
+        );
+        assert!(repo::messages::confirmed_move_projection_targets(conn, "acc", "fld")?.is_empty());
+        Ok(())
+    })
+    .expect("move target identity");
+}
+
+/// A later trip's identity must not be replaced by the retry of an older
+/// operation, while a newer operation may still take the slot over (which is
+/// what keeps a legitimate confirmation from being blocked by stale evidence).
+#[test]
+fn move_target_identity_is_owned_by_the_newest_trip() {
+    let db = setup();
+    add_account(&db, "acc", "a@example.com", false);
+    add_folder(&db, "fld", "acc", "Inbox", FolderRole::Inbox);
+    add_message(
+        &db,
+        &make_message("proj", "acc", "fld", "t", ts(2, 1), "m", true, false),
+    );
+    db.write_sync(|conn| {
+        conn.execute(
+            "UPDATE message SET uid = NULL, gm_msgid = NULL, target_pending = 1
+              WHERE id = 'proj'",
+            [],
+        )?;
+
+        // The newer trip claims the slot and records its destination.
+        repo::messages::claim_move_target_owner(
+            conn,
+            "acc",
+            &["proj".to_string()],
+            "fld",
+            "op-new",
+            2,
+        )?;
+        assert_eq!(
+            repo::messages::set_move_target_identity(
+                conn, "acc", "proj", "fld", "m-new2", "op-new", 2
+            )?,
+            1
+        );
+
+        // The older batch retries with its own stale destination.
+        assert_eq!(
+            repo::messages::set_move_target_identity(
+                conn, "acc", "proj", "fld", "m-new1", "op-old", 1
+            )?,
+            0,
+            "an older operation must not overwrite the newer trip"
+        );
+        assert_eq!(
+            repo::messages::confirmed_move_projection_targets(conn, "acc", "fld")?,
+            std::collections::HashMap::from([("m-new2".to_string(), "proj".to_string())])
+        );
+        let (remote, owner, sequence): (Option<String>, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT move_target_remote_id, move_target_op_id, move_target_seq
+                   FROM message WHERE id = 'proj'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        assert_eq!(
+            (remote.as_deref(), owner.as_deref(), sequence),
+            (Some("m-new2"), Some("op-new"), Some(2))
+        );
+
+        // A strictly newer trip may take the slot over.
+        assert_eq!(
+            repo::messages::set_move_target_identity(
+                conn, "acc", "proj", "fld", "m-new3", "op-newer", 3
+            )?,
+            1
+        );
+
+        // Binding the row clears the identity and its owner together.
+        repo::messages::set_uid_identity(conn, "proj", Some(42), Some(1))?;
+        let (remote, owner, sequence): (Option<String>, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT move_target_remote_id, move_target_op_id, move_target_seq
+                   FROM message WHERE id = 'proj'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        assert_eq!((remote, owner, sequence), (None, None, None));
+        Ok(())
+    })
+    .expect("move target ownership");
+}
+
+/// A failed batch's recovery writes are conditional on the row's current move
+/// owner. An older operation must not clear a newer trip's destination or pull
+/// its projection back to the source folder, while the owner itself can still
+/// record a reconciliation.
+#[test]
+fn move_failure_recovery_is_owned_by_the_current_trip() {
+    let db = setup();
+    add_account(&db, "acc", "a@example.com", false);
+    add_folder(&db, "src", "acc", "Inbox", FolderRole::Inbox);
+    add_folder(&db, "fld", "acc", "Archive", FolderRole::Archive);
+    add_message(
+        &db,
+        &make_message("proj", "acc", "fld", "t", ts(2, 1), "m", true, false),
+    );
+    db.write_sync(|conn| {
+        conn.execute(
+            "UPDATE message SET uid = NULL, gm_msgid = NULL, target_pending = 1
+              WHERE id = 'proj'",
+            [],
+        )?;
+
+        repo::messages::claim_move_target_owner(
+            conn,
+            "acc",
+            &["proj".to_string()],
+            "fld",
+            "op-new",
+            2,
+        )?;
+        assert_eq!(
+            repo::messages::set_move_target_identity(
+                conn,
+                "acc",
+                "proj",
+                "fld",
+                "m-current",
+                "op-new",
+                2
+            )?,
+            1
+        );
+
+        // The older batch's failure must leave the newer trip's evidence.
+        repo::messages::mark_reconcile_owned(
+            conn,
+            &["proj".to_string()],
+            repo::messages::RECONCILE_MOVE_ROLLBACK,
+            "op-old",
+            1,
+            Some(7),
+            Some(1),
+        )?;
+        assert_eq!(
+            repo::messages::move_target_owner(conn, "proj")?.as_deref(),
+            Some("op-new"),
+            "an older recovery must not take the newer owner's slot"
+        );
+        let (remote, folder, reconcile): (Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT move_target_remote_id, move_target_folder_id, reconcile_op_id
+                   FROM message WHERE id = 'proj'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        assert_eq!(remote.as_deref(), Some("m-current"));
+        assert_eq!(folder.as_deref(), Some("fld"));
+        assert_eq!(reconcile, None);
+
+        // Nor may it move the newer projection back into the source folder.
+        assert!(repo::messages::move_to_folder_rollback(
+            conn,
+            &["proj".to_string()],
+            "src",
+            "fld",
+            "acc",
+            "op-old",
+        )?
+        .is_empty());
+        assert_eq!(
+            repo::messages::get_required(conn, "proj")?
+                .summary
+                .folder_id,
+            "fld"
+        );
+
+        // The operation that owns the slot may still record the failure.
+        repo::messages::mark_reconcile_owned(
+            conn,
+            &["proj".to_string()],
+            repo::messages::RECONCILE_MOVE_ROLLBACK,
+            "op-new",
+            2,
+            Some(7),
+            Some(1),
+        )?;
+        assert_eq!(repo::messages::move_target_owner(conn, "proj")?, None);
+        let reconcile_owner: Option<String> = conn.query_row(
+            "SELECT reconcile_op_id FROM message WHERE id = 'proj'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(reconcile_owner.as_deref(), Some("op-new"));
+        Ok(())
+    })
+    .expect("owner-checked move recovery");
+}
+
+/// A legacy permanent-delete rollback wrote an empty reconcile token where it
+/// meant "no trip owns this row". An empty (or `"0"`) token is not a trip and
+/// must not look like a foreign owner to the binding guards: the row stays
+/// legitimately bindable and does not get stuck as a pending duplicate.
+#[test]
+fn blank_owner_token_is_an_unowned_projection() {
+    let db = setup();
+    add_account(&db, "acc", "a@example.com", false);
+    add_folder(&db, "fld", "acc", "Inbox", FolderRole::Inbox);
+    add_message(
+        &db,
+        &make_message("proj", "acc", "fld", "t", ts(2, 1), "m", true, false),
+    );
+    db.write_sync(|conn| {
+        conn.execute(
+            "UPDATE message SET uid = NULL, gm_msgid = NULL, target_pending = 1,
+                    awaiting_reconcile = 1,
+                    reconcile_reason = ?1,
+                    reconcile_op_id = ''
+              WHERE id = 'proj'",
+            rusqlite::params![repo::messages::RECONCILE_PENDING_DELETE],
+        )?;
+
+        assert_eq!(
+            repo::messages::projection_owner(conn, "proj")?,
+            None,
+            "an empty token is not an owner"
+        );
+        assert!(
+            repo::messages::move_target_owners(conn, "acc", "fld")?.is_empty(),
+            "an empty token must not claim the row's identity slot"
+        );
+
+        // The legacy `"0"` placeholder is the same "no owner" marker.
+        conn.execute(
+            "UPDATE message SET reconcile_op_id = '0' WHERE id = 'proj'",
+            [],
+        )?;
+        assert_eq!(repo::messages::projection_owner(conn, "proj")?, None);
+
+        // A legitimate binding must succeed despite the leftover token.
+        conn.execute(
+            "UPDATE message SET reconcile_op_id = '' WHERE id = 'proj'",
+            [],
+        )?;
+        assert_eq!(
+            repo::messages::set_graph_identity_if_pending(
+                conn, "proj", "acc", "fld", 42, "graph-1", "undo-op"
+            )?,
+            1,
+            "an empty token must not block the row's own binding"
+        );
+        let restored = repo::messages::get_required(conn, "proj")?;
+        assert_eq!(restored.uid, Some(42));
+        assert_eq!(restored.gm_msgid.as_deref(), Some("graph-1"));
+        assert!(
+            repo::messages::target_pending_ids(conn, &["proj".to_string()])?.is_empty(),
+            "a confirmed binding ends the pending projection"
+        );
+        assert_eq!(repo::messages::projection_owner(conn, "proj")?, None);
+        Ok(())
+    })
+    .expect("blank owner token");
+}
+
+/// Releasing a permanent-delete projection is owner-checked: a row owned by a
+/// newer trip stays hidden with its markers, while an unowned row (or one owned
+/// by the releasing operation) is released exactly as before.
+#[test]
+fn releasing_a_permanent_delete_respects_the_projection_owner() {
+    let db = setup();
+    add_account(&db, "acc", "a@example.com", false);
+    add_folder(&db, "inbox", "acc", "INBOX", FolderRole::Inbox);
+    for (index, id) in ["m1", "m2", "m3"].into_iter().enumerate() {
+        let mut row = make_message(id, "acc", "inbox", "t", ts(2, 1), "m", true, false);
+        row.uid = Some(7 + index as i64);
+        add_message(&db, &row);
+    }
+
+    db.write_sync(|conn| {
+        // m1/m2 were hidden by an older delete but a newer trip then claimed
+        // their identity. m3 is unowned.
+        conn.execute(
+            "UPDATE message
+                SET uid = NULL, gm_msgid = NULL, target_pending = 1,
+                    is_deleted_local = 1, pending_delete = 1,
+                    reconcile_op_id = CASE WHEN id = 'm3' THEN NULL ELSE 'op-new' END,
+                    reconcile_seq = CASE WHEN id = 'm3' THEN NULL ELSE 5 END,
+                    reconcile_reason = 'pendingDelete'
+              WHERE id IN ('m1', 'm2', 'm3')",
+            [],
+        )?;
+
+        let ids = |id: &str| vec![id.to_string()];
+        // A newer trip's row must not be unhidden, and its markers stay.
+        assert!(repo::messages::release_pending_delete_preserving_identity(
+            conn,
+            "acc",
+            "inbox",
+            &ids("m1"),
+            "op-old"
+        )?
+        .is_empty());
+        assert!(repo::messages::release_pending_delete_with_trust(
+            conn,
+            "acc",
+            "inbox",
+            &ids("m2"),
+            &std::collections::HashSet::new(),
+            &[],
+            None,
+            "op-old"
+        )?
+        .is_empty());
+        for id in ["m1", "m2"] {
+            let row = repo::messages::get_required(conn, id)?;
+            assert!(row.is_deleted_local, "{id} must stay hidden");
+            let (pending_delete, owner): (i64, Option<String>) = conn.query_row(
+                "SELECT pending_delete, reconcile_op_id FROM message WHERE id = ?1",
+                rusqlite::params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            assert_eq!(pending_delete, 1);
+            assert_eq!(owner.as_deref(), Some("op-new"));
+        }
+
+        // The owning operation (or an unowned row) is released normally.
+        assert_eq!(
+            repo::messages::release_pending_delete_preserving_identity(
+                conn,
+                "acc",
+                "inbox",
+                &ids("m1"),
+                "op-new"
+            )?,
+            ids("m1")
+        );
+        assert_eq!(
+            repo::messages::release_pending_delete_with_trust(
+                conn,
+                "acc",
+                "inbox",
+                &ids("m2"),
+                &std::collections::HashSet::new(),
+                &[8],
+                None,
+                "op-new"
+            )?,
+            ids("m2")
+        );
+        assert_eq!(
+            repo::messages::release_pending_delete_with_trust(
+                conn,
+                "acc",
+                "inbox",
+                &ids("m3"),
+                &std::collections::HashSet::new(),
+                &[],
+                None,
+                "op-old"
+            )?,
+            ids("m3")
+        );
+        for id in ["m1", "m2", "m3"] {
+            let row = repo::messages::get_required(conn, id)?;
+            assert!(!row.is_deleted_local, "{id} must be visible again");
+            let pending_delete: i64 = conn.query_row(
+                "SELECT pending_delete FROM message WHERE id = ?1",
+                rusqlite::params![id],
+                |row| row.get(0),
+            )?;
+            assert_eq!(pending_delete, 0);
+        }
+        Ok(())
+    })
+    .expect("owner-checked permanent-delete release");
+}
+
+/// Housekeeping must not drop the confirmed move receipt while it is the only
+/// evidence for an unbound projection. Once the row carries that identity, the
+/// operation may be pruned.
+#[test]
+fn pruning_retains_a_confirmed_move_until_the_row_carries_the_identity() {
+    let db = setup();
+    add_account(&db, "acc", "a@example.com", false);
+    add_folder(&db, "src", "acc", "Inbox", FolderRole::Inbox);
+    add_folder(&db, "fld", "acc", "Archive", FolderRole::Archive);
+    add_message(
+        &db,
+        &make_message("proj", "acc", "fld", "t", ts(2, 1), "m", true, false),
+    );
+    db.write_sync(|conn| {
+        conn.execute(
+            "UPDATE message SET uid = NULL, gm_msgid = NULL, target_pending = 1
+              WHERE id = 'proj'",
+            [],
+        )?;
+        let op = repo::pending_ops::enqueue(
+            conn,
+            NewPendingOp::new(
+                "acc",
+                "move",
+                serde_json::json!({
+                    "folderId": "src",
+                    "targetFolderId": "fld",
+                    "uids": [7],
+                    "messageIds": ["proj"],
+                    "outcomes": [{
+                        "messageId": "proj",
+                        "state": "confirmed",
+                        "targetFolderId": "fld",
+                        "targetRemoteId": "m-new"
+                    }]
+                }),
+                "Move message",
+            ),
+        )?;
+        let old = Utc::now() - chrono::Duration::days(9);
+        conn.execute(
+            "UPDATE pending_op SET state = 'done', updated_at = ?2 WHERE id = ?1",
+            rusqlite::params![op.id, repo::dt_string(old)],
+        )?;
+
+        repo::pending_ops::prune_finished(conn, Utc::now() - chrono::Duration::days(7))?;
+        assert!(
+            repo::pending_ops::get(conn, &op.id)?.is_some(),
+            "the receipt is the projection's only identity and must survive"
+        );
+
+        // The executor mirrored the receipt onto the row; the queue row is now
+        // redundant and may be housekept.
+        repo::messages::set_move_target_identity(conn, "acc", "proj", "fld", "m-new", "op-1", 1)?;
+        repo::pending_ops::prune_finished(conn, Utc::now() - chrono::Duration::days(7))?;
+        assert!(
+            repo::pending_ops::get(conn, &op.id)?.is_none(),
+            "the durable row identity replaces the operation receipt"
+        );
+        Ok(())
+    })
+    .expect("prune confirmed move");
+}
+
 #[test]
 fn sync_state_and_settings_repo() {
     let db = setup();
@@ -1382,7 +2284,13 @@ fn folder_create_move_validation_and_account_delete_cleanup() {
         );
         message.summary.preview = "unique-preview-token".into();
         repo::messages::upsert(conn, &message)?;
-        repo::messages::set_body(conn, "m1", Some("/tmp/m1.eml"), Some("body-token-xyz"))?;
+        repo::messages::set_body(
+            conn,
+            "m1",
+            Some("/tmp/m1.eml"),
+            Some("body-token-xyz"),
+            None,
+        )?;
         let mut attachment = Attachment {
             id: String::new(),
             message_id: "m1".into(),
@@ -1451,4 +2359,163 @@ fn serialized_contract_shapes() {
     assert_eq!(value["recurrence"], serde_json::Value::Null);
     assert_eq!(value["attendees"], serde_json::json!([]));
     assert!(value.get("isOrganizer").is_some());
+}
+
+/// Clearing a writer with no predecessor deletes its row. The message-level
+/// revision must still move, or a reader that observed `None` before cannot
+/// tell "nothing changed" from "an undo restored the value and removed the
+/// writer".
+#[test]
+fn clearing_a_flag_writer_advances_the_message_revision() {
+    let db = setup();
+    add_account(&db, "a1", "a1@example.com", true);
+    add_folder(&db, "f1", "a1", "INBOX", FolderRole::Inbox);
+    let message = make_message("m1", "a1", "f1", "t1", ts(1, 0), "revision", false, false);
+    add_message(&db, &message);
+
+    db.write_sync(|conn| {
+        let observed = repo::messages::flag_revision(conn, "m1")?.expect("message row");
+        assert_eq!(observed, 0);
+
+        // A user action records its writer: the revision moves.
+        repo::messages::record_flag_writer(conn, "m1", "seen", "op-1", Some(true), "setSeen")?;
+        let after_write = repo::messages::flag_revision(conn, "m1")?.expect("message row");
+        assert!(after_write > observed);
+
+        // Undo with no predecessor clears the writer row entirely.
+        repo::messages::reassign_flag_writer(conn, "m1", "seen", "op-1", None, None, None)?;
+        assert!(repo::messages::flag_writer(conn, "m1", "seen")?.is_none());
+        let after_clear = repo::messages::flag_revision(conn, "m1")?.expect("message row");
+        assert!(
+            after_clear > after_write,
+            "removing the last writer must still advance the observed revision"
+        );
+        Ok(())
+    })
+    .expect("flag revision on clear");
+}
+
+#[test]
+fn flag_writer_revisions_are_not_reused_after_a_writer_is_deleted() {
+    let db = setup();
+    db.write_sync(|conn| {
+        repo::messages::record_flag_writer(conn, "m1", "seen", "first", Some(false), "unread")?;
+        let first = repo::messages::flag_writer(conn, "m1", "seen")?
+            .expect("first writer")
+            .seq;
+        // Undoing an action with no predecessor removes its writer row.
+        repo::messages::reassign_flag_writer(conn, "m1", "seen", "first", None, None, None)?;
+        assert!(repo::messages::flag_writer(conn, "m1", "seen")?.is_none());
+
+        repo::messages::record_flag_writer(conn, "m1", "seen", "second", Some(false), "unread")?;
+        let second = repo::messages::flag_writer(conn, "m1", "seen")?
+            .expect("second writer")
+            .seq;
+        assert!(
+            second > first,
+            "a revision freed by deleting the writer row must never be handed out again"
+        );
+
+        repo::messages::reassign_flag_writer(
+            conn, "m1", "seen", "second", Some("third"), Some(false), Some("unread"),
+        )?;
+        let third = repo::messages::flag_writer(conn, "m1", "seen")?
+            .expect("third writer")
+            .seq;
+        assert!(
+            third > second,
+            "a hand-off revision must also advance past every deleted value"
+        );
+        Ok(())
+    })
+    .expect("flag writer revisions");
+}
+
+/// Message-ID reuse is identity-aware: a row bound to a different UID (or a
+/// different UIDVALIDITY generation) is a *different provider copy* and must
+/// never be overwritten. Only a single identity-less projection may be bound
+/// by header alone. This is the page-boundary / split-pass case in miniature.
+#[test]
+fn message_id_reuse_respects_the_provider_identity_generation() {
+    let db = setup();
+    add_account(&db, "acc", "me@example.com", true);
+    add_folder(&db, "sent", "acc", "Sent", FolderRole::Sent);
+
+    for (id, uid) in [("copy-a", 10), ("copy-b", 11)] {
+        let mut message = make_message(id, "acc", "sent", "t1", ts(6, 9), "Pair", true, false);
+        message.message_id_header = Some("pair@example.com".into());
+        message.uid = Some(uid);
+        message.uidvalidity = Some(1);
+        add_message(&db, &message);
+    }
+    let mut projection = make_message(
+        "projection",
+        "acc",
+        "sent",
+        "t1",
+        ts(6, 9),
+        "Moving",
+        true,
+        false,
+    );
+    projection.message_id_header = Some("move@example.com".into());
+    add_message(&db, &projection);
+
+    db.read_sync(|conn| {
+        // Same UID + generation: the row is the incoming copy.
+        assert_eq!(
+            repo::messages::unambiguous_message_id_row_for_identity(
+                conn,
+                "acc",
+                "sent",
+                "pair@example.com",
+                1,
+                Some(10),
+                Some(1),
+            )?,
+            Some("copy-a".to_string())
+        );
+        // A different UID is a second provider copy, never a reuse target.
+        assert_eq!(
+            repo::messages::unambiguous_message_id_row_for_identity(
+                conn,
+                "acc",
+                "sent",
+                "pair@example.com",
+                1,
+                Some(12),
+                Some(1),
+            )?,
+            None
+        );
+        // The same UID in another generation is not the same message.
+        assert_eq!(
+            repo::messages::unambiguous_message_id_row_for_identity(
+                conn,
+                "acc",
+                "sent",
+                "pair@example.com",
+                1,
+                Some(10),
+                Some(2),
+            )?,
+            None
+        );
+        // An identity-less projection may be bound when it is the only
+        // candidate for the header (the reconciliation path relies on this).
+        assert_eq!(
+            repo::messages::unambiguous_message_id_row_for_identity(
+                conn,
+                "acc",
+                "sent",
+                "move@example.com",
+                1,
+                Some(12),
+                Some(1),
+            )?,
+            Some("projection".to_string())
+        );
+        Ok(())
+    })
+    .expect("identity-aware lookup");
 }

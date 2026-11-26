@@ -1,0 +1,15 @@
+-- Trip order of the operation recorded in `reconcile_op_id` (migration 0011).
+--
+-- A failed trip's terminal recovery clears the move-target identity slot and
+-- records itself as the reconciliation owner. That owner is still the row's
+-- current trip: an older batch retrying afterwards must not be able to fill the
+-- now-empty move slot with its stale destination, nor overwrite the reconcile
+-- owner. Without an explicit sequence the two ownership records
+-- (`move_target_op_id`/`move_target_seq` and `reconcile_op_id`) cannot be
+-- ordered, so "unowned move slot" would incorrectly mean "no owner at all".
+--
+-- `reconcile_seq` is the `pending_op.seq` of the reconciliation owner (NULL for
+-- rows written before this migration and for writer paths that have no queue
+-- row). Ownership helpers compare it with `move_target_seq`; the new owner of a
+-- projection is the one with the greater sequence.
+ALTER TABLE message ADD COLUMN reconcile_seq INTEGER;

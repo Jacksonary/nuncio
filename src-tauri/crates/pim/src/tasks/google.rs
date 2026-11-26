@@ -599,6 +599,8 @@ impl TaskProvider for GoogleTasksProvider {
                 // not change are absent.  Only a full sync can claim the step
                 // list is complete.
                 steps_complete: updated_min.is_none(),
+                // Google ids are real provider identifiers, never href-derived.
+                uid_is_derived: false,
             });
         }
         debug!(
@@ -611,6 +613,10 @@ impl TaskProvider for GoogleTasksProvider {
             tasks,
             deleted_remote_ids,
             deleted_hrefs: Vec::new(),
+            // The API is not an href listing; a full sync re-delivers every
+            // task, so presence comes from `seen_remote`.
+            listed_hrefs: Vec::new(),
+            incomplete: false,
             sync_token: Some(started),
             ctag: None,
             full_sync: updated_min.is_none(),
@@ -632,6 +638,7 @@ impl TaskProvider for GoogleTasksProvider {
             remote_id: Some(created.id).filter(|id| !id.is_empty()),
             etag: created.etag,
             href: None,
+            uid_is_derived: false,
         })
     }
 
@@ -641,6 +648,7 @@ impl TaskProvider for GoogleTasksProvider {
         list: &RemoteTaskList,
         current: &RemoteTaskRef,
         task: &Task,
+        _assigned_uid: Option<&str>,
     ) -> Result<RemoteWriteResult> {
         let Some(id) = current.remote_id.clone() else {
             return Err(AppError::conflict("task has no Google id"));
@@ -654,6 +662,7 @@ impl TaskProvider for GoogleTasksProvider {
             remote_id: Some(updated.id).filter(|id| !id.is_empty()).or(Some(id)),
             etag: updated.etag,
             href: None,
+            uid_is_derived: false,
         })
     }
 
@@ -690,6 +699,7 @@ impl TaskProvider for GoogleTasksProvider {
             remote_id: Some(moved.id).filter(|id| !id.is_empty()).or(Some(id)),
             etag: moved.etag,
             href: None,
+            uid_is_derived: false,
         })
     }
 
@@ -749,6 +759,7 @@ impl TaskProvider for GoogleTasksProvider {
             remote_id: Some(created.id).filter(|id| !id.is_empty()),
             etag: created.etag,
             href: None,
+            uid_is_derived: false,
         }))
     }
 

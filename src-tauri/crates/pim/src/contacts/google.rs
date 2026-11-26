@@ -1151,6 +1151,7 @@ impl ContactProvider for GoogleContactsProvider {
                 remote_id: Some(resource_name),
                 href: None,
                 etag,
+                uid_is_derived: false,
                 raw_vcard: None,
                 group_names: names,
             });
@@ -1165,6 +1166,7 @@ impl ContactProvider for GoogleContactsProvider {
             contacts,
             deleted_remote_ids,
             deleted_hrefs: Vec::new(),
+            listed_hrefs: Vec::new(),
             groups: groups
                 .iter()
                 .filter(|group| group.is_user_group())
@@ -1180,6 +1182,8 @@ impl ContactProvider for GoogleContactsProvider {
             sync_token: next_token.or_else(|| cursor.sync_token.clone()),
             ctag: None,
             full_sync,
+            incomplete: false,
+            window_start: None,
         })
     }
 
@@ -1207,6 +1211,7 @@ impl ContactProvider for GoogleContactsProvider {
             remote_id: person.resource_name,
             etag: person.etag,
             href: None,
+            uid_is_derived: false,
         })
     }
 
@@ -1217,6 +1222,7 @@ impl ContactProvider for GoogleContactsProvider {
         current: &RemoteContactRef,
         contact: &Contact,
         _group_names: &[String],
+        _assigned_uid: Option<&str>,
     ) -> Result<RemoteWriteResult> {
         let Some(resource_name) = current.remote_id.clone() else {
             return Err(AppError::conflict("contact has no Google resource name"));
@@ -1244,6 +1250,7 @@ impl ContactProvider for GoogleContactsProvider {
             remote_id: person.resource_name.or(Some(resource_name)),
             etag: person.etag,
             href: None,
+            uid_is_derived: false,
         })
     }
 

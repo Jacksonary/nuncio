@@ -418,6 +418,29 @@ function createSubscriptions(): EventSubscriptions {
 let installed = false;
 
 /**
+ * Merge one `sync://status` snapshot into the cached list.
+ *
+ * The backend stamps each snapshot with a monotonic `seq` while it holds the
+ * status lock, but publishes only after releasing it. An older cleanup (for
+ * example a dropped full-sync marker) can therefore be delivered *after* a
+ * newer round's snapshot. Keep the highest `seq` per account+module instead
+ * of trusting arrival order.
+ */
+export function mergeSyncStatusEvent(
+  list: SyncStatus[],
+  status: SyncStatus,
+): SyncStatus[] {
+  const index = list.findIndex(
+    (entry) => entry.accountId === status.accountId && entry.module === status.module,
+  );
+  if (index < 0) return [...list, status];
+  if (list[index].seq > status.seq) return list;
+  const next = [...list];
+  next[index] = status;
+  return next;
+}
+
+/**
  * Subscribe to every backend event. Returns an unlisten function.
  * Calling it twice returns a no-op (the Shell is the single owner).
  */
@@ -434,16 +457,9 @@ export function installEventBridge(): () => void {
   const { subscribe, dispose } = createSubscriptions();
 
   subscribe("sync://status", (status) => {
-    queryClient.setQueryData<SyncStatus[]>(queryKeys.syncStatus(), (current) => {
-      const list = current ?? [];
-      const index = list.findIndex(
-        (entry) => entry.accountId === status.accountId && entry.module === status.module,
-      );
-      if (index < 0) return [...list, status];
-      const next = [...list];
-      next[index] = status;
-      return next;
-    });
+    queryClient.setQueryData<SyncStatus[]>(queryKeys.syncStatus(), (current) =>
+      mergeSyncStatusEvent(current ?? [], status),
+    );
   });
 
   subscribe("accounts://changed", invalidateAccountData);

@@ -141,6 +141,21 @@ describe("inline image serialization", () => {
     expect(prepareEditorHtml(stored, [])).toBe("<p>Hello</p>");
   });
 
+  it("folds the mail empty-paragraph idiom into a real empty paragraph", () => {
+    // `<p><br></p>` would parse as a paragraph holding a hardBreak: two lines
+    // inside one paragraph, and a click on the second one moves the caret.
+    expect(prepareEditorHtml("<p><br></p>", [])).toBe("<p></p>");
+    expect(prepareEditorHtml("<p><br/></p>", [])).toBe("<p></p>");
+    expect(prepareEditorHtml("<p><br></p><p>Hi</p>", [])).toBe("<p></p><p>Hi</p>");
+    expect(prepareEditorHtml('<p class="x"><br></p>', [])).toBe('<p class="x"></p>');
+  });
+
+  it("keeps one empty paragraph per break and leaves real content alone", () => {
+    expect(prepareEditorHtml("<p><br><br></p>", [])).toBe("<p></p><p></p>");
+    expect(prepareEditorHtml("<p><br>Hello</p>", [])).toBe("<p><br>Hello</p>");
+    expect(prepareEditorHtml("<p>&nbsp;</p>", [])).toBe("<p>&nbsp;</p>");
+  });
+
   it("leaves html untouched when no font is configured", () => {
     expect(finalizeHtml("<p>Hi</p>")).toBe("<p>Hi</p>");
   });

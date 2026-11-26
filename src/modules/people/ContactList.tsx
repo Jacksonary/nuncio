@@ -15,22 +15,27 @@ import {
 } from "react";
 import {
   Add16Regular,
-  ArrowExport16Regular,
   ArrowSync16Regular,
+  ArrowUpload16Regular,
   Delete16Regular,
   People20Regular,
+  SelectAllOn16Regular,
   Star16Filled,
 } from "@fluentui/react-icons";
 import {
+  Avatar,
+  BulkBar,
   Button,
   Checkbox,
+  DangerButton,
   EmptyState,
   IconButton,
   Menu,
   ModuleSyncStatus,
   SearchBox,
   Spinner,
-  Avatar,
+  ToggleButton,
+  Tooltip,
   VirtualList,
   confirm,
   toast,
@@ -38,6 +43,7 @@ import {
 } from "@/components";
 import { sync as syncApi } from "@/ipc/api";
 import type { ContactSummary } from "@/ipc/types";
+import { formatShortcut } from "@/lib/hotkeys";
 import { useT } from "@/lib/i18n";
 import { useAppSettings } from "@/lib/useSettings";
 import { useShellStore } from "@/lib/store";
@@ -106,6 +112,7 @@ export function ContactList() {
   const clearSelection = usePeopleUiStore((state) => state.clearSelection);
   const openEdit = usePeopleUiStore((state) => state.openEdit);
   const focusSearchRequest = usePeopleUiStore((state) => state.focusSearchRequest);
+  const selectAllRequest = usePeopleUiStore((state) => state.selectAllRequest);
   const deleteRequest = usePeopleUiStore((state) => state.deleteRequest);
 
   const booksQuery = useAddressBooksQuery();
@@ -157,6 +164,32 @@ export function ContactList() {
   useEffect(() => {
     if (focusSearchRequest > 0) searchRef.current?.focus();
   }, [focusSearchRequest]);
+
+  const visibleIds = useMemo(
+    () =>
+      rows
+        .filter((row): row is Extract<PeopleRow, { kind: "contact" }> => row.kind === "contact")
+        .map((row) => row.contact.id),
+    [rows],
+  );
+  const allVisibleSelected =
+    visibleIds.length > 0 && visibleIds.every((id) => selectedIds.includes(id));
+
+  const selectAllVisible = useCallback(() => {
+    if (visibleIds.length === 0) return;
+    setSelectedIds(visibleIds);
+    setSelectionMode("multi");
+    setAnchor(visibleIds[0] ?? null);
+  }, [setAnchor, setSelectedIds, setSelectionMode, visibleIds]);
+
+  // `Ctrl/⌘+A` asks the store to select everything currently listed; the
+  // request counter keeps it one-shot so a later refetch cannot replay it.
+  const handledSelectAll = useRef(0);
+  useEffect(() => {
+    if (selectAllRequest === 0 || handledSelectAll.current === selectAllRequest) return;
+    handledSelectAll.current = selectAllRequest;
+    selectAllVisible();
+  }, [selectAllRequest, selectAllVisible]);
 
   // Changing the scope or filter starts a fresh selection.
   useEffect(() => {
@@ -473,45 +506,56 @@ export function ContactList() {
           onChange={setSearch}
           placeholder={t("people.search.placeholder")}
           aria-label={t("people.search.placeholder")}
-          shortcut="Mod+E"
+          shortcut={formatShortcut("Mod+E")}
         />
         {selectionMode === "multi" && selectedIds.length > 0 ? (
-          <div className={styles.bulkBar} role="toolbar" aria-label={t("people.list.selectedCount", { count: selectedIds.length })}>
-            <span className={styles.bulkLabel}>
-              {t("people.list.selectedCount", { count: selectedIds.length })}
-            </span>
-            <Button
-              size="small"
-              appearance="subtle"
+          <BulkBar
+            ariaLabel={t("people.list.selectedCount", { count: selectedIds.length })}
+            selectedCount={selectedIds.length}
+            onClear={clearSelection}
+            leading={
+              <Tooltip
+                content={
+                  allVisibleSelected
+                    ? t("people.list.selectNone")
+                    : t("people.list.selectAll")
+                }
+              >
+                <ToggleButton
+                  pressed={allVisibleSelected}
+                  onPressedChange={() =>
+                    allVisibleSelected ? clearSelection() : selectAllVisible()
+                  }
+                  icon={<SelectAllOn16Regular />}
+                  size="small"
+                  aria-label={t("people.list.selectAll")}
+                />
+              </Tooltip>
+            }
+          >
+            <IconButton
               icon={<Add16Regular />}
+              label={t("people.bulk.addToGroup")}
+              size="small"
               onClick={(event) => {
                 setGroupMenu({ open: true, anchor: event.currentTarget });
               }}
-            >
-              {t("people.bulk.addToGroup")}
-            </Button>
-            <Button
+            />
+            <IconButton
+              icon={<ArrowUpload16Regular />}
+              label={t("people.bulk.export")}
               size="small"
-              appearance="subtle"
-              icon={<ArrowExport16Regular />}
-              onClick={() =>
-                void exportContactIds(selectedIds, title || "contacts")
-              }
-            >
-              {t("people.bulk.export")}
-            </Button>
-            <Button
-              size="small"
-              appearance="subtle"
-              icon={<Delete16Regular />}
-              onClick={() => void confirmBulkDelete(selectedIds)}
-            >
-              {t("people.bulk.delete")}
-            </Button>
-            <Button size="small" appearance="transparent" onClick={clearSelection}>
-              {t("common.cancel")}
-            </Button>
-          </div>
+              onClick={() => void exportContactIds(selectedIds, title || "contacts")}
+            />
+            <Tooltip content={t("people.bulk.delete")}>
+              <DangerButton
+                size="small"
+                icon={<Delete16Regular />}
+                aria-label={t("people.bulk.delete")}
+                onClick={() => void confirmBulkDelete(selectedIds)}
+              />
+            </Tooltip>
+          </BulkBar>
         ) : null}
       </div>
 

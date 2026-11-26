@@ -36,9 +36,10 @@
   background: var(--control-bg-hover);
 }
 
+/* Border only: the old 2px accent underline made the bottom edge read three
+   times thicker than the other three sides. */
 .inputWrap:focus-within {
   border-color: var(--accent);
-  box-shadow: inset 0 -2px 0 var(--accent);
 }
 
 .small {
@@ -110,7 +111,13 @@
 
 .invalid:focus-within {
   border-color: var(--danger);
-  box-shadow: inset 0 -2px 0 var(--danger);
+}
+
+/* Opt out of the focus highlight while keeping the field chrome (task notes):
+   the border keeps its resting colour and the caret is the focus cue. Declared
+   after the rules above so it wins the specificity tie. */
+.noFocus:focus-within {
+  border-color: var(--border-strong);
 }
 
 .message {

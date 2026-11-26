@@ -111,6 +111,12 @@ export interface PopoverProps {
   ariaLabel?: string;
   closeOnOutsideClick?: boolean;
   closeOnEscape?: boolean;
+  /**
+   * Render a full-window click-away layer under the surface. Needed for menus:
+   * a click over the sandboxed mail iframe never reaches this document, so the
+   * outside-pointerdown listener cannot see it.
+   */
+  dismissOnAnyClick?: boolean;
   /** Render inline instead of a portal (used by nested submenus). */
   portal?: boolean;
   children: ReactNode;
@@ -201,6 +207,7 @@ export function Popover({
   ariaLabel,
   closeOnOutsideClick = true,
   closeOnEscape = true,
+  dismissOnAnyClick = false,
   portal = true,
   children,
 }: PopoverProps) {
@@ -377,5 +384,26 @@ export function Popover({
     </PopoverNestingContext.Provider>
   );
 
-  return portal ? createPortal(surface, document.body) : surface;
+  // A point-anchored surface (context menu) must be dismissible by a click
+  // anywhere. A click over the sandboxed mail iframe never reaches this
+  // document's listeners, so it needs an in-document layer to catch it: the
+  // click dismisses the menu instead of reaching what is underneath.
+  const catcher = point || dismissOnAnyClick ? (
+    <div
+      className={styles.catcher}
+      aria-hidden="true"
+      onPointerDown={(event) => {
+        event.preventDefault();
+        onClose();
+      }}
+    />
+  ) : null;
+
+  const tree = (
+    <>
+      {catcher}
+      {surface}
+    </>
+  );
+  return portal ? createPortal(tree, document.body) : tree;
 }

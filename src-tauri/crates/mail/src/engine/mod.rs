@@ -68,6 +68,15 @@ pub struct EngineConfig {
     pub error_after_failures: u32,
     /// Time without a working session before the UI shows an error.
     pub error_after: Duration,
+    /// Budget for one interactive IMAP command (write + tagged completion).
+    /// An expired budget poisons the connection and the worker reconnects.
+    pub command_timeout: Duration,
+    /// Budget for one metadata/body FETCH or SEARCH.
+    pub fetch_timeout: Duration,
+    /// Per-poll socket read inactivity limit. IDLE suspends it.
+    pub io_read_timeout: Duration,
+    /// Per-poll socket write inactivity limit.
+    pub io_write_timeout: Duration,
 }
 
 impl Default for EngineConfig {
@@ -78,6 +87,10 @@ impl Default for EngineConfig {
             no_idle_poll_interval: Duration::from_secs(120),
             error_after_failures: 3,
             error_after: Duration::from_secs(120),
+            command_timeout: crate::imap::conn::COMMAND_TIMEOUT,
+            fetch_timeout: crate::imap::conn::FETCH_TIMEOUT,
+            io_read_timeout: crate::imap::conn::IO_READ_TIMEOUT,
+            io_write_timeout: crate::imap::conn::IO_WRITE_TIMEOUT,
         }
     }
 }
@@ -665,8 +678,12 @@ impl Engine {
             .map_err(|_| AppError::internal("mail worker dropped the reply"))?
     }
 
-    /// Permanently empty a folder (UID STORE \Deleted + EXPUNGE).
-    pub async fn expunge_folder(&self, account_id: &str, folder_id: &str) -> Result<()> {
+    /// Permanently empty a folder (UID STORE \Deleted + UID EXPUNGE).
+    ///
+    /// Returns `false` when the server has no UIDPLUS: the messages keep their
+    /// `\Deleted` flag instead of a whole-folder EXPUNGE that would also erase
+    /// messages other clients flagged but did not intend to remove.
+    pub async fn expunge_folder(&self, account_id: &str, folder_id: &str) -> Result<bool> {
         let (sender, receiver) = oneshot::channel();
         self.sender(account_id)
             .await?

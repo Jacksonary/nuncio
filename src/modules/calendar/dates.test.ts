@@ -4,6 +4,7 @@ import {
   addDaysLocal,
   calendarDayDiff,
   combineDateAndMinutes,
+  createRange,
   formatRangeTitle,
   isoWeekNumber,
   monthGridDays,
@@ -200,5 +201,27 @@ describe("formatRangeTitle", () => {
     expect(
       formatRangeTitle("week", anchor, rangeForView("week", anchor, settings), "en-US"),
     ).toBe("November 9 – 15, 2026");
+  });
+});
+
+describe("createRange", () => {
+  it("keeps a real drag", () => {
+    expect(createRange(660, 720, 30)).toEqual({ start: 660, end: 720 });
+    expect(createRange(720, 660, 30)).toEqual({ start: 660, end: 720 });
+  });
+
+  it("gives a click the default duration instead of a sliver", () => {
+    // A click (no movement) must preview and create the same block.
+    expect(createRange(660, 660, 30)).toEqual({ start: 660, end: 690 });
+    // A drag shorter than one snap step counts as a click.
+    expect(createRange(660, 665, 30)).toEqual({ start: 660, end: 690 });
+  });
+
+  it("never creates less than one snap step", () => {
+    expect(createRange(660, 660, 5)).toEqual({ start: 660, end: 675 });
+  });
+
+  it("clamps the block inside the day", () => {
+    expect(createRange(1435, 1435, 30)).toEqual({ start: 1410, end: 1440 });
   });
 });

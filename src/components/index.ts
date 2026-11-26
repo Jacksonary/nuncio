@@ -89,6 +89,9 @@ export type { TabsProps, TabItem } from "./Tabs";
 export { CommandBar, Ribbon } from "./CommandBar";
 export type { CommandBarProps, CommandBarItem, RibbonProps } from "./CommandBar";
 
+export { BulkBar } from "./BulkBar";
+export type { BulkBarProps } from "./BulkBar";
+
 export { Card } from "./Card";
 export type { CardProps } from "./Card";
 

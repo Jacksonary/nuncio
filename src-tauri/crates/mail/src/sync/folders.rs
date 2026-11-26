@@ -7,19 +7,26 @@
 use std::collections::{HashMap, HashSet};
 
 use async_imap::imap_proto::NameAttribute;
-use futures::TryStreamExt;
 use nuncio_core::events;
 use nuncio_core::models::{Account, Folder, FolderRole};
-use nuncio_core::{AppError, CoreContext, Result};
+use nuncio_core::{CoreContext, Result};
 use tracing::{debug, info, warn};
 
 use crate::graph::{self, GraphMailClient};
-use crate::imap::conn::{ImapConnection, COMMAND_TIMEOUT};
-use crate::util::imap_error;
+use crate::imap::conn::ImapConnection;
 
 /// Remote paths reserved for folders that only exist locally (Outbox, and a
 /// Drafts folder for accounts whose server has none).
 pub const LOCAL_FOLDER_PREFIX: &str = "local:";
+
+/// `sync_state` key marking an account that needs its Drafts folder re-fetched
+/// as soon as one exists.
+///
+/// A refused draft identity receipt normally queues that resync directly. When
+/// the receiving account has no Drafts folder yet there is no folder id to
+/// target, so the request is recorded here instead; [`reconcile`] consumes it
+/// on the first pass that sees the folder appear.
+pub const DRAFTS_RESYNC_KEY: &str = "drafts_resync_pending";
 
 #[derive(Debug, Clone)]
 pub struct RemoteFolder {
@@ -92,6 +99,10 @@ pub async fn sync(
 /// Used by the Graph account loop and by account commands that have no worker
 /// connection.  It shares [`reconcile`] with the IMAP path.
 pub async fn sync_graph(ctx: &CoreContext, account: &Account) -> Result<Vec<Folder>> {
+    // Best effort, before the network call: the v1/legacy cursor rows are
+    // inert but should not survive forever, and an offline folder refresh
+    // should still get the chance to remove them.
+    crate::sync::messages::cleanup_legacy_graph_cursors(ctx, &account.id).await;
     let listing = graph::folders::list_folders(&GraphMailClient::new(), ctx, &account.id).await?;
     if !listing.complete {
         // A transient childFolders failure or the pagination cap makes the
@@ -268,11 +279,12 @@ async fn reconcile(
                 // row (it is the user's choice), so the stale auto-star has to
                 // be cleared explicitly rather than through the upsert.
                 let stored = if lost_system_role {
-                    nuncio_core::repo::folders::set_favorite(db, &stored.id, false)
-                        .map(|()| Folder {
+                    nuncio_core::repo::folders::set_favorite(db, &stored.id, false).map(|()| {
+                        Folder {
                             is_favorite: false,
                             ..stored
-                        })?
+                        }
+                    })?
                 } else {
                     stored
                 };
@@ -419,6 +431,66 @@ async fn reconcile(
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
 
+    // A refused draft-identity receipt for an account that had no Drafts folder
+    // left a marker instead of a resync target. This is the first pass that can
+    // see the folder appear, so consume the marker now: make the new folder
+    // re-fetch (an identity mismatch means its projection may belong to the
+    // mailbox the draft came from), then clear it.
+    let resync_pending = ctx
+        .db
+        .read({
+            let account_id = account_id.to_string();
+            move |db| nuncio_core::repo::sync_state::get(db, &account_id, "mail", DRAFTS_RESYNC_KEY)
+        })
+        .await?;
+    if resync_pending.is_some() {
+        let drafts = refreshed
+            .iter()
+            .find(|folder| {
+                folder.role == FolderRole::Drafts
+                    && !folder.remote_path.starts_with(LOCAL_FOLDER_PREFIX)
+            })
+            .cloned();
+        if let Some(folder) = drafts {
+            let folder_id = folder.id.clone();
+            let folder_for_log = folder_id.clone();
+            let account = account_id.to_string();
+            let delta_key = crate::graph::messages::delta_cursor_key(&folder_id);
+            ctx.db
+                .write(move |db| {
+                    let (uidvalidity, _, _) =
+                        nuncio_core::repo::folders::sync_flags(db, &folder_id)?;
+                    nuncio_core::repo::folders::set_sync_flags(
+                        db,
+                        &folder_id,
+                        uidvalidity,
+                        None,
+                        None,
+                    )?;
+                    // Graph reconciles through a delta cursor, not UIDNEXT.
+                    nuncio_core::repo::sync_state::delete_key(db, &account, "mail", &delta_key)?;
+                    nuncio_core::repo::sync_state::delete_key(
+                        db,
+                        &account,
+                        "mail",
+                        DRAFTS_RESYNC_KEY,
+                    )?;
+                    Ok(())
+                })
+                .await?;
+            debug!(
+                account = account_id,
+                folder = %folder_for_log,
+                "consumed the deferred Drafts resync marker"
+            );
+        } else {
+            debug!(
+                account = account_id,
+                "deferring the Drafts resync: the account still has no Drafts folder"
+            );
+        }
+    }
+
     let folder_ids: Vec<String> = refreshed.iter().map(|folder| folder.id.clone()).collect();
     events::emit_folders_changed(ctx.events.as_ref(), account_id.to_string(), folder_ids);
     info!(
@@ -430,37 +502,28 @@ async fn reconcile(
 }
 
 async fn list_remote(conn: &mut ImapConnection) -> Result<Vec<RemoteFolder>> {
-    let session = &mut conn.session;
-    let result = tokio::time::timeout(COMMAND_TIMEOUT, async {
-        let mut stream = session
-            .list(Some(""), Some("\"*\""))
-            .await
-            .map_err(imap_error)?;
-        let mut names = Vec::new();
-        while let Some(name) = stream.try_next().await.map_err(imap_error)? {
-            let path = name.name().to_string();
-            if path.is_empty() {
-                continue;
-            }
-            let delimiter = name.delimiter().map(str::to_string);
-            let attributes: Vec<String> = name.attributes().iter().map(attribute_name).collect();
-            let selectable = !attributes.iter().any(|value| value == "\\Noselect");
-            let display = display_name(&path, delimiter.as_deref());
-            names.push(RemoteFolder {
-                path,
-                delimiter,
-                name: display,
-                attributes,
-                selectable,
-                // IMAP addresses the mailbox by this same path.
-                provider_id: None,
-            });
+    let names = conn.list_all().await?;
+    let mut folders = Vec::new();
+    for name in &names {
+        let path = name.name().to_string();
+        if path.is_empty() {
+            continue;
         }
-        Ok::<Vec<RemoteFolder>, AppError>(names)
-    })
-    .await
-    .map_err(|_| AppError::network("LIST timed out"))??;
-    Ok(result)
+        let delimiter = name.delimiter().map(str::to_string);
+        let attributes: Vec<String> = name.attributes().iter().map(attribute_name).collect();
+        let selectable = !attributes.iter().any(|value| value == "\\Noselect");
+        let display = display_name(&path, delimiter.as_deref());
+        folders.push(RemoteFolder {
+            path,
+            delimiter,
+            name: display,
+            attributes,
+            selectable,
+            // IMAP addresses the mailbox by this same path.
+            provider_id: None,
+        });
+    }
+    Ok(folders)
 }
 
 fn attribute_name(attribute: &NameAttribute<'_>) -> String {
@@ -571,7 +634,13 @@ fn role_from_attributes(attributes: &[String]) -> Option<FolderRole> {
 fn resolve_role_conflicts(remotes: &[RemoteFolder]) -> Vec<FolderRole> {
     let claimed: Vec<FolderRole> = remotes
         .iter()
-        .map(|remote| role_for(&remote.path, remote.delimiter.as_deref(), &remote.attributes))
+        .map(|remote| {
+            role_for(
+                &remote.path,
+                remote.delimiter.as_deref(),
+                &remote.attributes,
+            )
+        })
         .collect();
 
     // Winner index per role, preferring an explicit attribute.
@@ -1121,9 +1190,15 @@ mod reconcile_tests {
         seed_account(&ctx).await;
 
         // First sync: `发件箱` is the only Sent-looking folder.
-        reconcile(&ctx, "acc", vec![remote("INBOX"), remote("发件箱")], false, true)
-            .await
-            .expect("first reconcile");
+        reconcile(
+            &ctx,
+            "acc",
+            vec![remote("INBOX"), remote("发件箱")],
+            false,
+            true,
+        )
+        .await
+        .expect("first reconcile");
         let stray = local_folder(&ctx, "发件箱").await;
         assert_eq!(stray.role, FolderRole::Sent);
         assert!(stray.is_favorite, "the Sent default stars the folder");
@@ -1214,7 +1289,9 @@ mod reconcile_tests {
         );
         summary.seen = true;
         summary.is_draft = true;
-        let stored = nuncio_core::models::StoredMessage::new(summary);
+        let mut stored = nuncio_core::models::StoredMessage::new(summary);
+        stored.uid = Some(11);
+        stored.uidvalidity = Some(3);
         ctx.db
             .write(move |db| {
                 nuncio_core::repo::folders::insert(db, &orphan)?;
@@ -1240,7 +1317,9 @@ mod reconcile_tests {
             .await
             .expect("folders");
         assert!(
-            !folders.iter().any(|folder| folder.remote_path == "local:drafts"),
+            !folders
+                .iter()
+                .any(|folder| folder.remote_path == "local:drafts"),
             "the placeholder must be deleted"
         );
         let real = folders
@@ -1258,6 +1337,23 @@ mod reconcile_tests {
         assert!(
             message.summary.is_draft,
             "moving between drafts folders must not demote the draft"
+        );
+        assert_eq!(
+            message.uid,
+            Some(11),
+            "the migration is local; it must keep the row addressable"
+        );
+        assert_eq!(message.uidvalidity, Some(3));
+        let pending = ctx
+            .db
+            .read(|db| {
+                nuncio_core::repo::messages::target_pending_ids(db, &["draft-1".to_string()])
+            })
+            .await
+            .expect("pending check");
+        assert!(
+            pending.is_empty(),
+            "a local draft-folder migration queues no server move and must not mark target_pending"
         );
     }
 

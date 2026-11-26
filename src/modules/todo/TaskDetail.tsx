@@ -991,6 +991,7 @@ export function TaskDetail({ taskId, seedTask, lists, accounts, today, onDeleted
             placeholder={t("todo.detail.notesPlaceholder")}
             value={notes}
             rows={4}
+            quietFocus
             disabled={readOnly}
             onChange={(event) => changeNotes(event.target.value)}
             onBlur={() => commitNotes()}

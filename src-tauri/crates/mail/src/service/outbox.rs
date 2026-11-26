@@ -448,6 +448,8 @@ impl MailService {
             importance: parsed.headers.importance,
             request_read_receipt: !parsed.headers.disposition_notification_to.is_empty(),
             remote_draft_message_id: None,
+            remote_draft: None,
+            sync_suppressed: false,
             updated_at: None,
         })
     }

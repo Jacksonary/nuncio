@@ -168,6 +168,11 @@ export interface TextAreaProps extends TextareaHTMLAttributes<HTMLTextAreaElemen
   counter?: boolean;
   containerClassName?: string;
   noResize?: boolean;
+  /**
+   * Keep the field chrome but drop the focus highlight (no accent border when
+   * the field holds focus). The caret is the only focus cue, like a mail body.
+   */
+  quietFocus?: boolean;
 }
 
 export const TextArea = forwardRef<HTMLTextAreaElement, TextAreaProps>(function TextArea(
@@ -184,6 +189,7 @@ export const TextArea = forwardRef<HTMLTextAreaElement, TextAreaProps>(function 
     maxLength,
     value,
     noResize = false,
+    quietFocus = false,
     ...rest
   },
   ref,
@@ -208,6 +214,7 @@ export const TextArea = forwardRef<HTMLTextAreaElement, TextAreaProps>(function 
         className={cn(
           styles.inputWrap,
           styles.textareaWrap,
+          quietFocus && styles.noFocus,
           error ? styles.invalid : undefined,
           disabled ? styles.disabled : undefined,
         )}

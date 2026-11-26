@@ -8,11 +8,16 @@
 use std::collections::HashSet;
 
 use nuncio_core::models::{
-    Address, FolderRole, MailRule, MessageSummary, RuleActionKind, RuleField, RuleOp,
+    Address, FolderRole, MailRule, MessageSummary, NewPendingOp, RuleActionKind, RuleField, RuleOp,
+    StoredMessage,
 };
 use nuncio_core::{repo, AppError, CoreContext, Result};
 use regex::RegexBuilder;
 use tracing::{debug, warn};
+
+use crate::ops::{
+    DeleteOp, MoveOp, SetFlagsOp, KIND_ARCHIVE, KIND_DELETE, KIND_MOVE, KIND_SET_FLAGS,
+};
 
 /// Side effects of applying rules, consumed by the notification step.
 #[derive(Debug, Default)]
@@ -205,6 +210,7 @@ async fn apply_rule_set(
     };
     let trash = find_role(FolderRole::Trash);
     let junk = find_role(FolderRole::Junk);
+    let archive = find_role(FolderRole::Archive);
     let all = find_role(FolderRole::All);
 
     for summary in messages {
@@ -244,6 +250,18 @@ async fn apply_rule_set(
             continue;
         }
         let mut changed = false;
+        // Priority within one rule chain: actions run in the order the user
+        // configured them, and the **first action that changes the message's
+        // folder wins**. Every later action in the chain would have to address
+        // the source UID, which is no longer valid once the optimistic move
+        // landed: a second Move would enqueue the same source UID twice (the
+        // remote copy already left that folder, so the second command cannot
+        // do what the user asked), and a Delete after a Move would target a
+        // message that is no longer there. So a Move/Archive/MarkJunk/Delete
+        // after a successful folder action is skipped, and so is any flag
+        // action after it (the flag command is UID-addressed too; put
+        // "mark as read"/"flag" before the move if both are wanted).
+        let mut folder_claimed = false;
         for rule in matched {
             debug!(rule = %rule.name, message = %summary.id, "mail rule matched");
             for action in &rule.actions {
@@ -253,35 +271,80 @@ async fn apply_rule_set(
                     }
                     RuleActionKind::Notify => {}
                     RuleActionKind::MarkRead => {
-                        apply_seen(ctx, &stored, &account.id).await?;
-                        changed = true;
+                        if folder_claimed {
+                            debug!(
+                                message = %summary.id,
+                                "rule action skipped: an earlier action already changed the folder"
+                            );
+                        } else if apply_seen(ctx, &stored, account).await? {
+                            changed = true;
+                        }
                     }
                     RuleActionKind::Flag => {
-                        apply_flagged(ctx, &stored, &account.id).await?;
-                        changed = true;
+                        if folder_claimed {
+                            debug!(
+                                message = %summary.id,
+                                "rule action skipped: an earlier action already changed the folder"
+                            );
+                        } else if apply_flagged(ctx, &stored, account).await? {
+                            changed = true;
+                        }
                     }
                     RuleActionKind::Move => {
-                        if let Some(target) = action.folder_id.clone() {
-                            if target != summary.folder_id {
-                                apply_move(ctx, &stored, &account.id, &target).await?;
+                        if folder_claimed {
+                            debug!(
+                                message = %summary.id,
+                                "rule move skipped: an earlier action already changed the folder"
+                            );
+                        } else if let Some(target) = action.folder_id.clone() {
+                            if apply_move(ctx, &stored, account, &target).await? {
                                 changed = true;
+                                folder_claimed = true;
                             }
                         }
                     }
                     RuleActionKind::Delete => {
-                        let target = trash.clone();
-                        apply_delete(ctx, &stored, &account.id, target.as_deref()).await?;
-                        changed = true;
+                        if folder_claimed {
+                            debug!(
+                                message = %summary.id,
+                                "rule delete skipped: an earlier action already changed the folder"
+                            );
+                        } else if apply_delete(ctx, &stored, account, trash.as_deref()).await? {
+                            changed = true;
+                            folder_claimed = true;
+                        }
                     }
                     RuleActionKind::MarkJunk => {
-                        if let Some(target) = junk.clone() {
-                            apply_move(ctx, &stored, &account.id, &target).await?;
-                            changed = true;
+                        if folder_claimed {
+                            debug!(
+                                message = %summary.id,
+                                "rule junk move skipped: an earlier action already changed the folder"
+                            );
+                        } else if let Some(target) = junk.clone() {
+                            if apply_move(ctx, &stored, account, &target).await? {
+                                changed = true;
+                                folder_claimed = true;
+                            }
                         }
                     }
                     RuleActionKind::Archive => {
-                        apply_archive(ctx, &stored, &account.id, all.as_deref()).await?;
-                        changed = true;
+                        if folder_claimed {
+                            debug!(
+                                message = %summary.id,
+                                "rule archive skipped: an earlier action already changed the folder"
+                            );
+                        } else if apply_archive(
+                            ctx,
+                            &stored,
+                            account,
+                            archive.as_deref(),
+                            all.as_deref(),
+                        )
+                        .await?
+                        {
+                            changed = true;
+                            folder_claimed = true;
+                        }
                     }
                 }
             }
@@ -306,133 +369,464 @@ async fn apply_rule_set(
     Ok(effects)
 }
 
+/// Row identity a rule matched against, re-checked inside the transaction
+/// that records each action.
+///
+/// Rules are evaluated outside the write transaction, and in between the user
+/// (or a sync) can move, re-sync or otherwise reassign the row. A UID is
+/// folder-local and only valid for one generation, so acting on the stale
+/// snapshot could send a command about a different message. Every action
+/// therefore re-reads the row and requires all of these to be unchanged.
+struct MatchedRow {
+    id: String,
+    account_id: String,
+    folder_id: String,
+    uid: Option<i64>,
+    uidvalidity: Option<i64>,
+}
+
+impl MatchedRow {
+    fn from_stored(stored: &StoredMessage) -> Self {
+        Self {
+            id: stored.summary.id.clone(),
+            account_id: stored.summary.account_id.clone(),
+            folder_id: stored.summary.folder_id.clone(),
+            uid: stored.uid,
+            uidvalidity: stored.uidvalidity,
+        }
+    }
+}
+
+/// True when the row still has the identity the rule matched against and is
+/// not an optimistic move waiting for its target UID.
+fn still_matches(db: &rusqlite::Connection, expected: &MatchedRow) -> Result<bool> {
+    let Some(current) = repo::messages::get(db, &expected.id)? else {
+        return Ok(false);
+    };
+    if current.summary.account_id != expected.account_id
+        || current.summary.folder_id != expected.folder_id
+        || current.uid != expected.uid
+        || current.uidvalidity != expected.uidvalidity
+    {
+        return Ok(false);
+    }
+    Ok(repo::messages::target_pending_ids(db, std::slice::from_ref(&expected.id))?.is_empty())
+}
+
+fn skipped_changed(expected: &MatchedRow, action: &str) {
+    warn!(
+        message = %expected.id,
+        action,
+        "rule action skipped: the message changed since the rule matched"
+    );
+}
+
 async fn apply_seen(
     ctx: &CoreContext,
-    stored: &nuncio_core::models::StoredMessage,
-    account_id: &str,
-) -> Result<()> {
-    let id = stored.summary.id.clone();
+    stored: &StoredMessage,
+    account: &nuncio_core::models::Account,
+) -> Result<bool> {
+    let expected = MatchedRow::from_stored(stored);
+    let account_id = account.id.clone();
+    let payload = if account.provider.uses_imap() {
+        stored
+            .uid
+            .map(|uid| {
+                serde_json::to_value(SetFlagsOp {
+                    folder_id: stored.summary.folder_id.clone(),
+                    uids: vec![uid],
+                    seen: Some(true),
+                    flagged: None,
+                    answered: None,
+                    forwarded: None,
+                    source_uidvalidity: stored.uidvalidity,
+                    previous: Vec::new(),
+                    message_ids: vec![stored.summary.id.clone()],
+                    outcomes: Vec::new(),
+                    remote_ids: Vec::new(),
+                })
+                .map_err(|error| {
+                    AppError::internal(format!("cannot encode rule flag change: {error}"))
+                })
+            })
+            .transpose()?
+    } else {
+        None
+    };
     ctx.db
-        .write(move |db| repo::messages::set_flags(db, &[id], Some(true), None, None, None))
-        .await?;
-    if let Some(uid) = stored.uid {
-        crate::ops::enqueue_set_flags(
-            ctx,
-            account_id,
-            &stored.summary.folder_id,
-            &[uid],
-            Some(true),
-            None,
-            None,
-            None,
-            "Rule: mark as read",
-        )
-        .await?;
-    }
-    Ok(())
+        .write(move |db| {
+            if !still_matches(db, &expected)? {
+                skipped_changed(&expected, "markRead");
+                return Ok(false);
+            }
+            repo::messages::set_flags(
+                db,
+                std::slice::from_ref(&expected.id),
+                Some(true),
+                None,
+                None,
+                None,
+            )?;
+            if let Some(payload) = payload {
+                let op = repo::pending_ops::enqueue(
+                    db,
+                    NewPendingOp::new(account_id, KIND_SET_FLAGS, payload, "Rule: mark as read"),
+                )?;
+                // The executor no longer treats a missing writer as permission
+                // for a payload that carries message ids. Record the owner in
+                // the same transaction as the queue row.
+                repo::messages::record_flag_writers(
+                    db,
+                    &expected.id,
+                    &op.id,
+                    "setSeen",
+                    Some(true),
+                    None,
+                    None,
+                    None,
+                )?;
+            }
+            Ok(true)
+        })
+        .await
 }
 
 async fn apply_flagged(
     ctx: &CoreContext,
-    stored: &nuncio_core::models::StoredMessage,
-    account_id: &str,
-) -> Result<()> {
-    let id = stored.summary.id.clone();
+    stored: &StoredMessage,
+    account: &nuncio_core::models::Account,
+) -> Result<bool> {
+    let expected = MatchedRow::from_stored(stored);
+    let account_id = account.id.clone();
+    let payload = if account.provider.uses_imap() {
+        stored
+            .uid
+            .map(|uid| {
+                serde_json::to_value(SetFlagsOp {
+                    folder_id: stored.summary.folder_id.clone(),
+                    uids: vec![uid],
+                    seen: None,
+                    flagged: Some(true),
+                    answered: None,
+                    forwarded: None,
+                    source_uidvalidity: stored.uidvalidity,
+                    previous: Vec::new(),
+                    message_ids: vec![stored.summary.id.clone()],
+                    outcomes: Vec::new(),
+                    remote_ids: Vec::new(),
+                })
+                .map_err(|error| {
+                    AppError::internal(format!("cannot encode rule flag change: {error}"))
+                })
+            })
+            .transpose()?
+    } else {
+        None
+    };
     ctx.db
-        .write(move |db| repo::messages::set_flags(db, &[id], None, Some(true), None, None))
-        .await?;
-    if let Some(uid) = stored.uid {
-        crate::ops::enqueue_set_flags(
-            ctx,
-            account_id,
-            &stored.summary.folder_id,
-            &[uid],
-            None,
-            Some(true),
-            None,
-            None,
-            "Rule: flag message",
-        )
-        .await?;
-    }
-    Ok(())
+        .write(move |db| {
+            if !still_matches(db, &expected)? {
+                skipped_changed(&expected, "flag");
+                return Ok(false);
+            }
+            repo::messages::set_flags(
+                db,
+                std::slice::from_ref(&expected.id),
+                None,
+                Some(true),
+                None,
+                None,
+            )?;
+            if let Some(payload) = payload {
+                let op = repo::pending_ops::enqueue(
+                    db,
+                    NewPendingOp::new(account_id, KIND_SET_FLAGS, payload, "Rule: flag message"),
+                )?;
+                repo::messages::record_flag_writers(
+                    db,
+                    &expected.id,
+                    &op.id,
+                    "setFlagged",
+                    None,
+                    Some(true),
+                    None,
+                    None,
+                )?;
+            }
+            Ok(true)
+        })
+        .await
 }
 
 async fn apply_move(
     ctx: &CoreContext,
-    stored: &nuncio_core::models::StoredMessage,
-    account_id: &str,
+    stored: &StoredMessage,
+    account: &nuncio_core::models::Account,
     target_folder: &str,
-) -> Result<()> {
-    let ids = vec![stored.summary.id.clone()];
+) -> Result<bool> {
+    let expected = MatchedRow::from_stored(stored);
+    let account_id = account.id.clone();
     let target = target_folder.to_string();
+    let payload = if account.provider.uses_imap() {
+        stored
+            .uid
+            .map(|uid| {
+                serde_json::to_value(MoveOp {
+                    folder_id: stored.summary.folder_id.clone(),
+                    target_folder_id: target.clone(),
+                    uids: vec![uid],
+                    message_ids: vec![stored.summary.id.clone()],
+                    source_uidvalidity: stored.uidvalidity,
+                    outcomes: Vec::new(),
+                    remote_ids: Vec::new(),
+                })
+                .map_err(|error| AppError::internal(format!("cannot encode rule move: {error}")))
+            })
+            .transpose()?
+    } else {
+        None
+    };
     ctx.db
-        .write(move |db| repo::messages::move_to_folder(db, &ids, &target))
-        .await?;
-    let uids: Vec<i64> = stored.uid.into_iter().collect();
-    if !uids.is_empty() {
-        crate::ops::enqueue_move(
-            ctx,
-            account_id,
-            &stored.summary.folder_id,
-            target_folder,
-            &uids,
-            "Rule: move message",
-        )
-        .await?;
-    }
-    Ok(())
+        .write(move |db| {
+            if !still_matches(db, &expected)? {
+                skipped_changed(&expected, "move");
+                return Ok(false);
+            }
+            if expected.folder_id == target {
+                return Ok(false);
+            }
+            let ids = vec![expected.id.clone()];
+            match payload {
+                // No server identity (Local/POP3, or a Graph row without a
+                // UID mapping): move the row plainly and queue nothing.
+                None => {
+                    repo::messages::move_to_folder(db, &ids, &target)?;
+                }
+                // The optimistic move and the queue row are written together:
+                // a queued move always has a `target_pending` row and vice
+                // versa.
+                Some(payload) => {
+                    repo::messages::move_to_folder_pending(db, &ids, &target)?;
+                    let op = repo::pending_ops::enqueue(
+                        db,
+                        NewPendingOp::new(
+                            account_id,
+                            KIND_MOVE,
+                            payload.clone(),
+                            "Rule: move message",
+                        ),
+                    )?;
+                    // The rule-created trip owns the destination slot from the
+                    // moment it is projected. Without this claim a retry of an
+                    // earlier batch could write its stale destination onto the
+                    // new projection before this operation confirms, and the
+                    // old id's `@removed` would then delete it.
+                    crate::ops::claim_move_target_owner(
+                        db,
+                        &op.account_id,
+                        KIND_MOVE,
+                        &payload,
+                        &op.id,
+                        op.sequence,
+                    )?;
+                }
+            }
+            Ok(true)
+        })
+        .await
 }
 
 async fn apply_delete(
     ctx: &CoreContext,
-    stored: &nuncio_core::models::StoredMessage,
-    account_id: &str,
+    stored: &StoredMessage,
+    account: &nuncio_core::models::Account,
     trash: Option<&str>,
-) -> Result<()> {
-    if let Some(trash) = trash {
-        apply_move(ctx, stored, account_id, trash).await
-    } else {
-        let ids = vec![stored.summary.id.clone()];
-        ctx.db
-            .write(move |db| repo::messages::delete_local(db, &ids, false))
-            .await?;
-        let uids: Vec<i64> = stored.uid.into_iter().collect();
-        crate::ops::enqueue_delete(
-            ctx,
-            account_id,
-            &stored.summary.folder_id,
-            &uids,
-            false,
-            "Rule: delete message",
-        )
-        .await
-    }
+) -> Result<bool> {
+    let Some(trash) = trash else {
+        // No Trash folder: hide the row locally until the server confirms the
+        // delete, and queue the UID command (when there is one). `soft_hidden`
+        // records the local projection so a refused command unhides the row;
+        // a permanent server delete is what the executor does when the source
+        // has no Trash role.
+        let expected = MatchedRow::from_stored(stored);
+        let account_id = account.id.clone();
+        let payload = if account.provider.uses_imap() {
+            stored
+                .uid
+                .map(|uid| {
+                    serde_json::to_value(DeleteOp {
+                        folder_id: stored.summary.folder_id.clone(),
+                        uids: vec![uid],
+                        permanent: false,
+                        target_folder_id: None,
+                        soft_hidden: true,
+                        message_ids: vec![stored.summary.id.clone()],
+                        source_uidvalidity: stored.uidvalidity,
+                        pending_delete: false,
+                        deleted_flag_set: false,
+                        snapshot: Vec::new(),
+                        outcomes: Vec::new(),
+                        remote_ids: Vec::new(),
+                    })
+                    .map_err(|error| {
+                        AppError::internal(format!("cannot encode rule delete: {error}"))
+                    })
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        return ctx
+            .db
+            .write(move |db| {
+                if !still_matches(db, &expected)? {
+                    skipped_changed(&expected, "delete");
+                    return Ok(false);
+                }
+                repo::messages::delete_local(db, std::slice::from_ref(&expected.id), false)?;
+                if let Some(payload) = payload {
+                    repo::pending_ops::enqueue(
+                        db,
+                        NewPendingOp::new(account_id, KIND_DELETE, payload, "Rule: delete message"),
+                    )?;
+                }
+                Ok(true)
+            })
+            .await;
+    };
+    apply_move(ctx, stored, account, trash).await
 }
 
+/// Archive one message, reusing the provider-aware `ArchiveOp` semantics:
+/// Gmail drops the Inbox label, a regular IMAP mailbox moves to `\Archive` and
+/// only falls back to `\All` when no Archive folder exists.
+///
+/// The local projection uses the same target the executor will use. When the
+/// account has neither role, the row is hidden in place and the payload records
+/// `soft_hidden`, so a refused command unhides it by local id (the move
+/// rollback would look in a target folder that never existed).
 async fn apply_archive(
     ctx: &CoreContext,
-    stored: &nuncio_core::models::StoredMessage,
-    account_id: &str,
+    stored: &StoredMessage,
+    account: &nuncio_core::models::Account,
+    archive: Option<&str>,
     all: Option<&str>,
-) -> Result<()> {
-    if let Some(all) = all {
-        apply_move(ctx, stored, account_id, all).await?;
-    } else {
-        let ids = vec![stored.summary.id.clone()];
-        ctx.db
-            .write(move |db| repo::messages::delete_local(db, &ids, false))
-            .await?;
-    }
-    let uids: Vec<i64> = stored.uid.into_iter().collect();
-    crate::ops::enqueue_archive(
-        ctx,
-        account_id,
-        &stored.summary.folder_id,
-        &uids,
-        "Rule: archive message",
-    )
-    .await
+) -> Result<bool> {
+    let expected = MatchedRow::from_stored(stored);
+    let account_id = account.id.clone();
+    let imap = account.provider.uses_imap();
+    let archive = archive.map(str::to_string);
+    let all = all.map(str::to_string);
+    let uid = stored.uid;
+    let source_folder_id = stored.summary.folder_id.clone();
+    let uidvalidity = stored.uidvalidity;
+    let gmail = account.capabilities.gmail_extensions;
+    ctx.db
+        .write(move |db| {
+            if !still_matches(db, &expected)? {
+                skipped_changed(&expected, "archive");
+                return Ok(false);
+            }
+            // Provider-aware target shared with the manual archive action:
+            // Gmail drops the Inbox label (All Mail), everyone else moves to a
+            // real `\Archive` (created by the executor when missing).
+            let target = crate::ops::archive_target(gmail, archive.as_deref(), all.as_deref());
+            // Already filed in that target: there is nothing to archive.
+            if target.as_deref() == Some(expected.folder_id.as_str())
+                || (gmail && all.as_deref() == Some(expected.folder_id.as_str()))
+            {
+                return Ok(false);
+            }
+            let ids = vec![expected.id.clone()];
+            let message_ids = ids.clone();
+            match target {
+                Some(target) => {
+                    let payload = if imap {
+                        uid.map(|uid| {
+                            serde_json::to_value(crate::ops::ArchiveOp {
+                                folder_id: source_folder_id.clone(),
+                                uids: vec![uid],
+                                target_folder_id: Some(target.clone()),
+                                soft_hidden: false,
+                                message_ids: message_ids.clone(),
+                                source_uidvalidity: uidvalidity,
+                                outcomes: Vec::new(),
+                                remote_ids: Vec::new(),
+                            })
+                        })
+                        .transpose()
+                        .map_err(|error| {
+                            AppError::internal(format!("cannot encode rule archive: {error}"))
+                        })?
+                    } else {
+                        None
+                    };
+                    match payload {
+                        Some(payload) => {
+                            // The projection and the queued command now need the
+                            // same target folder.
+                            repo::messages::move_to_folder_pending(db, &ids, &target)?;
+                            let op = repo::pending_ops::enqueue(
+                                db,
+                                NewPendingOp::new(
+                                    account_id,
+                                    KIND_ARCHIVE,
+                                    payload.clone(),
+                                    "Rule: archive message",
+                                ),
+                            )?;
+                            // Same ownership rule as `apply_move`: the queued
+                            // archive is the only operation allowed to fill
+                            // this projection's destination slot.
+                            crate::ops::claim_move_target_owner(
+                                db,
+                                &op.account_id,
+                                KIND_ARCHIVE,
+                                &payload,
+                                &op.id,
+                                op.sequence,
+                            )?;
+                        }
+                        None => {
+                            repo::messages::move_to_folder(db, &ids, &target)?;
+                        }
+                    }
+                }
+                None => {
+                    // No Archive or All folder to project into. Only hide when
+                    // a server command will actually resolve the state; without
+                    // a UID there is no command and the row would stay hidden.
+                    let Some(uid) = uid.filter(|_| imap) else {
+                        return Ok(false);
+                    };
+                    let payload = serde_json::to_value(crate::ops::ArchiveOp {
+                        folder_id: source_folder_id.clone(),
+                        uids: vec![uid],
+                        target_folder_id: None,
+                        soft_hidden: true,
+                        message_ids,
+                        source_uidvalidity: uidvalidity,
+                        outcomes: Vec::new(),
+                        remote_ids: Vec::new(),
+                    })
+                    .map_err(|error| {
+                        AppError::internal(format!("cannot encode rule archive: {error}"))
+                    })?;
+                    repo::messages::delete_local(db, &ids, false)?;
+                    repo::pending_ops::enqueue(
+                        db,
+                        NewPendingOp::new(
+                            account_id,
+                            KIND_ARCHIVE,
+                            payload,
+                            "Rule: archive message",
+                        ),
+                    )?;
+                }
+            }
+            Ok(true)
+        })
+        .await
 }
 
 /// Validate a rule before persisting it (rejects invalid regex conditions).

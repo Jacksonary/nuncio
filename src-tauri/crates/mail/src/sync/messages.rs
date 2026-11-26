@@ -12,20 +12,23 @@
 use std::collections::{HashMap, HashSet};
 
 use async_imap::imap_proto::{AttributeValue, MessageSection, Response, SectionPath, Status};
-use async_imap::types::Fetch;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use futures::TryStreamExt;
 use nuncio_core::models::SyncModule;
 use nuncio_core::models::{Folder, FolderRole, PendingOpState};
 use nuncio_core::{events, repo, AppError, CoreContext, Result};
 use rusqlite::OptionalExtension;
 use tracing::{debug, warn};
 
-use crate::imap::conn::{ImapConnection, FETCH_TIMEOUT};
+use crate::imap::conn::ImapConnection;
 use crate::imap::fetch::{meta_from_fetch, FlagSnapshot};
+use crate::ops::OpMessageState;
 use crate::util::{imap_date, imap_error, uid_set};
 
 const BATCH_SIZE: usize = 200;
+/// `load_older` is a user-initiated single step, not a background sweep. A
+/// smaller batch keeps the first "load older" responsive on slow providers
+/// (163).
+const LOAD_OLDER_BATCH_SIZE: usize = 50;
 const FLAG_BATCH_SIZE: usize = 500;
 const PREVIEW_BYTES: usize = 2048;
 const FULL_RECONCILE_HOURS: i64 = 12;
@@ -37,6 +40,54 @@ pub struct SyncOutcome {
     pub deleted_ids: Vec<String>,
     pub initial: bool,
     pub folder_id: String,
+}
+
+/// `sync_state` key prefixes written by builds that still requested a
+/// server-side `$filter` for Graph delta.
+///
+/// Those tokens silently stop at Graph's 5,000-result cap, so resuming one
+/// would keep skipping changes the truncated scan never saw. The v2 keys
+/// deliberately orphan them; this cleanup removes the dead rows instead of
+/// letting them accumulate. The unprefixed variants are the tokens written
+/// before the versioned rename. None of these prefixes can match a live key:
+/// `graph_delta_v2:` does not start with `graph_delta:`, and likewise for the
+/// pending marker.
+const LEGACY_GRAPH_CURSOR_PREFIXES: &[&str] = &[
+    "graph_delta_v1:",
+    "graph_pending_v1:",
+    "graph_delta:",
+    "graph_pending:",
+];
+
+/// Best-effort removal of Graph delta cursors from before the unfiltered scan.
+///
+/// Idempotent and scoped to `account_id` + the `mail` module, so it can run on
+/// every account sync. A failure is logged and ignored: stale rows are inert,
+/// and cleanup must never block message synchronization.
+pub async fn cleanup_legacy_graph_cursors(ctx: &CoreContext, account_id: &str) {
+    let account_id = account_id.to_string();
+    let scope = account_id.clone();
+    let result = ctx
+        .db
+        .write(move |db| {
+            for entry in repo::sync_state::list_module(db, &scope, "mail")? {
+                if LEGACY_GRAPH_CURSOR_PREFIXES
+                    .iter()
+                    .any(|prefix| entry.key.starts_with(prefix))
+                {
+                    repo::sync_state::delete_key(db, &scope, "mail", &entry.key)?;
+                }
+            }
+            Ok(())
+        })
+        .await;
+    if let Err(error) = result {
+        warn!(
+            %error,
+            account = %account_id,
+            "cannot remove legacy Graph delta cursors; continuing"
+        );
+    }
 }
 
 /// Synchronize one folder. Callers own the sync-status lifecycle
@@ -136,6 +187,21 @@ pub async fn sync_folder(
         .await?;
     }
 
+    // Rows a failed operation left without a trusted folder-local identity are
+    // resolved here, without the sync window: a UID that the server still
+    // reports is confirmed, otherwise a Message-ID header search rebinds the
+    // row (or proves it is gone). Best effort: a failed lookup only leaves the
+    // marker for the next pass.
+    if let Err(error) =
+        reconcile_pending_identities(ctx, conn, account, folder, current_validity).await
+    {
+        warn!(
+            %error,
+            folder = %folder.remote_path,
+            "pending identity reconciliation failed"
+        );
+    }
+
     let folder_id = folder.id.clone();
     let last_sync = Utc::now();
     ctx.db
@@ -197,6 +263,18 @@ pub async fn sync_folder_graph(
     account: &nuncio_core::models::Account,
     folder: &Folder,
 ) -> Result<SyncOutcome> {
+    sync_folder_graph_with(ctx, account, folder, &crate::graph::GraphMailClient::new()).await
+}
+
+/// [`sync_folder_graph`] against an explicit client; tests use a loopback
+/// server so the delta request and its projection can be observed without
+/// talking to Microsoft.
+pub async fn sync_folder_graph_with(
+    ctx: &CoreContext,
+    account: &nuncio_core::models::Account,
+    folder: &Folder,
+    client: &crate::graph::GraphMailClient,
+) -> Result<SyncOutcome> {
     if !folder.is_selectable {
         return Ok(SyncOutcome {
             folder_id: folder.id.clone(),
@@ -204,7 +282,6 @@ pub async fn sync_folder_graph(
         });
     }
 
-    let client = crate::graph::GraphMailClient::new();
     let cursor_key = crate::graph::messages::delta_cursor_key(&folder.id);
     let cursor = {
         let account_id = account.id.clone();
@@ -213,30 +290,54 @@ pub async fn sync_folder_graph(
             .read(move |db| repo::sync_state::get(db, &account_id, "mail", &cursor_key))
             .await?
     };
+    // No stored cursor means this folder has not completed a first delta scan
+    // yet. That pass now walks the whole folder without a `$filter`, so a large
+    // mailbox can take several rounds (see `graph::messages::MAX_PAGES`); the
+    // marker tells the UI this is expected work rather than a stalled sync. A
+    // resumed truncated pass has a pending page but still no cursor, so it
+    // stays marked until the scan finally produces one.
+    let full_sync = cursor.is_none();
+    // The marker owns the visible flag until this future finishes. It lives in
+    // a guard rather than an explicit clear so that a dropped future (the
+    // account worker aborted while the request is on the wire) still clears
+    // it; the guard also refuses to clear a flag a newer pass has set.
+    let full_sync_marker = if full_sync {
+        ctx.sync_status
+            .mark_full_sync(&account.id, SyncModule::Mail)
+    } else {
+        None
+    };
 
-    // `Folder::remote_path` is the readable local path; Graph delta and
-    // operation endpoints need the opaque folder id recorded at folder sync.
-    let graph_path = crate::sync::folders::graph_folder_id(ctx, &account.id, &folder.remote_path)
-        .await?
-        .ok_or_else(|| {
-            AppError::not_found(format!(
-                "Graph folder id is unknown for {}; refresh folders first",
-                folder.remote_path
-            ))
-        })?;
-    let mut graph_folder = folder.clone();
-    graph_folder.remote_path = graph_path;
+    let result = async {
+        // `Folder::remote_path` is the readable local path; Graph delta and
+        // operation endpoints need the opaque folder id recorded at folder
+        // sync.
+        let graph_path =
+            crate::sync::folders::graph_folder_id(ctx, &account.id, &folder.remote_path)
+                .await?
+                .ok_or_else(|| {
+                    AppError::not_found(format!(
+                        "Graph folder id is unknown for {}; refresh folders first",
+                        folder.remote_path
+                    ))
+                })?;
+        let mut graph_folder = folder.clone();
+        graph_folder.remote_path = graph_path;
 
-    let delta = crate::graph::messages::sync_messages(
-        &client,
-        ctx,
-        &account.id,
-        &graph_folder,
-        cursor.as_deref(),
-        account.sync_window_days,
-    )
-    .await?;
-    apply_graph_delta(ctx, account, folder, delta).await
+        let delta = crate::graph::messages::sync_messages(
+            client,
+            ctx,
+            &account.id,
+            &graph_folder,
+            cursor.as_deref(),
+            account.sync_window_days,
+        )
+        .await?;
+        apply_graph_delta(ctx, account, folder, delta).await
+    }
+    .await;
+    drop(full_sync_marker);
+    result
 }
 
 /// Persist one Graph batch (delta pass or older-mail page) into the local
@@ -263,7 +364,17 @@ async fn apply_graph_delta(
     // Copy out of the borrowed account for the `'static` write closure.
     let sync_window_days = account.sync_window_days;
     let messages = delta.messages;
-    let mut removed_ids = delta.removed_remote_ids;
+    // A confirmed move destination must update the optimistic projection that
+    // already lives in this folder. The projection has no provider id, so this
+    // is the only association the writer has; without it the new Graph id
+    // becomes a second row and the original one stays unbound forever.
+    let adopted_local_ids = delta.adopted_local_ids;
+    let removed_ids = delta.removed_remote_ids;
+    // The cursor and pending page belong to exactly these rows. They are
+    // persisted inside the same write transaction below: committing a cursor
+    // without its rows would make the retry skip the unstored changes.
+    let delta_link = delta.delta_link;
+    let pending_cursor = delta.pending_cursor;
     let resync_folder = folder.id.clone();
 
     let (inserted, updated, removed_ids) = ctx
@@ -271,6 +382,180 @@ async fn apply_graph_delta(
         .write(move |db| {
             let mut inserted = Vec::new();
             let mut updated = Vec::new();
+            // A delta page only carries identities for the Graph ids it
+            // actually returned. A confirmed move destination that has not
+            // appeared in this batch must still protect its projection: an
+            // update or removal carrying the row's *old* id would otherwise
+            // rewrite it and clear `target_pending`, and an unrelated copy
+            // sharing the Message-ID could be folded into it. Derive the
+            // complete mapping from the durable operation queue instead,
+            // independent of the page's contents. It is computed inside the
+            // write transaction, so it is fresher than the page's mapping (an
+            // undo may have moved the row back) and wins where both name the
+            // same Graph id.
+            let mut adopted_local_ids = adopted_local_ids;
+            // The page mapping was captured when the delta was requested, so it
+            // predates this transaction. A newer trip may have claimed the row
+            // since (an undo that moved it out and back again is the common
+            // case), and a claim alone owns the identity slot even before its
+            // destination is confirmed. Only the current owner's confirmed
+            // destination may still alias the row; every other page entry is
+            // historical evidence and must not resolve (or delete) the
+            // projection below.
+            let current_owners =
+                repo::messages::move_target_owners(db, &account_id, &folder_id)?;
+            // The current owner's confirmed destination, if it has one. Kept
+            // outside the `retain` below so the Message-ID heuristic and the
+            // primary-key upsert guard can also tell the current trip's own
+            // binding from a stale one.
+            let current_destinations: HashMap<String, String> = if current_owners.is_empty() {
+                HashMap::new()
+            } else {
+                repo::messages::move_target_identities(db, &account_id, &folder_id)?
+                    .into_iter()
+                    .map(|identity| (identity.local_id, identity.remote_id))
+                    .collect()
+            };
+            if !current_owners.is_empty() {
+                adopted_local_ids.retain(|remote, local| match current_owners.get(local) {
+                    // A claimed row is owned by a current trip. Its own
+                    // confirmed destination is the only alias that may stand;
+                    // with a claim-only trip there is none, so every page
+                    // alias is stale.
+                    Some(_) => current_destinations.get(local) == Some(remote),
+                    None => true,
+                });
+            }
+            for (remote, local) in confirmed_move_targets(db, &account_id, &folder_id)? {
+                // One local row may only be adopted for one destination id.
+                // The row's own identity is authoritative, so a page-provided
+                // stale alias for the same row is dropped rather than kept
+                // alongside it (an `@removed` for the old id would otherwise
+                // resolve the projection and delete it).
+                adopted_local_ids.retain(|existing_remote, existing_local| {
+                    existing_local != &local || existing_remote == &remote
+                });
+                adopted_local_ids.insert(remote, local);
+            }
+            // Local rows this batch's confirmed move receipts already own. A
+            // pending projection in this set may only be resolved by its
+            // adopted Graph id: another copy sharing the Message-ID, or a
+            // stale id that happens to equal its primary key, must not consume
+            // it.
+            let adopted_local_id_set: HashSet<&str> =
+                adopted_local_ids.values().map(String::as_str).collect();
+            // Same protection as the IMAP metadata path: a delta can still
+            // report a message whose permanent delete is queued, and upserting
+            // it would undo the optimistic hide.
+            let pending_delete_rows: HashSet<String> =
+                repo::messages::pending_delete_ids_in_folder(db, &folder_id)?
+                    .into_iter()
+                    .collect();
+            let pending_delete_remote: HashSet<String> = {
+                let mut statement = db.prepare(
+                    "SELECT gm_msgid FROM message
+                      WHERE folder_id = ?1 AND pending_delete = 1 AND gm_msgid IS NOT NULL",
+                )?;
+                let mut rows = statement.query(rusqlite::params![folder_id])?;
+                let mut values = HashSet::new();
+                while let Some(row) = rows.next()? {
+                    values.insert(row.get::<_, String>(0)?);
+                }
+                values
+            };
+            // Resolve every removal to the local row it names before deleting.
+            // A confirmed binding keeps the local primary key and mirrors the
+            // provider id into `gm_msgid` (`id=m-old, gm_msgid=m-new`), so
+            // deleting by the Graph id alone would miss the row while the
+            // cursor advanced past the deletion. The local primary key remains
+            // the fallback for rows that never went through a binding.
+            //
+            // The resolved local id is kept together with the Graph id that
+            // named it: the row may still be reused by another entry of this
+            // same batch, and deleting it then would remove the live
+            // replacement. The apply-time check below re-validates every
+            // target against the binding it had when it was resolved.
+            //
+            // The same ids must also suppress this batch's upserts: a page can
+            // report a message before it reports its removal (the local row
+            // does not exist yet at resolution time), and writing it after the
+            // deletion evidence would resurrect it with the cursor advanced
+            // past both events.
+            let removed_remote_set: HashSet<String> = removed_ids.iter().cloned().collect();
+            // `None` is a full-scan prune target (no Graph id names it); the
+            // apply-time check only applies to removal events.
+            let mut removed_targets: Vec<(String, Option<String>)> = Vec::new();
+            for remote in &removed_ids {
+                match local_row_for_graph_id(db, &account_id, &folder_id, remote)? {
+                    Some((local_id, pending_delete)) => {
+                        if pending_delete != 0 {
+                            // The row is hidden for an unconfirmed permanent
+                            // delete; the queued operation owns its removal.
+                            debug!(
+                                message = %local_id,
+                                remote = %remote,
+                                folder = %folder_id,
+                                "Graph removal left a row hidden for an unconfirmed permanent delete"
+                            );
+                            continue;
+                        }
+                        removed_targets.push((local_id, Some(remote.clone())));
+                    }
+                    None => {
+                        // A confirmed move destination has no `gm_msgid` on its
+                        // projection yet, so only the confirmed mapping can
+                        // name it. Deleting it here is what lets the cursor
+                        // advance safely; without this the removal matches
+                        // nothing and the projection is lost with the cursor.
+                        match adopted_local_ids.get(remote) {
+                            Some(local_id)
+                                if is_pending_projection(
+                                    db,
+                                    &account_id,
+                                    &folder_id,
+                                    local_id,
+                                )? =>
+                            {
+                                removed_targets.push((local_id.clone(), Some(remote.clone())));
+                            }
+                            Some(local_id) => {
+                                // The pass promised this row, but it is no
+                                // longer the projection the confirmation
+                                // described (an undo may have moved it back).
+                                // Deleting a guess is unsafe, and advancing the
+                                // cursor would discard the only evidence that
+                                // names it: fail the batch so the next run
+                                // replays from the same cursor.
+                                return Err(AppError::conflict(format!(
+                                    "Graph removal {remote} names a confirmed move projection \
+                                     ({local_id}) that is no longer pending in folder {folder_id}"
+                                )));
+                            }
+                            None => {
+                                // An id with no local row and no confirmed
+                                // identity (already pruned, another folder, or
+                                // a copy that never reached the store) is not a
+                                // failure: the rest of the batch still applies
+                                // and the cursor still advances, but the event
+                                // is recorded.
+                                debug!(
+                                    remote = %remote,
+                                    folder = %folder_id,
+                                    "Graph removal did not match a local row"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            // A delta may contain two copies of the same mail (same Message-ID,
+            // different Graph ids). Count them before any row is reused.
+            let mut header_counts: HashMap<String, usize> = HashMap::new();
+            for stored in &messages {
+                if let Some(header) = stored.message_id_header.as_deref() {
+                    *header_counts.entry(header.to_string()).or_default() += 1;
+                }
+            }
             for mut stored in messages {
                 // Graph, like IMAP, can hand out a new provider id for a
                 // message whose content did not change: every draft save
@@ -282,11 +567,123 @@ async fn apply_graph_delta(
                 // projection row and the APPEND echo become two rows for one
                 // draft.
                 let remote_id = stored.summary.id.clone();
-                if let Some(header) = stored.message_id_header.as_deref() {
-                    if let Some(existing_id) =
-                        local_id_for_message_id(db, &account_id, &folder_id, header)?
+                // The same batch removed this Graph id: deletion evidence wins
+                // over its upsert, even when the local row did not exist yet
+                // when the removals were resolved above. Writing it here would
+                // recreate the message the server already deleted.
+                if removed_remote_set.contains(&remote_id) {
+                    debug!(
+                        remote = %remote_id,
+                        folder = %folder_id,
+                        "Graph batch both upserted and removed this id; skipping the write"
+                    );
+                    continue;
+                }
+                // Re-check the projection inside the write: an undo may have
+                // moved the row back while the delta request was in flight.
+                let adopted_local_id = match adopted_local_ids.get(&remote_id) {
+                    Some(local_id)
+                        if is_pending_projection(db, &account_id, &folder_id, local_id)? =>
                     {
-                        stored.summary.id = existing_id;
+                        Some(local_id.clone())
+                    }
+                    _ => None,
+                };
+                let resolved_by_adoption = adopted_local_id.is_some();
+                if let Some(local_id) = adopted_local_id {
+                    // The destination of an optimistic move: the row was moved
+                    // locally already, so apply the delta onto it. This takes
+                    // precedence over the Message-ID heuristic because the
+                    // executor confirmed this exact local row.
+                    stored.summary.id = local_id;
+                } else if let Some((local_id, _)) =
+                    local_row_for_graph_id(db, &account_id, &folder_id, &remote_id)?
+                {
+                    // The row is already bound to this provider id but keeps a
+                    // different local primary key. This must come before the
+                    // Message-ID heuristic: after a confirmed move or a draft
+                    // re-APPEND the stored header may lag behind (or be absent),
+                    // so a repeated delivery of the same Graph id would
+                    // otherwise insert a second row and advance the cursor.
+                    stored.summary.id = local_id;
+                } else if let Some(header) = stored.message_id_header.as_deref() {
+                    let incoming = header_counts.get(header).copied().unwrap_or(1);
+                    if let Some(existing_id) =
+                        local_id_for_message_id(db, &account_id, &folder_id, header, incoming)?
+                    {
+                        // A row already bound to a different Graph id may
+                        // only be reused when this batch also removes that
+                        // binding: a re-APPENDed draft or a replacement copy
+                        // reports the old id removed next to the new one.
+                        // Otherwise the row keeps the live binding and this
+                        // entry must not be folded into it.
+                        //
+                        // Refusing that *reuse* is not refusing the *import*:
+                        // a copy has its own Graph id but shares the original
+                        // Message-ID, so the entry is a legitimate second
+                        // message. Leaving `summary.id` as the incoming Graph
+                        // id makes the insert below create a row for it.
+                        // Skipping the entry instead would lose the copy
+                        // forever while the cursor advanced past it. Only a
+                        // repeated delivery of the same Graph id (resolved
+                        // above by `local_row_for_graph_id`) is a duplicate.
+                        //
+                        // A row that a current move trip owns (a claim alone or
+                        // a confirmed destination) may only be bound by that
+                        // trip's own confirmed destination. This incoming
+                        // entry is not part of that trip, so reusing the row
+                        // would clear `target_pending` and its owner while the
+                        // move is still waiting. Import a genuinely new copy
+                        // under its own Graph id instead; when the entry names
+                        // the row's own primary key there is no separate row to
+                        // import, so ignore it and let the trip settle.
+                        if current_owners.contains_key(existing_id.as_str()) {
+                            if existing_id == remote_id {
+                                debug!(
+                                    message = %existing_id,
+                                    remote = %remote_id,
+                                    folder = %folder_id,
+                                    "Graph update names a row owned by its current move trip; ignored"
+                                );
+                                continue;
+                            }
+                            debug!(
+                                message = %existing_id,
+                                remote = %remote_id,
+                                folder = %folder_id,
+                                "Graph message shares a Message-ID with a row owned by its current move trip; importing it as a new copy"
+                            );
+                        } else if adopted_local_id_set.contains(existing_id.as_str())
+                            && is_pending_projection(
+                                db,
+                                &account_id,
+                                &folder_id,
+                                &existing_id,
+                            )?
+                        {
+                            debug!(
+                                message = %existing_id,
+                                remote = %remote_id,
+                                folder = %folder_id,
+                                "Graph message shares a Message-ID with a pending projection owned by a confirmed target; importing it as a new copy"
+                            );
+                        } else {
+                            match bound_graph_id(db, &account_id, &folder_id, &existing_id)? {
+                                Some(bound)
+                                    if bound != remote_id
+                                        && !removed_remote_set.contains(&bound) =>
+                                {
+                                    debug!(
+                                        message = %existing_id,
+                                        remote = %remote_id,
+                                        bound = %bound,
+                                        folder = %folder_id,
+                                        "Graph message shares a Message-ID with a row bound to another live id; importing it as a new copy"
+                                    );
+                                }
+                                _ => stored.summary.id = existing_id,
+                            }
+                        }
                     }
                 }
                 // The service layer needs a UID to group queue entries; derive
@@ -294,6 +691,87 @@ async fn apply_graph_delta(
                 // when a re-APPEND changes the Graph id of a draft.
                 if stored.uid.is_none() {
                     stored.uid = Some(synthetic_uid(&stored.summary.id));
+                }
+                // The primary-key fallback needs the same guard as the
+                // deletion path. When no identity lookup resolved this entry,
+                // `stored.summary.id` is still the raw Graph id, and the
+                // upsert below would hit `id = remote_id` by primary key even
+                // though that row was re-bound to another Graph id
+                // (`id=m-old, gm_msgid=m-new`). `ON CONFLICT(id)` would then
+                // overwrite the live binding with the superseded id. Only a
+                // row that is unbound or still bound to this exact id may
+                // receive the write; a stale id is ignored.
+                if stored.summary.id == remote_id {
+                    if let Some(bound) =
+                        bound_graph_id(db, &account_id, &folder_id, &stored.summary.id)?
+                    {
+                        if bound != remote_id {
+                            debug!(
+                                message = %stored.summary.id,
+                                remote = %remote_id,
+                                bound = %bound,
+                                folder = %folder_id,
+                                "Graph update names a row re-bound to another id; ignored"
+                            );
+                            continue;
+                        }
+                    }
+                    // The row at this primary key may be an optimistic move
+                    // projection that a confirmed receipt in this batch already
+                    // owns (`adopted_local_ids`). Its key is the id it had in
+                    // the folder it is moving back into, so this stale entry
+                    // must not bind it back and clear `target_pending`: only the
+                    // adopted Graph id may resolve it. `resolved_by_adoption`
+                    // keeps a legitimate adoption that happens to share the
+                    // key from being rejected here.
+                    if !resolved_by_adoption
+                        && (adopted_local_id_set.contains(stored.summary.id.as_str())
+                            || current_owners.contains_key(stored.summary.id.as_str()))
+                        && is_pending_projection(
+                            db,
+                            &account_id,
+                            &folder_id,
+                            &stored.summary.id,
+                        )?
+                    {
+                        debug!(
+                            message = %stored.summary.id,
+                            remote = %remote_id,
+                            folder = %folder_id,
+                            "Graph update names a pending move projection owned by another trip; ignored"
+                        );
+                        continue;
+                    }
+                }
+                // Keep the upsert strictly inside this folder. When the entry
+                // still carries the raw Graph id and that id already belongs
+                // to a row in another folder, the row is an optimistic move
+                // projection (or a move this account already applied): the
+                // primary-key upsert would rewrite its `folder_id` and clear
+                // `target_pending`. Hand the update to the folder that owns
+                // the row instead.
+                if let Some((owner_folder, target_pending)) =
+                    foreign_folder_row(db, &account_id, &folder_id, &stored.summary.id)?
+                {
+                    debug!(
+                        message = %stored.summary.id,
+                        remote = %remote_id,
+                        folder = %folder_id,
+                        owner = %owner_folder,
+                        target_pending,
+                        "Graph update names a row owned by another folder; ignored here"
+                    );
+                    continue;
+                }
+                if pending_delete_rows.contains(&stored.summary.id)
+                    || pending_delete_remote.contains(&remote_id)
+                {
+                    debug!(
+                        message = %stored.summary.id,
+                        folder = %folder_id,
+                        "Graph sync left a row hidden for an unconfirmed permanent delete"
+                    );
+                    continue;
                 }
                 // Graph has no per-message answered/forwarded flag; both are
                 // local-only (set when the user replies or forwards). Carry
@@ -327,19 +805,70 @@ async fn apply_graph_delta(
             if initial {
                 // A completed scan is authoritative for every synced row in
                 // the folder, including rows left over from the IMAP era.
-                removed_ids.extend(graph_prune_ids(
-                    db,
-                    &account_id,
-                    &folder_id,
-                    &seen_ids,
-                    sync_window_days,
-                )?);
+                removed_targets.extend(
+                    graph_prune_ids(
+                        db,
+                        &account_id,
+                        &folder_id,
+                        &seen_ids,
+                        sync_window_days,
+                    )?
+                    .into_iter()
+                    .map(|id| (id, None)),
+                );
             }
-            if !removed_ids.is_empty() {
+            // Re-validate every removal at apply time. A row resolved before
+            // the upserts above may have been reused by another entry of this
+            // same batch (a re-APPENDed draft or a replacement copy under a
+            // new Graph id). Deleting it now would drop the live replacement
+            // while the server still holds it. Only a row that still exists
+            // and is still bound to the removed Graph id (or never bound,
+            // NULL) may be deleted; a row now bound to a different id is the
+            // replacement and stays.
+            let mut removed_local_ids: Vec<String> = Vec::new();
+            for (local_id, remote) in removed_targets {
+                let Some(remote) = remote else {
+                    // Full-scan prune: no Graph id names it and it was derived
+                    // from the post-upsert state, so it is safe to delete.
+                    removed_local_ids.push(local_id);
+                    continue;
+                };
+                let binding: Option<Option<String>> = db
+                    .query_row(
+                        "SELECT gm_msgid FROM message
+                          WHERE id = ?1 AND account_id = ?2 AND folder_id = ?3",
+                        rusqlite::params![local_id, &account_id, &folder_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                match binding {
+                    Some(Some(bound)) if bound != remote => {
+                        debug!(
+                            message = %local_id,
+                            removed = %remote,
+                            bound = %bound,
+                            folder = %folder_id,
+                            "Graph removal skipped: the row was reused by another id in this batch"
+                        );
+                    }
+                    Some(_) => removed_local_ids.push(local_id),
+                    None => {
+                        debug!(
+                            message = %local_id,
+                            removed = %remote,
+                            folder = %folder_id,
+                            "Graph removal target no longer exists"
+                        );
+                    }
+                }
+            }
+            removed_local_ids.sort();
+            removed_local_ids.dedup();
+            if !removed_local_ids.is_empty() {
                 // Drop the uid mapping together with the row.  The mapping is
                 // keyed by that row's uid and a later sync derives a fresh uid
                 // for a new row, so a stale entry could only mislead.
-                for id in &removed_ids {
+                for id in &removed_local_ids {
                     let uid: Option<Option<i64>> = db
                         .query_row(
                             "SELECT uid FROM message WHERE id = ?1",
@@ -352,11 +881,24 @@ async fn apply_graph_delta(
                         repo::sync_state::delete_key(db, &account_id, "mail", &key)?;
                     }
                 }
-                repo::messages::delete_local(db, &removed_ids, true)?;
+                repo::messages::delete_local(db, &removed_local_ids, true)?;
             }
             repo::folders::set_last_sync_at(db, &resync_folder, Utc::now())?;
             repo::folders::recompute_counts(db, &resync_folder)?;
-            Ok((inserted, updated, removed_ids))
+            // Heal rows earlier builds stored without subject/from even
+            // though their raw headers carried both.
+            crate::graph::messages::heal_missing_metadata(db, &account_id)?;
+            // Same transaction as the messages above. If any write fails, the
+            // cursor is rolled back with them, so a retry replays this batch
+            // instead of resuming past changes that were never stored.
+            crate::graph::messages::persist_cursor_update(
+                db,
+                &account_id,
+                &folder_id,
+                delta_link.as_deref(),
+                &pending_cursor,
+            )?;
+            Ok((inserted, updated, removed_local_ids))
         })
         .await?;
 
@@ -411,7 +953,7 @@ async fn apply_graph_delta(
 /// `(folder_id, uid)`.  A v5 UUID of the Graph id gives a stable positive
 /// 63-bit integer: stable across restarts (unlike `DefaultHasher`, whose keys
 /// are randomised per process) and effectively collision-free for one folder.
-fn synthetic_uid(remote_id: &str) -> i64 {
+pub fn synthetic_uid(remote_id: &str) -> i64 {
     let uuid = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, remote_id.as_bytes());
     let mut value = 0u64;
     for byte in &uuid.as_bytes()[..8] {
@@ -474,16 +1016,247 @@ fn local_id_for_message_id(
     account_id: &str,
     folder_id: &str,
     header: &str,
+    incoming_count: usize,
+) -> Result<Option<String>> {
+    // Copies share a Message-ID but have distinct provider ids. Only a single
+    // candidate on each side may be folded into one row.
+    repo::messages::unambiguous_message_id_row(conn, account_id, folder_id, header, incoming_count)
+}
+
+/// Local row in `folder_id` already bound to a Graph id.
+///
+/// A confirmed move or a draft re-APPEND reuses the local row and mirrors the
+/// provider id into `gm_msgid`, so the row key and the remote id differ
+/// (`id=m-old, gm_msgid=m-new`). Every Graph delta entry and `@removed` event
+/// must resolve that binding first: the Message-ID heuristic is not reliable
+/// after the provider rewrote the row's headers, and deleting by the Graph id
+/// alone would miss the row while the cursor still advanced. The local primary
+/// key is the fallback only for rows that were **never rebound**: an unbound
+/// `gm_msgid` (NULL) or one that still equals `remote_id`. A row already bound
+/// to a different Graph id is not a match — a late `@removed` carrying the old
+/// id must not delete the message now bound to the new one. The lookup stays
+/// inside this account and folder so a coincidental id elsewhere is never
+/// touched.
+///
+/// An optimistic move projection (`uid IS NULL AND target_pending = 1`) is
+/// never resolved by that primary-key fallback. It has no identity yet, and
+/// after a move back into its original folder its primary key is the *old*
+/// Graph id of that folder: trusting the key would let a removal delete the
+/// projection, or an update bind it back to the id the move is leaving (and
+/// clear `target_pending`) while the cursor advances. Only the current
+/// operation's adopted mapping may resolve such a row (see
+/// [`apply_graph_delta`]).
+///
+/// Returns the row id and its `pending_delete` flag. An ambiguous binding (more
+/// than one row carrying the same provider id) is not resolved: acting on a
+/// guess could update or delete the wrong message.
+fn local_row_for_graph_id(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+    folder_id: &str,
+    remote_id: &str,
+) -> Result<Option<(String, i64)>> {
+    let mut statement = conn.prepare(
+        "SELECT id, pending_delete FROM message
+          WHERE account_id = ?1 AND folder_id = ?2 AND gm_msgid = ?3",
+    )?;
+    let mut rows = statement.query(rusqlite::params![account_id, folder_id, remote_id])?;
+    let mut candidates: Vec<(String, i64)> = Vec::new();
+    while let Some(row) = rows.next()? {
+        candidates.push((row.get(0)?, row.get(1)?));
+    }
+    match candidates.len() {
+        1 => return Ok(candidates.pop()),
+        0 => {}
+        _ => return Ok(None),
+    }
+    // A row whose primary key happens to equal `remote_id` but is bound to a
+    // different Graph id has been re-bound (`id=m-old, gm_msgid=m-new`). The
+    // old id is stale evidence: resolving it here would delete the live
+    // message. A pending move projection is excluded too: its identity is not
+    // decided yet and the key may be the id it had before it left this folder,
+    // so only the current operation's adopted mapping may name it.
+    Ok(conn
+        .query_row(
+            "SELECT id, pending_delete FROM message
+              WHERE id = ?1 AND account_id = ?2 AND folder_id = ?3
+                AND (gm_msgid IS NULL OR gm_msgid = ?1)
+                AND NOT (uid IS NULL AND target_pending = 1)",
+            rusqlite::params![remote_id, account_id, folder_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?)
+}
+
+/// `gm_msgid` of the local row `id` in `folder_id`, when it is set.
+///
+/// The upsert writer uses this for its primary-key fallback: a row already
+/// bound to a *different* Graph id has been re-bound by an earlier delta (a
+/// draft re-APPEND or a provider-side id change) and must not receive an entry
+/// that still carries the superseded id. `None` means either the row does not
+/// exist or its `gm_msgid` is NULL, both of which are safe to write.
+fn bound_graph_id(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+    folder_id: &str,
+    id: &str,
 ) -> Result<Option<String>> {
     Ok(conn
         .query_row(
-            "SELECT id FROM message
-             WHERE account_id = ?1 AND folder_id = ?2 AND message_id_header = ?3
-             LIMIT 1",
-            rusqlite::params![account_id, folder_id, header],
-            |row| row.get(0),
+            "SELECT gm_msgid FROM message
+              WHERE id = ?1 AND account_id = ?2 AND folder_id = ?3",
+            rusqlite::params![id, account_id, folder_id],
+            |row| row.get::<_, Option<String>>(0),
         )
-        .optional()?)
+        .optional()?
+        .flatten())
+}
+
+/// Folder and `target_pending` of a row with `id` that lives in a *different*
+/// folder of the same account.
+///
+/// Graph ids are mailbox-wide, and an optimistic move keeps the local primary
+/// key while changing `folder_id`. A late delta entry for the source folder
+/// therefore names a row the destination folder now owns. Upserting it would
+/// pull the projection back to the source and clear `target_pending`, so the
+/// writer treats it as foreign and ignores it here; only the destination
+/// folder (or its adopted projection) may update it.
+fn foreign_folder_row(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+    folder_id: &str,
+    id: &str,
+) -> Result<Option<(String, i64)>> {
+    Ok(conn
+        .query_row(
+            "SELECT folder_id, target_pending FROM message
+              WHERE id = ?1 AND account_id = ?2",
+            rusqlite::params![id, account_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .filter(|(existing, _)| existing != folder_id))
+}
+
+/// Whether `id` is still an optimistic-move projection waiting for its
+/// destination identity in `folder_id`.
+///
+/// The confirmed destination was resolved before the delta request; an undo
+/// can move the row back while that request is in flight, so the writer
+/// re-checks instead of rebinding a row that is no longer this operation's.
+fn is_pending_projection(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+    folder_id: &str,
+    id: &str,
+) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM message
+              WHERE id = ?1 AND account_id = ?2 AND folder_id = ?3
+                AND uid IS NULL AND target_pending = 1)",
+        rusqlite::params![id, account_id, folder_id],
+        |row| row.get(0),
+    )?)
+}
+
+/// Confirmed move destinations whose projection is still pending in
+/// `folder_id`.
+///
+/// [`crate::graph::messages::MessageDelta::adopted_local_ids`] only names the
+/// Graph ids the delta page returned. A confirmed destination that has not
+/// reached the page yet has no entry there, so an update or removal carrying
+/// the row's *old* id could bind (or delete) the projection and clear
+/// `target_pending`, and a different copy sharing the Message-ID could be
+/// folded into it.
+///
+/// The projection row itself is the primary source: the executor writes the
+/// confirmed destination *and its owner* onto it, so the identity survives
+/// pruning of the operation queue. Operation payloads are a supplement for
+/// receipts recorded before that column existed. A retained receipt may
+/// describe an earlier trip of the same row, so it is accepted only when it is
+/// the identity's owner (or, for rows written before ownership was recorded,
+/// when it is the newest operation that moved the row into this folder)
+/// ([`crate::graph::messages::latest_owner`]), the row is still an unbound
+/// projection here, and the row does not already carry a different confirmed
+/// identity. Those re-checks also drop a mapping whose row an undo already
+/// moved back.
+fn confirmed_move_targets(
+    db: &rusqlite::Connection,
+    account_id: &str,
+    folder_id: &str,
+) -> Result<HashMap<String, String>> {
+    let row_identities = repo::messages::move_target_identities(db, account_id, folder_id)?;
+    let mut targets: HashMap<String, String> = HashMap::new();
+    // One local row may only be adopted for one destination id; the row's own
+    // identity always wins over a retained receipt.
+    let mut adopted_by_message: HashMap<String, String> = HashMap::new();
+    let mut row_owner: HashMap<String, (String, Option<i64>)> = HashMap::new();
+    for identity in &row_identities {
+        targets
+            .entry(identity.remote_id.clone())
+            .or_insert_with(|| identity.local_id.clone());
+        adopted_by_message
+            .entry(identity.local_id.clone())
+            .or_insert_with(|| identity.remote_id.clone());
+        if let Some(owner) = identity.owner_op_id.clone() {
+            row_owner.insert(identity.local_id.clone(), (owner, identity.owner_sequence));
+        }
+    }
+    // Claims without a destination yet still own the row: a retained receipt
+    // from another operation is historical and must not resolve it.
+    for (message_id, owner) in repo::messages::move_target_owners(db, account_id, folder_id)? {
+        row_owner.insert(message_id, owner);
+    }
+    let scopes = crate::graph::messages::move_operation_scopes(db, account_id)?;
+    let latest_owner = crate::graph::messages::latest_owner(&scopes, folder_id);
+    for scope in &scopes {
+        for outcome in &scope.outcomes {
+            if outcome.state != OpMessageState::Confirmed
+                || outcome.target_folder_id.as_deref() != Some(folder_id)
+            {
+                continue;
+            }
+            let Some(remote) = outcome
+                .target_remote_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            // The recorded owner is authoritative. Only its receipt may
+            // contribute; a historical operation must not back another
+            // destination for the same row.
+            if let Some((owner_id, _)) = row_owner.get(&outcome.message_id) {
+                if owner_id != &scope.id {
+                    continue;
+                }
+            } else if !adopted_by_message.contains_key(&outcome.message_id)
+                && latest_owner.get(&outcome.message_id).copied() != Some(scope.sequence)
+            {
+                continue;
+            }
+            if !is_pending_projection(db, account_id, folder_id, &outcome.message_id)? {
+                continue;
+            }
+            // The row already carries the identity of its *current* pending
+            // projection. An operation receipt from an earlier trip must not
+            // add a second, stale destination for the same row.
+            if let Some(existing) = adopted_by_message.get(&outcome.message_id) {
+                if existing != remote {
+                    continue;
+                }
+            }
+            targets
+                .entry(remote.to_string())
+                .or_insert_with(|| outcome.message_id.clone());
+            adopted_by_message
+                .entry(outcome.message_id.clone())
+                .or_insert_with(|| remote.to_string());
+        }
+    }
+    Ok(targets)
 }
 
 /// Local ids a completed Graph full scan must delete.
@@ -504,10 +1277,11 @@ fn local_id_for_message_id(
 /// because the disappearance of its old remote copy is expected and the new
 /// copy has not necessarily been echoed yet.
 ///
-/// `sync_window_days` matters because a Graph full scan is `$filter`ed to that
-/// window: a row older than the window is simply not returned, so it cannot be
+/// `sync_window_days` matters because a Graph full scan only stores rows inside
+/// that window (the window is applied locally, not as a `$filter`): a row older
+/// than the window is simply absent from the returned set, so it cannot be
 /// treated as deleted.  Only rows clearly inside the window (one extra day of
-/// slack for clock/query skew) are judged.
+/// slack for clock-skew) are judged.
 fn graph_prune_ids(
     conn: &rusqlite::Connection,
     account_id: &str,
@@ -518,9 +1292,12 @@ fn graph_prune_ids(
     let cutoff = (sync_window_days > 0)
         .then(|| Utc::now() - ChronoDuration::days(i64::from(sync_window_days).saturating_add(1)));
     let awaiting_append = pending_append_draft_ids(conn, account_id)?;
+    // Rows hidden for an unconfirmed permanent delete are not pruned: their
+    // absence from the scan may simply mean the server already applied the
+    // queued delete, and the executor still has to confirm it.
     let mut statement = conn.prepare(
         "SELECT id, gm_msgid, is_draft, message_id_header, date FROM message
-         WHERE folder_id = ?1 AND uid IS NOT NULL",
+         WHERE folder_id = ?1 AND uid IS NOT NULL AND pending_delete = 0",
     )?;
     let mut rows = statement.query(rusqlite::params![folder_id])?;
     let mut removed = Vec::new();
@@ -724,8 +1501,8 @@ async fn incremental_sync(
 /// mailbox is sparse so a big folder never costs a full `UID SEARCH ALL`.
 const OLDER_RANGE_START: u32 = 1000;
 
-/// Load the next batch (up to [`BATCH_SIZE`]) of messages OLDER than anything
-/// stored for an IMAP folder, ignoring the sync window.
+/// Load the next batch (up to [`LOAD_OLDER_BATCH_SIZE`]) of messages OLDER than
+/// anything stored for an IMAP folder, ignoring the sync window.
 ///
 /// The cursor is derived, not stored: it is the minimum UID already in the
 /// local database for the folder (or the server `UIDNEXT` when the window
@@ -785,7 +1562,9 @@ pub async fn load_older_imap(
     // (163 does not report one). With nothing stored the server's UIDNEXT, or a
     // previously stored one, bounds the first batch; with none of those the
     // folder simply has not been synced.
-    let Some(upper) = min_uid.or(mailbox.uid_next.map(|value| value as i64)).or(stored_uidnext)
+    let Some(upper) = min_uid
+        .or(mailbox.uid_next.map(|value| value as i64))
+        .or(stored_uidnext)
     else {
         return Err(AppError::conflict(
             "the folder has not been synced yet; sync it before loading older mail",
@@ -830,26 +1609,21 @@ pub async fn load_older_imap(
     })
 }
 
-/// Up to [`BATCH_SIZE`] UIDs at or below `hi`, newest first, plus whether more
-/// exist below them. Uses bounded `UID SEARCH UID lo:hi` ranges that widen x4
-/// until the batch is full (one surplus UID proves `has_more`) or UID 1 is
-/// reached (an exhaustive answer), so exhaustion is exact without ever
+/// Up to [`LOAD_OLDER_BATCH_SIZE`] UIDs at or below `hi`, newest first, plus
+/// whether more exist below them. Uses bounded `UID SEARCH UID lo:hi` ranges
+/// that widen x4 until the batch is full (one surplus UID proves `has_more`) or
+/// UID 1 is reached (an exhaustive answer), so exhaustion is exact without ever
 /// listing a large mailbox.
 async fn older_uid_batch(conn: &mut ImapConnection, hi: u32) -> Result<(Vec<u32>, bool)> {
     let mut width = OLDER_RANGE_START;
     loop {
         let lo = hi.saturating_sub(width - 1).max(1);
         let query = format!("UID {lo}:{hi}");
-        let session = &mut conn.session;
-        let mut found: Vec<u32> = tokio::time::timeout(FETCH_TIMEOUT, session.uid_search(query))
-            .await
-            .map_err(|_| AppError::network("UID SEARCH timed out"))?
-            .map(|set| set.into_iter().collect())
-            .map_err(imap_error)?;
-        if found.len() > BATCH_SIZE || lo == 1 {
+        let mut found: Vec<u32> = conn.uid_search(&query).await?.into_iter().collect();
+        if found.len() > LOAD_OLDER_BATCH_SIZE || lo == 1 {
             found.sort_unstable_by(|a, b| b.cmp(a));
-            let has_more = found.len() > BATCH_SIZE;
-            found.truncate(BATCH_SIZE);
+            let has_more = found.len() > LOAD_OLDER_BATCH_SIZE;
+            found.truncate(LOAD_OLDER_BATCH_SIZE);
             return Ok((found, has_more));
         }
         width = width.saturating_mul(4);
@@ -910,12 +1684,14 @@ pub async fn load_older_graph_with(
         .map(|date| date.with_timezone(&Utc));
 
     let page =
-        crate::graph::messages::list_older(client, ctx, &account.id, &graph_folder, before)
-            .await?;
+        crate::graph::messages::list_older(client, ctx, &account.id, &graph_folder, before).await?;
     let has_more = page.has_more;
     let delta = crate::graph::messages::MessageDelta {
         messages: page.messages,
         delta_link: None,
+        // Loading older mail must not disturb delta pagination state.
+        pending_cursor: crate::graph::messages::PendingCursor::Keep,
+        adopted_local_ids: page.adopted_local_ids,
         full_sync: false,
         removed_remote_ids: Vec::new(),
     };
@@ -933,31 +1709,22 @@ async fn search_uids(conn: &mut ImapConnection, window_days: u32) -> Result<Vec<
         let since = Utc::now() - ChronoDuration::days(window_days as i64);
         format!("SINCE {}", imap_date(since))
     };
-    let session = &mut conn.session;
-    tokio::time::timeout(FETCH_TIMEOUT, session.uid_search(criteria))
+    conn.uid_search(&criteria)
         .await
-        .map_err(|_| AppError::network("UID SEARCH timed out"))?
         .map(|set| set.into_iter().collect())
-        .map_err(imap_error)
 }
 
 async fn search_all_uids(conn: &mut ImapConnection) -> Result<Vec<u32>> {
-    let session = &mut conn.session;
-    tokio::time::timeout(FETCH_TIMEOUT, session.uid_search("ALL"))
+    conn.uid_search("ALL")
         .await
-        .map_err(|_| AppError::network("UID SEARCH ALL timed out"))?
         .map(|set| set.into_iter().collect())
-        .map_err(imap_error)
 }
 
 async fn uid_range(conn: &mut ImapConnection, start: i64) -> Result<Vec<u32>> {
     let query = format!("UID {}:*", start.max(1));
-    let session = &mut conn.session;
-    tokio::time::timeout(FETCH_TIMEOUT, session.uid_search(query))
+    conn.uid_search(&query)
         .await
-        .map_err(|_| AppError::network("UID SEARCH timed out"))?
         .map(|set| set.into_iter().collect())
-        .map_err(imap_error)
 }
 
 struct FlagChange {
@@ -967,13 +1734,7 @@ struct FlagChange {
 
 async fn fetch_changed_flags(conn: &mut ImapConnection, modseq: u64) -> Result<Vec<FlagChange>> {
     let query = format!("(UID FLAGS MODSEQ) (CHANGEDSINCE {modseq})");
-    let session = &mut conn.session;
-    let fetches = tokio::time::timeout(FETCH_TIMEOUT, async {
-        let stream = session.uid_fetch("1:*", query).await.map_err(imap_error)?;
-        stream.try_collect::<Vec<Fetch>>().await.map_err(imap_error)
-    })
-    .await
-    .map_err(|_| AppError::network("CHANGEDSINCE fetch timed out"))??;
+    let fetches = conn.uid_fetch_all("1:*", &query).await?;
     Ok(fetches
         .iter()
         .filter_map(|fetch| {
@@ -994,16 +1755,7 @@ async fn fetch_all_flags(
     let total = limit.unwrap_or(uids.len()).min(uids.len());
     for chunk in uids[..total].chunks(FLAG_BATCH_SIZE) {
         let set = uid_set(&chunk.iter().map(|uid| *uid as i64).collect::<Vec<_>>());
-        let session = &mut conn.session;
-        let fetches = tokio::time::timeout(FETCH_TIMEOUT, async {
-            let stream = session
-                .uid_fetch(set, "(UID FLAGS)")
-                .await
-                .map_err(imap_error)?;
-            stream.try_collect::<Vec<Fetch>>().await.map_err(imap_error)
-        })
-        .await
-        .map_err(|_| AppError::network("flag fetch timed out"))??;
+        let fetches = conn.uid_fetch_all(&set, "(UID FLAGS)").await?;
         all.extend(fetches.iter().filter_map(|fetch| {
             fetch.uid.map(|uid| FlagChange {
                 uid: uid as i64,
@@ -1030,15 +1782,13 @@ async fn fetch_metadata(
          BODY.PEEK[HEADER.FIELDS (REFERENCES IN-REPLY-TO IMPORTANCE X-PRIORITY LIST-UNSUBSCRIBE CONTENT-TYPE)])",
     );
     if conn.caps.gmail {
-        query = query.trim_end_matches(')').to_string() + " X-GM-THRID X-GM-MSGID X-GM-LABELS)";
+        // `X-GM-THRID` is the exact thread key, `X-GM-MSGID` dedupes label
+        // copies, and `X-GM-LABELS` keeps the label set for the list and
+        // move/archive ops.
+        query.pop();
+        query.push_str(" X-GM-THRID X-GM-MSGID X-GM-LABELS)");
     }
-    let session = &mut conn.session;
-    let fetches = tokio::time::timeout(FETCH_TIMEOUT, async {
-        let stream = session.uid_fetch(set, &query).await.map_err(imap_error)?;
-        stream.try_collect::<Vec<Fetch>>().await.map_err(imap_error)
-    })
-    .await
-    .map_err(|_| AppError::network("metadata fetch timed out"))??;
+    let fetches = conn.uid_fetch_all(&set, &query).await?;
 
     // async-imap 0.12 does not expose parsed `X-GM-THRID` values, so ask for
     // them with a small raw FETCH and keep the parsed attributes. Without this
@@ -1047,6 +1797,11 @@ async fn fetch_metadata(
         match fetch_gm_thread_ids(conn, uids).await {
             Ok(ids) => ids,
             Err(error) => {
+                // A timeout poisons the connection; continuing would read the
+                // previous command's tail as this command's response.
+                if crate::util::is_command_timeout(&error) {
+                    return Err(error);
+                }
                 debug!(%error, "X-GM-THRID fetch failed");
                 HashMap::new()
             }
@@ -1082,49 +1837,50 @@ async fn fetch_gm_thread_ids(
     }
     let set = uid_set(&uids.iter().map(|uid| *uid as i64).collect::<Vec<_>>());
     let command = format!("UID FETCH {set} (UID X-GM-THRID)");
-    let session = &mut conn.session;
-    let tag = tokio::time::timeout(FETCH_TIMEOUT, session.run_command(command))
-        .await
-        .map_err(|_| AppError::network("X-GM-THRID command timed out"))?
-        .map_err(imap_error)?;
-    let mut result = HashMap::new();
-    loop {
-        let response = tokio::time::timeout(FETCH_TIMEOUT, session.read_response())
-            .await
-            .map_err(|_| AppError::network("X-GM-THRID response timed out"))?
-            .map_err(|error| AppError::network(format!("X-GM-THRID read failed: {error}")))?;
-        let Some(data) = response else {
-            break;
-        };
-        match data.parsed() {
-            Response::Fetch(_, attributes) => {
-                let mut uid = None;
-                let mut thrid = None;
-                for attribute in attributes {
-                    match attribute {
-                        AttributeValue::Uid(value) => uid = Some(*value as i64),
-                        AttributeValue::GmailThrId(value) => thrid = Some(value.to_string()),
-                        _ => {}
-                    }
-                }
-                if let (Some(uid), Some(thrid)) = (uid, thrid) {
-                    result.insert(uid, thrid);
-                }
-            }
-            Response::Done {
-                tag: done, status, ..
-            } => {
-                if done.0 == tag.0 {
-                    if !matches!(status, Status::Ok) {
-                        debug!(?status, "server rejected X-GM-THRID fetch");
-                    }
+    let budget = conn.fetch_timeout();
+    conn.with_session(budget, "X-GM-THRID fetch", move |session| {
+        Box::pin(async move {
+            let tag = session.run_command(&command).await.map_err(imap_error)?;
+            let mut result = HashMap::new();
+            loop {
+                let response = session.read_response().await.map_err(|error| {
+                    AppError::network(format!("X-GM-THRID read failed: {error}"))
+                })?;
+                let Some(data) = response else {
                     break;
+                };
+                match data.parsed() {
+                    Response::Fetch(_, attributes) => {
+                        let mut uid = None;
+                        let mut thrid = None;
+                        for attribute in attributes {
+                            match attribute {
+                                AttributeValue::Uid(value) => uid = Some(*value as i64),
+                                AttributeValue::GmailThrId(value) => {
+                                    thrid = Some(value.to_string())
+                                }
+                                _ => {}
+                            }
+                        }
+                        if let (Some(uid), Some(thrid)) = (uid, thrid) {
+                            result.insert(uid, thrid);
+                        }
+                    }
+                    Response::Done {
+                        tag: done, status, ..
+                    } if done.0 == tag.0 => {
+                        if !matches!(status, Status::Ok) {
+                            debug!(?status, "server rejected X-GM-THRID fetch");
+                        }
+                        break;
+                    }
+                    _ => {}
                 }
             }
-            _ => {}
-        }
-    }
-    Ok(result)
+            Ok(result)
+        })
+    })
+    .await
 }
 
 /// Insert/update fetched metadata, deduplicating Gmail messages across labels.
@@ -1149,23 +1905,53 @@ async fn persist_metadata(
         .db
         .write(move |db| {
             let mut inserted = Vec::new();
+            // Rows hidden for an unacknowledged permanent delete keep their
+            // state exactly as the optimistic action left it. A metadata pass
+            // may still see the message on the server (the delete is queued or
+            // in flight); upserting it would unhide the row and, on Gmail,
+            // reset its labels before the command runs.
+            let pending_deletes: HashSet<String> =
+                repo::messages::pending_delete_ids_in_folder(db, &folder_id)?
+                    .into_iter()
+                    .collect();
+            // A Message-ID does not identify a copy uniquely. Count the ones in
+            // this batch first: two incoming copies with the same header must
+            // never be folded into one local row.
+            let mut header_counts: HashMap<String, usize> = HashMap::new();
+            for meta in &metas_for_write {
+                if let Some(header) = meta.stored.message_id_header.as_deref() {
+                    *header_counts.entry(header.to_string()).or_default() += 1;
+                }
+            }
             for meta in &metas_for_write {
                 let mut stored = meta.stored.clone();
                 // Reuse the local id of a row that already represents this
-                // Message-ID in the same folder (UIDs change after moves/copies).
+                // Message-ID in the same folder (UIDs change after moves/copies),
+                // but only when both sides are unambiguous. A row hidden for a
+                // pending delete is never a candidate: upserting it would undo
+                // the optimistic hide. A row waiting for a targeted
+                // reconciliation is also protected: with a second local
+                // candidate or a second server copy the lookup returns None,
+                // so a different copy can never clear its markers.
                 if let Some(header) = stored.message_id_header.as_deref() {
-                    if let Some((existing_id, existing_folder)) = db
-                        .query_row(
-                            "SELECT id, folder_id FROM message
-                             WHERE account_id = ?1 AND folder_id = ?2 AND message_id_header = ?3 LIMIT 1",
-                            rusqlite::params![account_id, stored.summary.folder_id, header],
-                            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                        )
-                        .optional()?
+                    let incoming = header_counts.get(header).copied().unwrap_or(1);
+                    // UIDs are folder-local and two provider copies of one
+                    // letter share a Message-ID. Reuse only the row bound to
+                    // this exact UID/UIDVALIDITY (or a single identity-less
+                    // projection), never a stable copy under another UID: that
+                    // would overwrite its identity and its Bcc.
+                    if let Some(existing_id) =
+                        repo::messages::unambiguous_message_id_row_for_identity(
+                            db,
+                            &account_id,
+                            &stored.summary.folder_id,
+                            header,
+                            incoming,
+                            stored.uid,
+                            stored.uidvalidity,
+                        )?
                     {
-                        if existing_folder == stored.summary.folder_id {
-                            stored.summary.id = existing_id;
-                        }
+                        stored.summary.id = existing_id;
                     }
                 }
                 if gmail {
@@ -1216,6 +2002,14 @@ async fn persist_metadata(
                             }
                         }
                     }
+                }
+                if pending_deletes.contains(&stored.summary.id) {
+                    debug!(
+                        message = %stored.summary.id,
+                        folder = %folder_id,
+                        "sync left a row hidden for an unconfirmed permanent delete"
+                    );
+                    continue;
                 }
                 // Reuse the parent conversation when it is already local; the
                 // derived key only applies when no ancestor has been stored yet.
@@ -1534,9 +2328,546 @@ async fn apply_flag_updates(
     Ok(())
 }
 
+/// Message ids referenced by operations that are still pending or running.
+/// Such a row belongs to the operation that will release it: a sync must not
+/// converge it on its own.
+fn open_operation_message_ids(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+) -> Result<HashSet<String>> {
+    let mut ids = HashSet::new();
+    for op in repo::pending_ops::list(conn, Some(account_id))? {
+        if !matches!(
+            op.state,
+            PendingOpState::Pending | PendingOpState::InProgress
+        ) {
+            continue;
+        }
+        if let Some(values) = op
+            .payload
+            .get("messageIds")
+            .and_then(|value| value.as_array())
+        {
+            for value in values {
+                if let Some(id) = value.as_str() {
+                    ids.insert(id.to_string());
+                }
+            }
+        }
+    }
+    Ok(ids)
+}
+
+/// Row state re-read immediately before a reconciliation write. The tuple is
+/// account id, folder id, reconcile reason, reconcile op id and pending_delete.
+type ReconcileRowState = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    i64,
+    Option<String>,
+);
+
+/// Resolve rows left without a trusted folder-local identity by failed
+/// optimistic operations.
+///
+/// Normal syncs only cover the sync window and incremental UID ranges, so a
+/// restored row older than the window, or a projection whose target folder has
+/// no server copy, would otherwise stay mis-addressed forever. This pass asks
+/// the server directly, and only acts on positive evidence:
+///
+/// * a retained UID still present in the current generation is confirmed;
+/// * otherwise `UID SEARCH HEADER Message-ID` (independent of the window) finds
+///   the row and the metadata pass rebinds it, but only when both sides are
+///   unambiguous;
+/// * a `pendingDelete` row is erased only when the queued UID is definitively
+///   absent from the same generation — never from an empty HEADER result;
+/// * a `moveRollback` row leaves the target only after the target search is
+///   empty *and* the source still reports the pre-move UID.
+async fn reconcile_pending_identities(
+    ctx: &CoreContext,
+    conn: &mut ImapConnection,
+    account: &nuncio_core::models::Account,
+    folder: &Folder,
+    uidvalidity: Option<i64>,
+) -> Result<()> {
+    let folder_id = folder.id.clone();
+    let account_id = account.id.clone();
+    let rows = ctx
+        .db
+        .read({
+            let folder_id = folder_id.clone();
+            move |db| repo::messages::pending_identity_rows(db, &folder_id)
+        })
+        .await?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let open = ctx
+        .db
+        .read({
+            let account_id = account_id.clone();
+            move |db| open_operation_message_ids(db, &account_id)
+        })
+        .await?;
+    // QQ/NetEase accept `UID SEARCH` but answer content keys with no hits. An
+    // empty HEADER result is then not evidence of anything.
+    let header_search_reliable = nuncio_core::providers::server_text_search(account);
+
+    enum Action {
+        /// The row is addressable again. `uid` is `Some` when the server
+        /// confirmed the pre-operation number and it must be written back.
+        Confirm {
+            uid: Option<i64>,
+            uidvalidity: Option<i64>,
+        },
+        /// A permanent delete was positively confirmed for the exact queued
+        /// generation (the UID is gone). This is the only path that erases a
+        /// row, and it never relies on an empty HEADER result.
+        Delete,
+        /// The failed move's source still holds the message: put the row back.
+        Restore {
+            source: String,
+            uid: i64,
+            uidvalidity: i64,
+        },
+    }
+    let mut actions: Vec<(String, String, Option<String>, Action)> = Vec::new();
+
+    for row in rows {
+        if open.contains(&row.id) {
+            continue;
+        }
+        let reason = row.reason().to_string();
+        let op_id = row.reconcile_op_id.clone();
+
+        // 1. Exact identity check. `reconcile_uid` is the number the operation
+        //    was queued with; it may only be interpreted when the live folder
+        //    still reports that generation. Per RFC 9051 §2.3.1.1 a UID is
+        //    never reused inside one UIDVALIDITY, so a confirmed absence here
+        //    is meaningful for a permanent delete.
+        // A move rollback row lives in its *target* folder, so its recorded UID
+        // belongs to another folder and must never be searched here; the
+        // source side is checked by `move_rollback_source` below.
+        let mut uid_state: Option<bool> = None;
+        if reason != repo::messages::RECONCILE_MOVE_ROLLBACK {
+            if let (Some(uid), Some(generation)) = (row.reconcile_uid, row.reconcile_uidvalidity) {
+                if uidvalidity == Some(generation) {
+                    match run_search(conn, &format!("UID {uid}")).await {
+                        Ok(found) => {
+                            uid_state = Some(found.iter().any(|found| i64::from(*found) == uid));
+                        }
+                        Err(error) => {
+                            debug!(%error, message = %row.id, "reconcile: UID presence check failed");
+                        }
+                    }
+                }
+            }
+        }
+        if uid_state == Some(true) {
+            actions.push((
+                row.id,
+                reason,
+                op_id,
+                Action::Confirm {
+                    uid: row.reconcile_uid,
+                    uidvalidity: row.reconcile_uidvalidity,
+                },
+            ));
+            continue;
+        }
+        if may_erase_pending_delete(
+            &reason,
+            uid_state,
+            row.reconcile_uidvalidity.is_some() && row.reconcile_uidvalidity == uidvalidity,
+        ) {
+            // The exact queued UID is absent from the same generation: the
+            // permanent delete reached the server. (A UID cannot be reused in
+            // this generation, so this is not an ambiguous observation.)
+            actions.push((row.id, reason, op_id, Action::Delete));
+            continue;
+        }
+
+        // 2. A targeted header search is not limited by the sync window. An
+        //    empty result is never enough to delete a row: the provider may not
+        //    implement HEADER search, the header may be missing, or a copy may
+        //    live elsewhere.
+        let Some(header) = row.message_id_header.clone() else {
+            debug!(
+                message = %row.id,
+                reason = %reason,
+                "reconcile: no identity and no Message-ID; leaving the row marked"
+            );
+            continue;
+        };
+        let escaped = header.replace('\\', "\\\\").replace('"', "\\\"");
+        let hits = match run_search(conn, &format!("HEADER Message-ID \"{escaped}\"")).await {
+            Ok(hits) => hits,
+            Err(error) => {
+                debug!(%error, message = %row.id, "reconcile: header search failed");
+                continue;
+            }
+        };
+        if !hits.is_empty() {
+            // Some servers treat HEADER as a content search and answer with a
+            // superset; only accept messages that really carry the header.
+            let mut matching = Vec::new();
+            for chunk in hits.chunks(BATCH_SIZE) {
+                let metas = fetch_metadata(conn, account, folder, uidvalidity, chunk).await?;
+                for meta in metas {
+                    if meta.stored.message_id_header.as_deref() == Some(header.as_str()) {
+                        matching.push(meta);
+                    }
+                }
+            }
+            // Several hits mean several copies: binding one of them to the
+            // single waiting row would clear its markers and let a later
+            // delete address the wrong copy.
+            if matching.len() != 1 {
+                if matching.len() > 1 {
+                    debug!(
+                        message = %row.id,
+                        hits = matching.len(),
+                        "reconcile: Message-ID is ambiguous; leaving the row marked"
+                    );
+                }
+                continue;
+            }
+            let incoming_uid = matching[0].stored.uid;
+            let incoming_uidvalidity = matching[0].stored.uidvalidity;
+            let candidates = ctx
+                .db
+                .read({
+                    let account_id = account_id.clone();
+                    let folder_id = folder_id.clone();
+                    let header = header.clone();
+                    move |db| {
+                        repo::messages::unambiguous_message_id_row_for_identity(
+                            db,
+                            &account_id,
+                            &folder_id,
+                            &header,
+                            1,
+                            incoming_uid,
+                            incoming_uidvalidity,
+                        )
+                    }
+                })
+                .await?;
+            if candidates.as_deref() != Some(row.id.as_str()) {
+                debug!(
+                    message = %row.id,
+                    "reconcile: the header is owned by another local row; leaving it marked"
+                );
+                continue;
+            }
+            persist_metadata(ctx, conn, account, folder, matching, false).await?;
+            let bound = ctx
+                .db
+                .read({
+                    let id = row.id.clone();
+                    move |db| {
+                        Ok(db
+                            .query_row(
+                                "SELECT uid FROM message WHERE id = ?1",
+                                rusqlite::params![id],
+                                |row| row.get::<_, Option<i64>>(0),
+                            )
+                            .optional()?
+                            .flatten()
+                            .is_some())
+                    }
+                })
+                .await?;
+            if bound {
+                actions.push((
+                    row.id,
+                    reason,
+                    op_id,
+                    Action::Confirm {
+                        uid: None,
+                        uidvalidity: None,
+                    },
+                ));
+            }
+            continue;
+        }
+
+        // 3. No hit in this folder. Only a move rollback can still be resolved:
+        //    the op knows its source folder, and both ends must agree (absent
+        //    here, present there) before the projection moves back.
+        if reason != repo::messages::RECONCILE_MOVE_ROLLBACK {
+            if !header_search_reliable {
+                debug!(
+                    message = %row.id,
+                    "reconcile: header search is unreliable for this provider; keeping the row marked"
+                );
+            }
+            continue;
+        }
+        let Some(source) = move_rollback_source(ctx, conn, account, folder, &row).await? else {
+            continue;
+        };
+        actions.push((
+            row.id,
+            reason,
+            op_id,
+            Action::Restore {
+                source: source.0,
+                uid: source.1,
+                uidvalidity: source.2,
+            },
+        ));
+    }
+
+    if actions.is_empty() {
+        return Ok(());
+    }
+    let event_account = account_id.clone();
+    let event_folder = folder_id.clone();
+    let write_account = account_id.clone();
+    let write_folder = folder_id.clone();
+    let (confirmed_ids, deleted_ids, moved_back_by_source): (
+        Vec<String>,
+        Vec<String>,
+        HashMap<String, Vec<String>>,
+    ) = ctx
+        .db
+        .write(move |db| {
+            let mut confirmed_ids: Vec<String> = Vec::new();
+            let mut deleted_ids: Vec<String> = Vec::new();
+            let mut moved_back_by_source: HashMap<String, Vec<String>> = HashMap::new();
+            for (id, reason, op_id, action) in actions {
+                // Re-check ownership and the exact state before writing: a
+                // concurrent action may have claimed the row between the
+                // server lookup and this pass.
+                let current: Option<ReconcileRowState> = db
+                    .query_row(
+                        "SELECT account_id, folder_id, reconcile_reason,
+                                -- Blank tokens mean no owner (legacy rollback);
+                                -- they must not look like a current trip here.
+                                NULLIF(NULLIF(TRIM(reconcile_op_id), ''), '0'),
+                                pending_delete,
+                                NULLIF(NULLIF(TRIM(move_target_op_id), ''), '0')
+                           FROM message WHERE id = ?1",
+                        rusqlite::params![id],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get::<_, Option<String>>(5)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                let Some((account, folder, stored_reason, stored_op, pending_delete, move_owner)) =
+                    current
+                else {
+                    continue;
+                };
+                // A legacy row has no explicit reason; `reason()` then reports
+                // the safe `rebind` default, which is what was checked above.
+                let reason_matches = stored_reason.as_deref() == Some(reason.as_str())
+                    || (stored_reason.is_none() && reason == repo::messages::RECONCILE_REBIND);
+                // A newer move trip may have claimed this projection while the
+                // reconcile actions were being planned. That trip's identity
+                // owns the row now; this pass must not confirm or move it.
+                let move_owner_conflicts = match (&move_owner, &op_id) {
+                    (Some(owner), Some(op)) => owner != op,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+                if account != write_account
+                    || folder != write_folder
+                    || pending_delete != 0
+                    || !reason_matches
+                    || stored_op != op_id
+                    || move_owner_conflicts
+                {
+                    debug!(message = %id, "reconcile: the row changed while it was being checked");
+                    continue;
+                }
+                match action {
+                    Action::Confirm { uid, uidvalidity } => {
+                        match (uid, uidvalidity) {
+                            (Some(uid), Some(uidvalidity)) => {
+                                repo::messages::set_uid_identity(
+                                    db,
+                                    &id,
+                                    Some(uid),
+                                    Some(uidvalidity),
+                                )?;
+                                repo::messages::confirm_pending_identity(db, &id)?;
+                            }
+                            _ => repo::messages::confirm_pending_identity(db, &id)?,
+                        }
+                        confirmed_ids.push(id);
+                    }
+                    Action::Delete => {
+                        repo::messages::delete_local(db, std::slice::from_ref(&id), true)?;
+                        deleted_ids.push(id);
+                    }
+                    Action::Restore {
+                        source,
+                        uid,
+                        uidvalidity,
+                    } => {
+                        let restored = repo::messages::move_to_folder_rollback(
+                            db,
+                            std::slice::from_ref(&id),
+                            &source,
+                            &write_folder,
+                            &write_account,
+                            op_id.as_deref().unwrap_or(""),
+                        )?;
+                        if restored.contains(&id) {
+                            repo::messages::set_uid_identity(
+                                db,
+                                &id,
+                                Some(uid),
+                                Some(uidvalidity),
+                            )?;
+                            moved_back_by_source
+                                .entry(source.clone())
+                                .or_default()
+                                .push(id);
+                        }
+                    }
+                }
+            }
+            Ok((confirmed_ids, deleted_ids, moved_back_by_source))
+        })
+        .await?;
+    if !confirmed_ids.is_empty() {
+        events::emit_mail_changed(
+            ctx.events.as_ref(),
+            event_account.clone(),
+            vec![event_folder.clone()],
+            confirmed_ids,
+            events::MailChangeKind::Updated,
+        );
+    }
+    if !deleted_ids.is_empty() {
+        events::emit_mail_changed(
+            ctx.events.as_ref(),
+            event_account.clone(),
+            vec![event_folder.clone()],
+            deleted_ids,
+            events::MailChangeKind::Deleted,
+        );
+    }
+    for (source, ids) in moved_back_by_source {
+        events::emit_mail_changed(
+            ctx.events.as_ref(),
+            event_account.clone(),
+            vec![source, event_folder.clone()],
+            ids,
+            events::MailChangeKind::Updated,
+        );
+    }
+    Ok(())
+}
+
+/// Whether a row may be erased after a refused permanent delete.
+///
+/// The only positive evidence is a successful `UID SEARCH` in the *same*
+/// UIDVALIDITY generation answering without the queued UID (RFC 9051 §2.3.1.1:
+/// a UID is never reused inside one generation). An empty `HEADER Message-ID`
+/// result — or a search that could not run — never authorizes erasure.
+fn may_erase_pending_delete(
+    reason: &str,
+    uid_state: Option<bool>,
+    generation_confirmed: bool,
+) -> bool {
+    reason == repo::messages::RECONCILE_PENDING_DELETE
+        && generation_confirmed
+        && uid_state == Some(false)
+}
+
+/// Verify that a `moveRollback` projection which is absent from the target
+/// folder still exists in its source folder.
+///
+/// Both ends are checked: the caller has already searched the target for the
+/// Message-ID, and this function selects the source (recorded by the owning
+/// operation) and asks for the pre-move UID in that same generation. Anything
+/// short of a positive hit leaves the projection where it is.
+async fn move_rollback_source(
+    ctx: &CoreContext,
+    conn: &mut ImapConnection,
+    _account: &nuncio_core::models::Account,
+    folder: &Folder,
+    row: &repo::messages::PendingIdentity,
+) -> Result<Option<(String, i64, i64)>> {
+    let Some(op_id) = row.reconcile_op_id.clone() else {
+        return Ok(None);
+    };
+    let Some(uid) = row.reconcile_uid else {
+        return Ok(None);
+    };
+    let Some(expected) = row.reconcile_uidvalidity else {
+        return Ok(None);
+    };
+    let op = ctx
+        .db
+        .read(move |db| repo::pending_ops::get(db, &op_id))
+        .await?;
+    let Some(op) = op else {
+        return Ok(None);
+    };
+    let payload = &op.payload;
+    let source_id = payload
+        .get("folderId")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    let target_id = payload
+        .get("targetFolderId")
+        .and_then(|value| value.as_str());
+    let Some(source_id) = source_id else {
+        return Ok(None);
+    };
+    if target_id != Some(folder.id.as_str()) || source_id == folder.id {
+        return Ok(None);
+    }
+    let source = ctx
+        .db
+        .read({
+            let source_id = source_id.clone();
+            move |db| repo::folders::get(db, &source_id)
+        })
+        .await?;
+    let Some(source) = source else {
+        return Ok(None);
+    };
+    let mailbox = conn.select(&source.remote_path).await;
+    let live = mailbox
+        .ok()
+        .and_then(|mailbox| mailbox.uid_validity.map(|value| value as i64));
+    let present = if live == Some(expected) {
+        run_search(conn, &format!("UID {uid}")).await.ok()
+    } else {
+        None
+    };
+    // Restore the folder this sync pass is processing before returning; the
+    // caller may still need the connection (and leaving another mailbox
+    // selected would be surprising).
+    if let Err(error) = conn.select(&folder.remote_path).await {
+        debug!(%error, folder = %folder.remote_path, "reconcile: could not re-select folder");
+    }
+    let confirmed = present.is_some_and(|found| found.iter().any(|found| i64::from(*found) == uid));
+    Ok(confirmed.then_some((source_id, uid, expected)))
+}
+
 fn local_uids(db: &rusqlite::Connection, folder_id: &str) -> Result<Vec<(String, i64)>> {
-    let mut statement =
-        db.prepare("SELECT id, uid FROM message WHERE folder_id = ?1 AND uid IS NOT NULL")?;
+    // A row waiting for a permanent delete to be confirmed is not authoritative
+    // of the server's state yet: the expunge/prune pass must not drop it.
+    let mut statement = db.prepare(
+        "SELECT id, uid FROM message
+          WHERE folder_id = ?1 AND uid IS NOT NULL AND pending_delete = 0",
+    )?;
     let mut rows = statement.query(rusqlite::params![folder_id])?;
     let mut result = Vec::new();
     while let Some(row) = rows.next()? {
@@ -1615,20 +2946,14 @@ async fn fill_previews(
         for chunk in uids.chunks(50) {
             let set = uid_set(chunk);
             let query = format!("(UID BODY.PEEK[{part}]<0.{PREVIEW_BYTES}>)");
-            let session = &mut conn.session;
-            let fetches = match tokio::time::timeout(FETCH_TIMEOUT, async {
-                let stream = session.uid_fetch(&set, &query).await.map_err(imap_error)?;
-                stream.try_collect::<Vec<Fetch>>().await.map_err(imap_error)
-            })
-            .await
-            {
-                Ok(Ok(fetches)) => fetches,
-                Ok(Err(error)) => {
-                    debug!(%error, "preview fetch failed");
-                    continue;
+            let fetches = match conn.uid_fetch_all(&set, &query).await {
+                Ok(fetches) => fetches,
+                Err(error) if crate::util::is_command_timeout(&error) => {
+                    // The connection is poisoned; later chunks cannot be read.
+                    return Err(error);
                 }
-                Err(_) => {
-                    debug!("preview fetch timed out");
+                Err(error) => {
+                    debug!(%error, "preview fetch failed");
                     continue;
                 }
             };
@@ -1815,12 +3140,9 @@ async fn search_with_fallback(conn: &mut ImapConnection, criteria: &str) -> Resu
 }
 
 async fn run_search(conn: &mut ImapConnection, criteria: &str) -> Result<Vec<u32>> {
-    let session = &mut conn.session;
-    tokio::time::timeout(FETCH_TIMEOUT, session.uid_search(criteria))
+    conn.uid_search(criteria)
         .await
-        .map_err(|_| AppError::network("server search timed out"))?
         .map(|set| set.into_iter().collect())
-        .map_err(imap_error)
 }
 
 /// Run an IMAP `UID SEARCH` and cache metadata for any matching messages that
@@ -1976,7 +3298,13 @@ pub fn header_matches(raw_headers: &[u8], terms: &ScanTerms) -> bool {
     };
     let addresses = |list: &[nuncio_core::models::Address]| {
         list.iter()
-            .map(|address| format!("{} {}", address.name.as_deref().unwrap_or(""), address.email))
+            .map(|address| {
+                format!(
+                    "{} {}",
+                    address.name.as_deref().unwrap_or(""),
+                    address.email
+                )
+            })
             .collect::<Vec<_>>()
             .join(" ")
             .to_lowercase()
@@ -1989,7 +3317,11 @@ pub fn header_matches(raw_headers: &[u8], terms: &ScanTerms) -> bool {
         .unwrap_or_default();
     let to = addresses(&headers.to);
     let cc = addresses(&headers.cc);
-    let message_id = headers.message_id.clone().unwrap_or_default().to_lowercase();
+    let message_id = headers
+        .message_id
+        .clone()
+        .unwrap_or_default()
+        .to_lowercase();
     if let Some(wanted) = &terms.from {
         if !from.contains(wanted.as_str()) {
             return false;
@@ -2043,13 +3375,7 @@ pub async fn server_scan_with_cap(
     if terms.is_empty() {
         return Ok(ScanOutcome::default());
     }
-    let mailbox = {
-        let session = &mut conn.session;
-        crate::util::with_timeout(crate::imap::conn::COMMAND_TIMEOUT, "EXAMINE", async move {
-            session.examine(&folder.remote_path).await.map_err(imap_error)
-        })
-        .await?
-    };
+    let mailbox = conn.examine(&folder.remote_path).await?;
     let uidvalidity = mailbox.uid_validity.map(|value| value as i64);
     let mut uids = run_search(conn, &imap_scan_criteria(query)).await?;
     uids.sort_unstable_by(|a, b| b.cmp(a));
@@ -2063,16 +3389,7 @@ pub async fn server_scan_with_cap(
             break;
         }
         let set = uid_set(&chunk.iter().map(|uid| *uid as i64).collect::<Vec<_>>());
-        let session = &mut conn.session;
-        let fetches = tokio::time::timeout(FETCH_TIMEOUT, async {
-            let stream = session
-                .uid_fetch(set, SCAN_FIELDS)
-                .await
-                .map_err(imap_error)?;
-            stream.try_collect::<Vec<Fetch>>().await.map_err(imap_error)
-        })
-        .await
-        .map_err(|_| AppError::network("header scan timed out"))??;
+        let fetches = conn.uid_fetch_all(&set, SCAN_FIELDS).await?;
         scanned += chunk.len() as u32;
         for fetch in &fetches {
             let (Some(uid), Some(raw)) = (
@@ -2100,6 +3417,66 @@ pub async fn server_scan_with_cap(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn legacy_graph_cursors_are_removed_without_touching_current_keys() {
+        let dir = std::env::temp_dir().join(format!(
+            "nuncio-legacy-cursor-cleanup-{}",
+            nuncio_core::models::new_id()
+        ));
+        let ctx = nuncio_core::CoreContext::for_test(nuncio_core::Paths::new(dir))
+            .await
+            .expect("core context");
+        ctx.db
+            .write(|db| {
+                for key in [
+                    "graph_delta_v1:fld",
+                    "graph_pending_v1:fld",
+                    "graph_delta:fld",
+                    "graph_pending:fld",
+                ] {
+                    repo::sync_state::set(db, "acc", "mail", key, "legacy")?;
+                }
+                for key in [
+                    "graph_delta_v2:fld",
+                    "graph_pending_v2:fld",
+                    "graph_folder:Inbox",
+                    "drafts_resync_pending",
+                ] {
+                    repo::sync_state::set(db, "acc", "mail", key, "live")?;
+                }
+                // Another account's legacy row must be left for its own pass.
+                repo::sync_state::set(db, "other", "mail", "graph_delta_v1:fld", "legacy")?;
+                Ok(())
+            })
+            .await
+            .expect("seed");
+
+        cleanup_legacy_graph_cursors(&ctx, "acc").await;
+
+        let keys = ctx
+            .db
+            .read(|db| repo::sync_state::list_module(db, "acc", "mail"))
+            .await
+            .expect("list");
+        let keys: Vec<&str> = keys.iter().map(|entry| entry.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "drafts_resync_pending",
+                "graph_delta_v2:fld",
+                "graph_folder:Inbox",
+                "graph_pending_v2:fld",
+            ]
+        );
+        assert_eq!(
+            ctx.db
+                .read(|db| repo::sync_state::get(db, "other", "mail", "graph_delta_v1:fld"))
+                .await
+                .expect("other account"),
+            Some("legacy".to_string())
+        );
+    }
 
     #[test]
     fn search_criteria_are_quoted_and_combined() {
@@ -2480,6 +3857,43 @@ mod tests {
         .expect("prune imap era row");
     }
 
+    /// A full Graph scan is `$filter`ed to the sync window. A row older than
+    /// the window is simply not returned, so its absence must never be read as
+    /// "the server no longer has it". Only the direct receipt of a confirmed
+    /// operation may remove such a projection.
+    #[test]
+    fn graph_prune_keeps_rows_outside_the_sync_window() {
+        let db = nuncio_core::db::Db::open_in_memory().expect("in-memory database");
+        db.migrate_core().expect("core migrations");
+
+        db.write_sync(|conn| {
+            seed_graph_folder(conn);
+            insert_message(
+                conn,
+                "old-draft",
+                Some(synthetic_uid("old-draft")),
+                Some("retired-graph-id"),
+                true,
+                Some("nuncio-draft-old@nuncio.local"),
+            );
+            conn.execute(
+                "UPDATE message SET date = ?1 WHERE id = 'old-draft'",
+                rusqlite::params![(chrono::Utc::now() - chrono::Duration::days(400)).to_rfc3339()],
+            )?;
+
+            // The scan returned nothing, but the row is outside the window and
+            // therefore cannot be judged.
+            let seen: HashSet<String> = HashSet::new();
+            let removed = graph_prune_ids(conn, "acc", "fld", &seen, 30)?;
+            assert!(
+                removed.is_empty(),
+                "an out-of-window row must not be pruned: {removed:?}"
+            );
+            Ok(())
+        })
+        .expect("keep out-of-window row");
+    }
+
     #[test]
     fn graph_prune_keeps_rows_the_scan_returned() {
         let db = nuncio_core::db::Db::open_in_memory().expect("in-memory database");
@@ -2507,6 +3921,50 @@ mod tests {
         .expect("keep live graph row");
     }
 
+    /// Neither the IMAP expunge diff nor the Graph prune may drop a row whose
+    /// permanent delete the server has not confirmed yet.
+    #[test]
+    fn expunge_and_prune_skip_pending_permanent_deletes() {
+        let db = nuncio_core::db::Db::open_in_memory().expect("in-memory database");
+        db.migrate_core().expect("core migrations");
+
+        db.write_sync(|conn| {
+            seed_graph_folder(conn);
+            insert_message(
+                conn,
+                "pending",
+                Some(7),
+                None,
+                false,
+                Some("<pending@example.com>"),
+            );
+            insert_message(
+                conn,
+                "normal",
+                Some(8),
+                None,
+                false,
+                Some("<normal@example.com>"),
+            );
+            repo::messages::hide_for_permanent_delete(conn, &["pending".to_string()])?;
+
+            assert_eq!(
+                local_uids(conn, "fld")?,
+                vec![("normal".to_string(), 8)],
+                "the expunge diff must not see the pending row"
+            );
+
+            let seen: HashSet<String> = HashSet::new();
+            assert_eq!(
+                graph_prune_ids(conn, "acc", "fld", &seen, 0)?,
+                vec!["normal".to_string()],
+                "the Graph prune must keep the pending row"
+            );
+            Ok(())
+        })
+        .expect("pending delete sync protection");
+    }
+
     #[test]
     fn graph_sync_reuses_the_row_with_the_same_message_id() {
         let db = nuncio_core::db::Db::open_in_memory().expect("in-memory database");
@@ -2524,12 +3982,12 @@ mod tests {
             );
 
             assert_eq!(
-                local_id_for_message_id(conn, "acc", "fld", "nuncio-draft-abc@nuncio.local")?,
+                local_id_for_message_id(conn, "acc", "fld", "nuncio-draft-abc@nuncio.local", 1)?,
                 Some("draft-local".to_string()),
                 "the APPEND echo must update the composer's projection row"
             );
             assert_eq!(
-                local_id_for_message_id(conn, "acc", "fld", "<unknown@example.com>")?,
+                local_id_for_message_id(conn, "acc", "fld", "<unknown@example.com>", 1)?,
                 None
             );
             Ok(())
@@ -2586,7 +4044,7 @@ mod tests {
             // the header only works on the bare form.
             assert_eq!(crate::util::draft_id_from_header(header), Some("abc"));
 
-            let reused = local_id_for_message_id(conn, "acc", "fld", header)?
+            let reused = local_id_for_message_id(conn, "acc", "fld", header, 1)?
                 .expect("the APPEND echo must match the projection row");
             assert_eq!(reused, "draft-local");
 
@@ -2629,11 +4087,1949 @@ mod tests {
                     "acc",
                     "fld",
                     mailed.message_id_header.as_deref().expect("header"),
+                    1,
                 )?,
                 Some("mail-local".to_string())
             );
             Ok(())
         })
         .expect("reuse the bracketed graph message id");
+    }
+
+    /// An empty HEADER result, a failed search or a different generation must
+    /// never erase a row; only a definitive absence in the same generation may.
+    #[test]
+    fn only_a_confirmed_uid_absence_erases_a_pending_delete() {
+        use repo::messages::{RECONCILE_PENDING_DELETE, RECONCILE_REBIND};
+        // An empty HEADER search leaves uid_state None: no erasure.
+        assert!(!may_erase_pending_delete(
+            RECONCILE_PENDING_DELETE,
+            None,
+            true
+        ));
+        // The search ran and found the UID: the message still exists.
+        assert!(!may_erase_pending_delete(
+            RECONCILE_PENDING_DELETE,
+            Some(true),
+            true
+        ));
+        // The generation changed, so the old UID means nothing.
+        assert!(!may_erase_pending_delete(
+            RECONCILE_PENDING_DELETE,
+            Some(false),
+            false
+        ));
+        // A move rollback is never erased by this path.
+        assert!(!may_erase_pending_delete(
+            RECONCILE_REBIND,
+            Some(false),
+            true
+        ));
+        // Only this combination is positive evidence.
+        assert!(may_erase_pending_delete(
+            RECONCILE_PENDING_DELETE,
+            Some(false),
+            true
+        ));
+    }
+
+    /// Copies of one mail share a Message-ID but have different UIDs. Folding
+    /// both into one row would clear the wrong copy's markers.
+    #[test]
+    fn duplicate_message_ids_are_not_folded_into_one_row() {
+        let db = nuncio_core::db::Db::open_in_memory().expect("in-memory database");
+        db.migrate_core().expect("core migrations");
+
+        db.write_sync(|conn| {
+            seed_graph_folder(conn);
+            insert_message(
+                conn,
+                "copy-a",
+                Some(1),
+                Some("graph-a"),
+                false,
+                Some("<same@example.com>"),
+            );
+            insert_message(
+                conn,
+                "copy-b",
+                Some(2),
+                Some("graph-b"),
+                false,
+                Some("<same@example.com>"),
+            );
+
+            assert_eq!(
+                local_id_for_message_id(conn, "acc", "fld", "<same@example.com>", 2)?,
+                None,
+                "two copies must never be folded together"
+            );
+            assert_eq!(
+                local_id_for_message_id(conn, "acc", "fld", "<same@example.com>", 1)?,
+                None,
+                "a single incoming copy is still ambiguous with two local rows"
+            );
+            conn.execute("DELETE FROM message WHERE id = 'copy-b'", [])?;
+            assert_eq!(
+                local_id_for_message_id(conn, "acc", "fld", "<same@example.com>", 1)?,
+                Some("copy-a".to_string()),
+                "one row on each side is unambiguous"
+            );
+            Ok(())
+        })
+        .expect("ambiguous message ids");
+    }
+
+    /// A refused Graph permanent delete keeps the synthetic UID, and an
+    /// unchanged mailbox returns an *empty* delta. The row must stay
+    /// actionable without waiting for an entry that will never arrive.
+    #[tokio::test]
+    async fn graph_empty_delta_keeps_a_restored_row_actionable() {
+        use nuncio_core::models::{
+            Account, AccountState, AuthKind, OAuthProvider, ProviderCapabilities, ProviderKind,
+        };
+
+        let dir = std::env::temp_dir().join(format!(
+            "nuncio-graph-empty-delta-{}",
+            nuncio_core::models::new_id()
+        ));
+        let ctx = nuncio_core::CoreContext::for_test(nuncio_core::Paths::new(dir))
+            .await
+            .expect("core context");
+        ctx.db
+            .write(|db| {
+                seed_graph_folder(db);
+                // The state `release_pending_delete_preserving_identity`
+                // leaves behind: unhidden, full identity, no pending markers.
+                insert_message(
+                    db,
+                    "m1",
+                    Some(42),
+                    Some("AAMk-graph-id"),
+                    false,
+                    Some("<m1@example.com>"),
+                );
+                Ok(())
+            })
+            .await
+            .expect("seed");
+
+        let folder = ctx
+            .db
+            .read(|db| repo::folders::get_required(db, "fld"))
+            .await
+            .expect("folder");
+        let account = Account {
+            id: "acc".into(),
+            provider: ProviderKind::Outlook,
+            email: "me@example.com".into(),
+            display_name: "Me".into(),
+            color: "#336699".into(),
+            auth_kind: AuthKind::Oauth,
+            oauth_provider: Some(OAuthProvider::Microsoft),
+            imap: None,
+            smtp: None,
+            pop3: None,
+            caldav_url: None,
+            carddav_url: None,
+            sent_copy: None,
+            sync_window_days: 0,
+            mail_enabled: true,
+            calendar_enabled: false,
+            contacts_enabled: false,
+            tasks_enabled: false,
+            notifications_enabled: false,
+            include_in_unified: true,
+            sort_order: 0,
+            state: AccountState::Ok,
+            state_message: None,
+            capabilities: ProviderCapabilities::defaults_for(ProviderKind::Outlook),
+            created_at: nuncio_core::models::now(),
+        };
+
+        apply_graph_delta(
+            &ctx,
+            &account,
+            &folder,
+            crate::graph::messages::MessageDelta {
+                messages: Vec::new(),
+                delta_link: Some("unchanged-cursor".into()),
+                pending_cursor: crate::graph::messages::PendingCursor::Keep,
+                adopted_local_ids: std::collections::HashMap::new(),
+                full_sync: false,
+                removed_remote_ids: Vec::new(),
+            },
+        )
+        .await
+        .expect("empty delta");
+
+        let stored = ctx
+            .db
+            .read(|db| repo::messages::get(db, "m1"))
+            .await
+            .expect("read")
+            .expect("the row survives an empty delta");
+        assert_eq!(stored.uid, Some(42));
+        assert_eq!(stored.gm_msgid.as_deref(), Some("AAMk-graph-id"));
+        assert!(stored.summary.reconcile_reason.is_none());
+    }
+
+    /// Account/folder/context for the Graph delta regressions below.
+    async fn graph_delta_fixture() -> (
+        nuncio_core::CoreContext,
+        nuncio_core::models::Account,
+        Folder,
+    ) {
+        use nuncio_core::models::{
+            Account, AccountState, AuthKind, OAuthProvider, ProviderCapabilities, ProviderKind,
+        };
+
+        let dir = std::env::temp_dir().join(format!(
+            "nuncio-graph-delta-{}",
+            nuncio_core::models::new_id()
+        ));
+        let ctx = nuncio_core::CoreContext::for_test(nuncio_core::Paths::new(dir))
+            .await
+            .expect("core context");
+        ctx.db
+            .write(|db| {
+                seed_graph_folder(db);
+                Ok(())
+            })
+            .await
+            .expect("seed");
+        let folder = ctx
+            .db
+            .read(|db| repo::folders::get_required(db, "fld"))
+            .await
+            .expect("folder");
+        let account = Account {
+            id: "acc".into(),
+            provider: ProviderKind::Outlook,
+            email: "me@example.com".into(),
+            display_name: "Me".into(),
+            color: "#336699".into(),
+            auth_kind: AuthKind::Oauth,
+            oauth_provider: Some(OAuthProvider::Microsoft),
+            imap: None,
+            smtp: None,
+            pop3: None,
+            caldav_url: None,
+            carddav_url: None,
+            sent_copy: None,
+            sync_window_days: 0,
+            mail_enabled: true,
+            calendar_enabled: false,
+            contacts_enabled: false,
+            tasks_enabled: false,
+            notifications_enabled: false,
+            include_in_unified: true,
+            sort_order: 0,
+            state: AccountState::Ok,
+            state_message: None,
+            capabilities: ProviderCapabilities::defaults_for(ProviderKind::Outlook),
+            created_at: nuncio_core::models::now(),
+        };
+        (ctx, account, folder)
+    }
+
+    /// The state an optimistic move leaves behind: the row is already in the
+    /// target folder but has no folder-local identity yet.
+    async fn insert_pending_projection(ctx: &nuncio_core::CoreContext, id: &str, header: &str) {
+        let id = id.to_string();
+        let header = header.to_string();
+        ctx.db
+            .write(move |db| {
+                let now = nuncio_core::models::now().to_rfc3339();
+                db.execute(
+                    "INSERT INTO message (
+                         id, account_id, folder_id, uid, gm_msgid, message_id_header, thread_id,
+                         subject, date, preview, seen, flagged, answered, forwarded, is_draft,
+                         has_attachments, importance, size, target_pending, awaiting_reconcile,
+                         created_at, updated_at
+                     ) VALUES (?1, 'acc', 'fld', NULL, NULL, ?2, 'thread', 'subject', ?3, '',
+                               1, 0, 0, 0, 0, 0, 'normal', 0, 1, 1, ?3, ?3)",
+                    rusqlite::params![id, header, now],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("insert pending projection");
+    }
+
+    /// A completed Graph move as the executor leaves it behind: the payload
+    /// retains the confirmed destination id after the queue row settles.
+    ///
+    /// Returns the queued operation id so a test can also settle it the way
+    /// the executor does before the destination folder is synchronized.
+    async fn insert_confirmed_move_op(
+        ctx: &nuncio_core::CoreContext,
+        message_id: &str,
+        target_remote_id: &str,
+    ) -> String {
+        use crate::ops::{MoveOp, OpMessageOutcome, OpMessageState, KIND_MOVE};
+        let payload = MoveOp {
+            folder_id: "src".into(),
+            target_folder_id: "fld".into(),
+            uids: vec![7],
+            source_uidvalidity: None,
+            message_ids: vec![message_id.to_string()],
+            outcomes: vec![OpMessageOutcome {
+                message_id: message_id.to_string(),
+                source_uid: Some(7),
+                state: OpMessageState::Confirmed,
+                target_folder_id: Some("fld".into()),
+                target_uid: None,
+                target_uidvalidity: None,
+                target_remote_id: Some(target_remote_id.to_string()),
+                attempt_remote_id: None,
+                copy_phase: Default::default(),
+                delete_flag_phase: Default::default(),
+                expunge_phase: Default::default(),
+            }],
+            remote_ids: Vec::new(),
+        };
+        ctx.db
+            .write(move |db| {
+                let op = repo::pending_ops::enqueue(
+                    db,
+                    nuncio_core::models::NewPendingOp::new(
+                        "acc",
+                        KIND_MOVE,
+                        serde_json::to_value(payload).expect("move payload"),
+                        "Confirmed move",
+                    ),
+                )?;
+                Ok(op.id)
+            })
+            .await
+            .expect("enqueue confirmed move")
+    }
+
+    /// Settle a confirmed move the way the executor does immediately after the
+    /// wire command succeeds. The projection is still `target_pending` at this
+    /// point, so the protection has to outlive the queue row's `pending`
+    /// state.
+    async fn settle_move_op(ctx: &nuncio_core::CoreContext, op_id: &str) {
+        let op_id = op_id.to_string();
+        ctx.db
+            .write(move |db| {
+                repo::pending_ops::claim_for_execution(db, &op_id)?;
+                repo::pending_ops::finish(db, &op_id)?;
+                Ok(())
+            })
+            .await
+            .expect("settle move op");
+    }
+
+    /// Mirror a confirmed move destination onto the projection row, as the
+    /// executor does in the same write that records the outcome.
+    async fn set_row_move_target(
+        ctx: &nuncio_core::CoreContext,
+        message_id: &str,
+        target_remote_id: &str,
+    ) {
+        set_row_move_target_owned(ctx, message_id, target_remote_id, "row-owner", 1).await;
+    }
+
+    /// The same write, naming the operation that owns the identity.
+    async fn set_row_move_target_owned(
+        ctx: &nuncio_core::CoreContext,
+        message_id: &str,
+        target_remote_id: &str,
+        owner_op_id: &str,
+        owner_sequence: i64,
+    ) {
+        let message_id = message_id.to_string();
+        let target_remote_id = target_remote_id.to_string();
+        let owner_op_id = owner_op_id.to_string();
+        ctx.db
+            .write(move |db| {
+                repo::messages::set_move_target_identity(
+                    db,
+                    "acc",
+                    &message_id,
+                    "fld",
+                    &target_remote_id,
+                    &owner_op_id,
+                    owner_sequence,
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("persist row move target");
+    }
+
+    /// The old batch retry path: mirror a destination recorded in the
+    /// operation payload onto the row. Returns the rows changed, so a caller
+    /// can assert that newer evidence was not overwritten.
+    async fn backfill_row_move_target(
+        ctx: &nuncio_core::CoreContext,
+        message_id: &str,
+        target_remote_id: &str,
+        owner_op_id: &str,
+        owner_sequence: i64,
+    ) -> usize {
+        let message_id = message_id.to_string();
+        let target_remote_id = target_remote_id.to_string();
+        let owner_op_id = owner_op_id.to_string();
+        ctx.db
+            .write(move |db| {
+                repo::messages::set_move_target_identity(
+                    db,
+                    "acc",
+                    &message_id,
+                    "fld",
+                    &target_remote_id,
+                    &owner_op_id,
+                    owner_sequence,
+                )
+            })
+            .await
+            .expect("backfill row move target")
+    }
+
+    /// Publish the durable `graph_remote:{folder}:{uid}` alias the executor
+    /// writes when a move command succeeds.
+    async fn set_graph_alias(ctx: &nuncio_core::CoreContext, message_id: &str, remote_id: &str) {
+        let key = format!(
+            "graph_remote:fld:{}",
+            crate::sync::messages::synthetic_uid(message_id)
+        );
+        let remote_id = remote_id.to_string();
+        ctx.db
+            .write(move |db| repo::sync_state::set(db, "acc", "mail", &key, &remote_id))
+            .await
+            .expect("set graph alias");
+    }
+
+    /// The number of rows matching `id` in the fixture account.
+    async fn message_row_count(ctx: &nuncio_core::CoreContext, id: &str) -> i64 {
+        let id = id.to_string();
+        ctx.db
+            .read(move |db| {
+                Ok(db.query_row(
+                    "SELECT COUNT(*) FROM message WHERE account_id = 'acc' AND id = ?1",
+                    rusqlite::params![id],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .expect("row count")
+    }
+
+    /// Run housekeeping far enough into the future to prune every settled
+    /// queue row (subject to its retention guards).
+    async fn prune_finished_ops(ctx: &nuncio_core::CoreContext) {
+        ctx.db
+            .write(|db| {
+                repo::pending_ops::prune_finished(db, Utc::now() + chrono::Duration::days(1))?;
+                Ok(())
+            })
+            .await
+            .expect("prune finished ops");
+    }
+
+    /// Read the temporary confirmed-move identity stored on a row.
+    async fn row_move_target(
+        ctx: &nuncio_core::CoreContext,
+        id: &str,
+    ) -> (Option<String>, Option<String>) {
+        let id = id.to_string();
+        ctx.db
+            .read(move |db| {
+                Ok(db.query_row(
+                    "SELECT move_target_remote_id, move_target_folder_id
+                       FROM message WHERE id = ?1",
+                    rusqlite::params![id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?)
+            })
+            .await
+            .expect("read row move target")
+    }
+
+    /// Read `(uid, gm_msgid, target_pending)` of one row.
+    async fn pending_projection_state(
+        ctx: &nuncio_core::CoreContext,
+        id: &str,
+    ) -> (Option<i64>, Option<String>, i64) {
+        let id = id.to_string();
+        ctx.db
+            .read(move |db| {
+                Ok(db.query_row(
+                    "SELECT uid, gm_msgid, target_pending FROM message WHERE id = ?1",
+                    rusqlite::params![id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?)
+            })
+            .await
+            .expect("read projection state")
+    }
+
+    /// Regression: a message moved back into its original folder keeps its
+    /// primary key equal to the Graph id it had there. While the row waits for
+    /// the move's new target identity (`target_pending`, no uid/gm_msgid), a
+    /// delta that still names that *old* id must not delete the projection.
+    #[tokio::test]
+    async fn graph_pending_projection_survives_stale_original_id_removal() {
+        let (ctx, account, folder) = graph_delta_fixture().await;
+        insert_pending_projection(&ctx, "old-graph-id", "same@example.com").await;
+
+        apply_graph_delta(
+            &ctx,
+            &account,
+            &folder,
+            crate::graph::messages::MessageDelta {
+                messages: Vec::new(),
+                delta_link: Some("cursor-1".into()),
+                pending_cursor: crate::graph::messages::PendingCursor::Keep,
+                adopted_local_ids: std::collections::HashMap::from([(
+                    "m-new".to_string(),
+                    "old-graph-id".to_string(),
+                )]),
+                full_sync: false,
+                removed_remote_ids: vec!["old-graph-id".into()],
+            },
+        )
+        .await
+        .expect("delta");
+
+        let (uid, gm_msgid, target_pending) = pending_projection_state(&ctx, "old-graph-id").await;
+        assert_eq!(
+            (uid, gm_msgid, target_pending),
+            (None, None, 1),
+            "the old id must not resolve the projection through its primary key"
+        );
+        let rows: i64 = ctx
+            .db
+            .read(|db| {
+                Ok(db.query_row(
+                    "SELECT COUNT(*) FROM message WHERE account_id = 'acc'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .expect("row count");
+        assert_eq!(rows, 1, "the projection is not deleted");
+        // The removal really named another copy: the cursor may advance, but
+        // no local row (and therefore no message) was silently dropped.
+        let cursor = ctx
+            .db
+            .read(|db| {
+                repo::sync_state::get(
+                    db,
+                    "acc",
+                    "mail",
+                    &crate::graph::messages::delta_cursor_key("fld"),
+                )
+            })
+            .await
+            .expect("cursor");
+        assert_eq!(cursor.as_deref(), Some("cursor-1"));
+    }
+
+    /// Regression: the same stale old id arriving as an *update* must not bind
+    /// the projection back to it (which would clear `target_pending` and make
+    /// the row forget the move it is still waiting for).
+    #[tokio::test]
+    async fn graph_pending_projection_ignores_stale_original_id_update() {
+        let (ctx, account, folder) = graph_delta_fixture().await;
+        insert_pending_projection(&ctx, "old-graph-id", "same@example.com").await;
+        let stale = crate::graph::messages::map_graph_json(
+            serde_json::json!({
+                "id": "old-graph-id",
+                "subject": "Stale copy",
+                "receivedDateTime": "2026-11-16T08:00:00Z",
+                "internetMessageId": "<same@example.com>",
+            }),
+            "acc",
+            "fld",
+        )
+        .expect("mapped");
+
+        apply_graph_delta(
+            &ctx,
+            &account,
+            &folder,
+            crate::graph::messages::MessageDelta {
+                messages: vec![stale],
+                delta_link: Some("cursor-2".into()),
+                pending_cursor: crate::graph::messages::PendingCursor::Keep,
+                adopted_local_ids: std::collections::HashMap::from([(
+                    "m-new".to_string(),
+                    "old-graph-id".to_string(),
+                )]),
+                full_sync: false,
+                removed_remote_ids: Vec::new(),
+            },
+        )
+        .await
+        .expect("delta");
+
+        let (uid, gm_msgid, target_pending) = pending_projection_state(&ctx, "old-graph-id").await;
+        assert_eq!(
+            (uid, gm_msgid, target_pending),
+            (None, None, 1),
+            "the stale id must not be written back onto the pending projection"
+        );
+        let rows: i64 = ctx
+            .db
+            .read(|db| {
+                Ok(db.query_row(
+                    "SELECT COUNT(*) FROM message WHERE account_id = 'acc'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .expect("row count");
+        assert_eq!(rows, 1, "no second row is created");
+        let cursor = ctx
+            .db
+            .read(|db| {
+                repo::sync_state::get(
+                    db,
+                    "acc",
+                    "mail",
+                    &crate::graph::messages::delta_cursor_key("fld"),
+                )
+            })
+            .await
+            .expect("cursor");
+        assert_eq!(cursor.as_deref(), Some("cursor-2"));
+    }
+
+    /// Regression: another Graph copy sharing the Message-ID must not consume
+    /// a pending projection that a confirmed move receipt already owns. The
+    /// copy stays an independent row; the projection still waits for `m-new`.
+    #[tokio::test]
+    async fn graph_message_id_heuristic_keeps_an_adopted_pending_projection() {
+        let (ctx, account, folder) = graph_delta_fixture().await;
+        insert_pending_projection(&ctx, "local-proj", "shared@example.com").await;
+        let copy = crate::graph::messages::map_graph_json(
+            serde_json::json!({
+                "id": "copy-2",
+                "subject": "Independent copy",
+                "receivedDateTime": "2026-11-16T08:00:00Z",
+                "internetMessageId": "<shared@example.com>",
+            }),
+            "acc",
+            "fld",
+        )
+        .expect("mapped");
+
+        apply_graph_delta(
+            &ctx,
+            &account,
+            &folder,
+            crate::graph::messages::MessageDelta {
+                messages: vec![copy],
+                delta_link: Some("cursor-1".into()),
+                pending_cursor: crate::graph::messages::PendingCursor::Keep,
+                adopted_local_ids: std::collections::HashMap::from([(
+                    "m-new".to_string(),
+                    "local-proj".to_string(),
+                )]),
+                full_sync: false,
+                removed_remote_ids: Vec::new(),
+            },
+        )
+        .await
+        .expect("delta with the other copy");
+
+        let (uid, gm_msgid, target_pending) = pending_projection_state(&ctx, "local-proj").await;
+        assert_eq!(
+            (uid, gm_msgid, target_pending),
+            (None, None, 1),
+            "the projection still waits for its adopted id"
+        );
+        let (copy_uid, copy_remote, copy_pending) = pending_projection_state(&ctx, "copy-2").await;
+        assert!(copy_uid.is_some(), "the copy is imported as a real row");
+        assert_eq!(copy_remote.as_deref(), Some("copy-2"));
+        assert_eq!(copy_pending, 0);
+
+        // The confirmed target still binds to the projection afterwards.
+        let adopted = crate::graph::messages::map_graph_json(
+            serde_json::json!({
+                "id": "m-new",
+                "subject": "Moved message",
+                "receivedDateTime": "2026-11-16T08:00:00Z",
+                "internetMessageId": "<shared@example.com>",
+            }),
+            "acc",
+            "fld",
+        )
+        .expect("mapped");
+        apply_graph_delta(
+            &ctx,
+            &account,
+            &folder,
+            crate::graph::messages::MessageDelta {
+                messages: vec![adopted],
+                delta_link: Some("cursor-2".into()),
+                pending_cursor: crate::graph::messages::PendingCursor::Keep,
+                adopted_local_ids: std::collections::HashMap::from([(
+                    "m-new".to_string(),
+                    "local-proj".to_string(),
+                )]),
+                full_sync: false,
+                removed_remote_ids: Vec::new(),
+            },
+        )
+        .await
+        .expect("delta with the adopted id");
+
+        let (uid, gm_msgid, target_pending) = pending_projection_state(&ctx, "local-proj").await;
+        assert!(uid.is_some(), "the adopted id binds the projection");
+        assert_eq!(gm_msgid.as_deref(), Some("m-new"));
+        assert_eq!(target_pending, 0);
+        let rows: i64 = ctx
+            .db
+            .read(|db| {
+                Ok(db.query_row(
+                    "SELECT COUNT(*) FROM message WHERE account_id = 'acc'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .expect("row count");
+        assert_eq!(rows, 2, "the copy and the projection both survive");
+    }
+
+    /// Regression: the confirmed move target `m-new` has not appeared in a
+    /// delta yet. An update carrying the projection's *old* Graph id arrives
+    /// first. Protection must come from the durable pending-op receipt, not
+    /// from the page: the row must not be rebound and `target_pending` must
+    /// stay set so `m-new` can still claim it.
+    #[tokio::test]
+    async fn graph_confirmed_move_protects_projection_before_target_delta() {
+        let (ctx, account, folder) = graph_delta_fixture().await;
+        insert_pending_projection(&ctx, "old-graph-id", "same@example.com").await;
+        let op_id = insert_confirmed_move_op(&ctx, "old-graph-id", "m-new").await;
+        // The executor settles the row right after the move lands; the
+        // destination folder is synced later, so protection must not depend on
+        // the operation being outstanding.
+        settle_move_op(&ctx, &op_id).await;
+        let stale = crate::graph::messages::map_graph_json(
+            serde_json::json!({
+                "id": "old-graph-id",
+                "subject": "Stale copy",
+                "receivedDateTime": "2026-11-16T08:00:00Z",
+                "internetMessageId": "<same@example.com>",
+            }),
+            "acc",
+            "fld",
+        )
+        .expect("mapped");
+
+        apply_graph_delta(
+            &ctx,
+            &account,
+            &folder,
+            crate::graph::messages::MessageDelta {
+                messages: vec![stale],
+                delta_link: Some("cursor-1".into()),
+                pending_cursor: crate::graph::messages::PendingCursor::Keep,
+                // `m-new` is not in this batch, so the page carries no mapping.
+                adopted_local_ids: std::collections::HashMap::new(),
+                full_sync: false,
+                removed_remote_ids: Vec::new(),
+            },
+        )
+        .await
+        .expect("delta");
+
+        let (uid, gm_msgid, target_pending) = pending_projection_state(&ctx, "old-graph-id").await;
+        assert_eq!(
+            (uid, gm_msgid, target_pending),
+            (None, None, 1),
+            "the stale old id must not be written back onto the projection"
+        );
+        let rows: i64 = ctx
+            .db
+            .read(|db| {
+                Ok(db.query_row(
+                    "SELECT COUNT(*) FROM message WHERE account_id = 'acc'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .expect("row count");
+        assert_eq!(rows, 1, "no second row is created for the stale id");
+    }
+
+    /// Regression: while the confirmed target `m-new` is still absent, the
+    /// destination delta reports the projection's *old* Graph id as removed.
+    /// The durable receipt must keep the projection alive; the cursor may
+    /// advance, but the row (and its `target_pending` state) stays.
+    #[tokio::test]
+    async fn graph_confirmed_move_ignores_stale_old_id_removal_before_target_delta() {
+        let (ctx, account, folder) = graph_delta_fixture().await;
+        insert_pending_projection(&ctx, "old-graph-id", "same@example.com").await;
+        insert_confirmed_move_op(&ctx, "old-graph-id", "m-new").await;
+
+        apply_graph_delta(
+            &ctx,
+            &account,
+            &folder,
+            crate::graph::messages::MessageDelta {
+                messages: Vec::new(),
+                delta_link: Some("cursor-1".into()),
+                pending_cursor: crate::graph::messages::PendingCursor::Keep,
+                // `m-new` is not in this batch, so the page carries no mapping.
+                adopted_local_ids: std::collections::HashMap::new(),
+                full_sync: false,
+                removed_remote_ids: vec!["old-graph-id".into()],
+            },
+        )
+        .await
+        .expect("delta");
+
+        let (uid, gm_msgid, target_pending) = pending_projection_state(&ctx, "old-graph-id").await;
+        assert_eq!(
+            (uid, gm_msgid, target_pending),
+            (None, None, 1),
+            "the old id must not delete the projection through its primary key"
+        );
+        let rows: i64 = ctx
+            .db
+            .read(|db| {
+                Ok(db.query_row(
+                    "SELECT COUNT(*) FROM message WHERE account_id = 'acc'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .expect("row count");
+        assert_eq!(rows, 1, "the projection is not deleted");
+    }
+
+    /// Regression: with the same outstanding confirmed move (`m-new` absent
+    /// from the delta), a *different* Graph id carrying the same Message-ID
+    /// arrives. It must become its own row; the projection keeps waiting for
+    /// `m-new` instead of being consumed by the heuristic.
+    #[tokio::test]
+    async fn graph_confirmed_move_keeps_independent_copy_before_target_delta() {
+        let (ctx, account, folder) = graph_delta_fixture().await;
+        insert_pending_projection(&ctx, "local-proj", "shared@example.com").await;
+        insert_confirmed_move_op(&ctx, "local-proj", "m-new").await;
+        let copy = crate::graph::messages::map_graph_json(
+            serde_json::json!({
+                "id": "copy-2",
+                "subject": "Independent copy",
+                "receivedDateTime": "2026-11-16T08:00:00Z",
+                "internetMessageId": "<shared@example.com>",
+            }),
+            "acc",
+            "fld",
+        )
+        .expect("mapped");
+
+        apply_graph_delta(
+            &ctx,
+            &account,
+            &folder,
+            crate::graph::messages::MessageDelta {
+                messages: vec![copy],
+                delta_link: Some("cursor-1".into()),
+                pending_cursor: crate::graph::messages::PendingCursor::Keep,
+                // `m-new` is not in this batch, so the page carries no mapping.
+                adopted_local_ids: std::collections::HashMap::new(),
+                full_sync: false,
+                removed_remote_ids: Vec::new(),
+            },
+        )
+        .await
+        .expect("delta with the other copy");
+
+        let (uid, gm_msgid, target_pending) = pending_projection_state(&ctx, "local-proj").await;
+        assert_eq!(
+            (uid, gm_msgid, target_pending),
+            (None, None, 1),
+            "the projection still waits for its confirmed target m-new"
+        );
+        let (copy_uid, copy_remote, copy_pending) = pending_projection_state(&ctx, "copy-2").await;
+        assert!(copy_uid.is_some(), "the copy is imported as a real row");
+        assert_eq!(copy_remote.as_deref(), Some("copy-2"));
+        assert_eq!(copy_pending, 0);
+        let rows: i64 = ctx
+            .db
+            .read(|db| {
+                Ok(db.query_row(
+                    "SELECT COUNT(*) FROM message WHERE account_id = 'acc'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .expect("row count");
+        assert_eq!(rows, 2, "the copy and the projection both survive");
+    }
+
+    /// Regression: the confirmed destination lives on the projection row, so
+    /// protection must outlive the operation queue. With `m-new` still absent
+    /// from the delta and the confirming operation already pruned, a stale
+    /// update carrying the row's old id must not bind it back.
+    #[tokio::test]
+    async fn graph_confirmed_move_row_identity_survives_pruned_op() {
+        let (ctx, account, folder) = graph_delta_fixture().await;
+        insert_pending_projection(&ctx, "old-graph-id", "same@example.com").await;
+        let op_id = insert_confirmed_move_op(&ctx, "old-graph-id", "m-new").await;
+        set_row_move_target(&ctx, "old-graph-id", "m-new").await;
+        settle_move_op(&ctx, &op_id).await;
+        prune_finished_ops(&ctx).await;
+        let op = ctx
+            .db
+            .read({
+                let op_id = op_id.clone();
+                move |db| repo::pending_ops::get(db, &op_id)
+            })
+            .await
+            .expect("read op");
+        assert!(op.is_none(), "the settled operation row is pruned");
+
+        let stale = crate::graph::messages::map_graph_json(
+            serde_json::json!({
+                "id": "old-graph-id",
+                "subject": "Stale copy",
+                "receivedDateTime": "2026-11-16T08:00:00Z",
+                "internetMessageId": "<same@example.com>",
+            }),
+            "acc",
+            "fld",
+        )
+        .expect("mapped");
+
+        apply_graph_delta(
+            &ctx,
+            &account,
+            &folder,
+            crate::graph::messages::MessageDelta {
+                messages: vec![stale],
+                delta_link: Some("cursor-1".into()),
+                pending_cursor: crate::graph::messages::PendingCursor::Keep,
+                adopted_local_ids: std::collections::HashMap::new(),
+                full_sync: false,
+                removed_remote_ids: Vec::new(),
+            },
+        )
+        .await
+        .expect("delta");
+
+        let (uid, gm_msgid, target_pending) = pending_projection_state(&ctx, "old-graph-id").await;
+        assert_eq!(
+            (uid, gm_msgid, target_pending),
+            (None, None, 1),
+            "the row-level receipt must protect the projection after the op is pruned"
+        );
+        assert_eq!(
+            row_move_target(&ctx, "old-graph-id").await,
+            (Some("m-new".to_string()), Some("fld".to_string())),
+            "the row still waits for m-new"
+        );
+        let rows: i64 = ctx
+            .db
+            .read(|db| {
+                Ok(db.query_row(
+                    "SELECT COUNT(*) FROM message WHERE account_id = 'acc'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .expect("row count");
+        assert_eq!(rows, 1, "the stale id does not become a second row");
+    }
+
+    /// Regression: with the operation row pruned, a different Graph id sharing
+    /// the Message-ID must still be imported as its own row. The row-level
+    /// receipt keeps the projection reserved for `m-new`.
+    #[tokio::test]
+    async fn graph_confirmed_move_row_identity_keeps_independent_copy_after_prune() {
+        let (ctx, account, folder) = graph_delta_fixture().await;
+        insert_pending_projection(&ctx, "local-proj", "shared@example.com").await;
+        let op_id = insert_confirmed_move_op(&ctx, "local-proj", "m-new").await;
+        set_row_move_target(&ctx, "local-proj", "m-new").await;
+        settle_move_op(&ctx, &op_id).await;
+        prune_finished_ops(&ctx).await;
+        let copy = crate::graph::messages::map_graph_json(
+            serde_json::json!({
+                "id": "copy-2",
+                "subject": "Independent copy",
+                "receivedDateTime": "2026-11-16T08:00:00Z",
+                "internetMessageId": "<shared@example.com>",
+            }),
+            "acc",
+            "fld",
+        )
+        .expect("mapped");
+
+        apply_graph_delta(
+            &ctx,
+            &account,
+            &folder,
+            crate::graph::messages::MessageDelta {
+                messages: vec![copy],
+                delta_link: Some("cursor-1".into()),
+                pending_cursor: crate::graph::messages::PendingCursor::Keep,
+                adopted_local_ids: std::collections::HashMap::new(),
+                full_sync: false,
+                removed_remote_ids: Vec::new(),
+            },
+        )
+        .await
+        .expect("delta with the other copy");
+
+        let (uid, gm_msgid, target_pending) = pending_projection_state(&ctx, "local-proj").await;
+        assert_eq!(
+            (uid, gm_msgid, target_pending),
+            (None, None, 1),
+            "the projection still waits for its confirmed target"
+        );
+        let (copy_uid, copy_remote, copy_pending) = pending_projection_state(&ctx, "copy-2").await;
+        assert!(copy_uid.is_some(), "the copy is imported as a real row");
+        assert_eq!(copy_remote.as_deref(), Some("copy-2"));
+        assert_eq!(copy_pending, 0);
+        let rows: i64 = ctx
+            .db
+            .read(|db| {
+                Ok(db.query_row(
+                    "SELECT COUNT(*) FROM message WHERE account_id = 'acc'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .expect("row count");
+        assert_eq!(rows, 2, "the copy and the projection both survive");
+    }
+
+    /// The temporary identity is cleared when `m-new` finally binds the row,
+    /// and the row then behaves exactly as before: a later stale update of the
+    /// old id cannot replace the live binding.
+    #[tokio::test]
+    async fn graph_confirmed_move_binding_clears_row_identity() {
+        let (ctx, account, folder) = graph_delta_fixture().await;
+        insert_pending_projection(&ctx, "old-graph-id", "same@example.com").await;
+        let op_id = insert_confirmed_move_op(&ctx, "old-graph-id", "m-new").await;
+        set_row_move_target(&ctx, "old-graph-id", "m-new").await;
+        settle_move_op(&ctx, &op_id).await;
+        prune_finished_ops(&ctx).await;
+
+        let adopted = crate::graph::messages::map_graph_json(
+            serde_json::json!({
+                "id": "m-new",
+                "subject": "Moved message",
+                "receivedDateTime": "2026-11-16T08:00:00Z",
+                "internetMessageId": "<same@example.com>",
+            }),
+            "acc",
+            "fld",
+        )
+        .expect("mapped");
+        apply_graph_delta(
+            &ctx,
+            &account,
+            &folder,
+            crate::graph::messages::MessageDelta {
+                messages: vec![adopted],
+                delta_link: Some("cursor-1".into()),
+                pending_cursor: crate::graph::messages::PendingCursor::Keep,
+                // Derived from the row identity, not the pruned operation.
+                adopted_local_ids: std::collections::HashMap::new(),
+                full_sync: false,
+                removed_remote_ids: Vec::new(),
+            },
+        )
+        .await
+        .expect("delta binds the projection");
+
+        let (uid, gm_msgid, target_pending) = pending_projection_state(&ctx, "old-graph-id").await;
+        assert!(uid.is_some(), "the projection is bound");
+        assert_eq!(gm_msgid.as_deref(), Some("m-new"));
+        assert_eq!(target_pending, 0);
+        assert_eq!(
+            row_move_target(&ctx, "old-graph-id").await,
+            (None, None),
+            "the temporary identity is cleared with the binding"
+        );
+
+        // Post-binding behaviour is unchanged: the old id is a superseded
+        // binding and must not replace the live one.
+        let stale = crate::graph::messages::map_graph_json(
+            serde_json::json!({
+                "id": "old-graph-id",
+                "subject": "Stale copy",
+                "receivedDateTime": "2026-11-16T08:00:00Z",
+                "internetMessageId": "<same@example.com>",
+            }),
+            "acc",
+            "fld",
+        )
+        .expect("mapped");
+        apply_graph_delta(
+            &ctx,
+            &account,
+            &folder,
+            crate::graph::messages::MessageDelta {
+                messages: vec![stale],
+                delta_link: Some("cursor-2".into()),
+                pending_cursor: crate::graph::messages::PendingCursor::Keep,
+                adopted_local_ids: std::collections::HashMap::new(),
+                full_sync: false,
+                removed_remote_ids: Vec::new(),
+            },
+        )
+        .await
+        .expect("stale delta after binding");
+
+        let (_, gm_msgid, target_pending) = pending_projection_state(&ctx, "old-graph-id").await;
+        assert_eq!(gm_msgid.as_deref(), Some("m-new"));
+        assert_eq!(target_pending, 0);
+        let rows: i64 = ctx
+            .db
+            .read(|db| {
+                Ok(db.query_row(
+                    "SELECT COUNT(*) FROM message WHERE account_id = 'acc'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .expect("row count");
+        assert_eq!(rows, 1, "the superseded id does not add a row");
+    }
+
+    /// Regression: the row was already claimed by a newer trip that recorded
+    /// destination `m-new2`. A retry of an older batch must not backfill its
+    /// stale `m-new1` over that identity, because an `@removed` for `m-new1`
+    /// would then delete the projection of the new copy.
+    #[tokio::test]
+    async fn graph_old_batch_backfill_does_not_overwrite_newer_trip_identity() {
+        let (ctx, account, folder) = graph_delta_fixture().await;
+        insert_pending_projection(&ctx, "proj", "same@example.com").await;
+        // The older trip still has a retained confirmed receipt for m-new1.
+        let older = insert_confirmed_move_op(&ctx, "proj", "m-new1").await;
+        // The newer trip owns the row and wrote m-new2 onto it.
+        let newer = insert_confirmed_move_op(&ctx, "proj", "m-new2").await;
+        set_row_move_target_owned(&ctx, "proj", "m-new2", &newer, 2).await;
+
+        let changed = backfill_row_move_target(&ctx, "proj", "m-new1", &older, 1).await;
+        assert_eq!(
+            changed, 0,
+            "the older batch must not replace the newer trip's destination"
+        );
+        assert_eq!(
+            row_move_target(&ctx, "proj").await,
+            (Some("m-new2".to_string()), Some("fld".to_string())),
+            "the row still waits for the newer trip's copy"
+        );
+        // The collection layer must hand the writer only the newer trip's
+        // destination, never both.
+        let cached = crate::graph::messages::cached_identities(&ctx, "acc", "fld")
+            .await
+            .expect("cached identities");
+        assert_eq!(
+            cached.adopted_local_ids.get("m-new2").map(String::as_str),
+            Some("proj")
+        );
+        assert!(
+            !cached.adopted_local_ids.contains_key("m-new1"),
+            "the old batch's destination is not adopted for the row"
+        );
+
+        // The old copy is reported removed. It must not resolve the projection.
+        apply_graph_delta(
+            &ctx,
+            &account,
+            &folder,
+            crate::graph::messages::MessageDelta {
+                messages: Vec::new(),
+                delta_link: Some("cursor-1".into()),
+                pending_cursor: crate::graph::messages::PendingCursor::Keep,
+                adopted_local_ids: std::collections::HashMap::new(),
+                full_sync: false,
+                removed_remote_ids: vec!["m-new1".into()],
+            },
+        )
+        .await
+        .expect("delta removing the old copy");
+
+        assert_eq!(
+            message_row_count(&ctx, "proj").await,
+            1,
+            "the old id's @removed must not delete the new projection"
+        );
+        let (uid, gm_msgid, target_pending) = pending_projection_state(&ctx, "proj").await;
+        assert_eq!((uid, gm_msgid, target_pending), (None, None, 1));
+        assert_eq!(
+            row_move_target(&ctx, "proj").await,
+            (Some("m-new2".to_string()), Some("fld".to_string())),
+            "the newer destination survives the stale removal"
+        );
+    }
+
+    /// Regression: the newer trip's confirmation is on the row (`m-new2`) and
+    /// its settled operation has since been housekept, while an older trip's
+    /// confirmed receipt (`m-old`) and its `graph_remote` alias are still
+    /// retained. The historical receipt must not back the alias next to the
+    /// row's new target, so an `@removed` for `m-old` must not delete the
+    /// projection.
+    #[tokio::test]
+    async fn graph_historical_receipt_does_not_back_stale_alias() {
+        let (ctx, account, folder) = graph_delta_fixture().await;
+        insert_pending_projection(&ctx, "proj", "same@example.com").await;
+        // Historical receipt from an earlier trip into this folder.
+        let older = insert_confirmed_move_op(&ctx, "proj", "m-old").await;
+        // The newer trip confirmed m-new2 and wrote it onto the row.
+        let newer = insert_confirmed_move_op(&ctx, "proj", "m-new2").await;
+        set_row_move_target_owned(&ctx, "proj", "m-new2", &newer, 2).await;
+        settle_move_op(&ctx, &newer).await;
+        prune_finished_ops(&ctx).await;
+
+        let newer_row = ctx
+            .db
+            .read({
+                let newer = newer.clone();
+                move |db| repo::pending_ops::get(db, &newer)
+            })
+            .await
+            .expect("read newer op");
+        assert!(newer_row.is_none(), "the newer receipt is housekept");
+        let older_row = ctx
+            .db
+            .read({
+                let older = older.clone();
+                move |db| repo::pending_ops::get(db, &older)
+            })
+            .await
+            .expect("read older op");
+        assert!(
+            older_row.is_some(),
+            "the historical receipt is retained because it disagrees with the row identity"
+        );
+
+        // The durable alias still names the earlier trip's destination.
+        set_graph_alias(&ctx, "proj", "m-old").await;
+        assert_eq!(
+            row_move_target(&ctx, "proj").await,
+            (Some("m-new2".to_string()), Some("fld".to_string())),
+            "the current row identity is the newer target"
+        );
+
+        // The collection layer must hand the writer only the row's identity,
+        // never the historical alias alongside it.
+        let cached = crate::graph::messages::cached_identities(&ctx, "acc", "fld")
+            .await
+            .expect("cached identities");
+        assert_eq!(
+            cached.adopted_local_ids.get("m-new2").map(String::as_str),
+            Some("proj")
+        );
+        assert!(
+            !cached.adopted_local_ids.contains_key("m-old"),
+            "the stale alias is not adopted for the current projection"
+        );
+        assert!(
+            !cached.remote_ids.contains("m-old"),
+            "the stale alias is not presented as a cached identity"
+        );
+
+        apply_graph_delta(
+            &ctx,
+            &account,
+            &folder,
+            crate::graph::messages::MessageDelta {
+                messages: Vec::new(),
+                delta_link: Some("cursor-1".into()),
+                pending_cursor: crate::graph::messages::PendingCursor::Keep,
+                adopted_local_ids: std::collections::HashMap::new(),
+                full_sync: false,
+                removed_remote_ids: vec!["m-old".into()],
+            },
+        )
+        .await
+        .expect("delta removing the historical destination");
+
+        assert_eq!(
+            message_row_count(&ctx, "proj").await,
+            1,
+            "the historical receipt must not back the stale alias, so the projection survives"
+        );
+        let (uid, gm_msgid, target_pending) = pending_projection_state(&ctx, "proj").await;
+        assert_eq!(
+            (uid, gm_msgid, target_pending),
+            (None, None, 1),
+            "the projection still waits for the newer trip"
+        );
+        assert_eq!(
+            row_move_target(&ctx, "proj").await,
+            (Some("m-new2".to_string()), Some("fld".to_string())),
+            "the new target survives the stale removal"
+        );
+    }
+
+    /// A page mapping captured before a newer trip cannot resolve (and delete)
+    /// the row after that trip claimed the identity slot, even while the claim
+    /// has no confirmed destination yet.
+    ///
+    /// This is the exact `message_undo` sequence: the message leaves and
+    /// returns to the folder, so the old receipts (and the page aliases derived
+    /// from them) still name it, but the current trip owns the row.
+    #[tokio::test]
+    async fn graph_stale_page_mapping_does_not_survive_a_new_claim() {
+        async fn confirm_latest(ctx: &nuncio_core::CoreContext, remote: &str, bind: bool) {
+            let remote = remote.to_string();
+            ctx.db
+                .write(move |db| {
+                    let op = repo::pending_ops::list(db, Some("acc"))?
+                        .into_iter()
+                        .max_by_key(|op| op.sequence)
+                        .expect("queued move");
+                    let mut payload: crate::ops::MoveOp = repo::pending_ops::payload(&op)?;
+                    payload.outcomes.push(crate::ops::OpMessageOutcome {
+                        message_id: "proj".into(),
+                        source_uid: Some(payload.uids[0]),
+                        state: crate::ops::OpMessageState::Confirmed,
+                        target_folder_id: Some(payload.target_folder_id.clone()),
+                        target_uid: Some(synthetic_uid(&remote)),
+                        target_uidvalidity: None,
+                        target_remote_id: Some(remote.clone()),
+                        attempt_remote_id: None,
+                        copy_phase: Default::default(),
+                        delete_flag_phase: Default::default(),
+                        expunge_phase: Default::default(),
+                    });
+                    repo::pending_ops::update_payload(
+                        db,
+                        &op.id,
+                        &serde_json::to_value(&payload).expect("payload"),
+                    )?;
+                    repo::pending_ops::mark_done(db, &op.id)?;
+                    repo::messages::set_move_target_identity(
+                        db,
+                        "acc",
+                        "proj",
+                        &payload.target_folder_id,
+                        &remote,
+                        &op.id,
+                        op.sequence,
+                    )?;
+                    if bind {
+                        repo::messages::set_graph_identity(
+                            db,
+                            "proj",
+                            synthetic_uid("proj"),
+                            &remote,
+                        )?;
+                    }
+                    Ok(())
+                })
+                .await
+                .expect("confirm move");
+        }
+
+        let (ctx, account, folder) = graph_delta_fixture().await;
+        insert_pending_projection(&ctx, "proj", "same@example.com").await;
+        ctx.db
+            .write(|db| {
+                repo::folders::insert(db, &Folder::new("src", "acc", "Source", FolderRole::Other))?;
+                db.execute(
+                    "UPDATE account SET oauth_provider = 'microsoft' WHERE id = 'acc'",
+                    [],
+                )?;
+                repo::messages::set_graph_identity(db, "proj", synthetic_uid("proj"), "m-start")?;
+                Ok(())
+            })
+            .await
+            .expect("seed source");
+        let service = crate::MailService::new(ctx.clone());
+        let first = service
+            .message_act(
+                &["proj".to_string()],
+                &nuncio_core::models::MessageAction::Move {
+                    folder_id: "src".into(),
+                },
+            )
+            .await
+            .expect("first move");
+        confirm_latest(&ctx, "m-src", true).await;
+        let second = service
+            .message_act(
+                &["proj".to_string()],
+                &nuncio_core::models::MessageAction::Move {
+                    folder_id: "fld".into(),
+                },
+            )
+            .await
+            .expect("second move");
+        confirm_latest(&ctx, "m-old", false).await;
+        let cached = crate::graph::messages::cached_identities(&ctx, "acc", "fld")
+            .await
+            .expect("collect before the newer trip");
+        assert_eq!(
+            cached.adopted_local_ids.get("m-old").map(String::as_str),
+            Some("proj"),
+            "the page starts from the receipt of the previous trip"
+        );
+        // Both undos commit their inverse claim locally without waiting for
+        // the account actor.
+        assert!(service.message_undo(&second).await.expect("undo second"));
+        assert!(service.message_undo(&first).await.expect("undo first"));
+        assert_eq!(
+            pending_projection_state(&ctx, "proj").await,
+            (None, None, 1)
+        );
+        assert_eq!(row_move_target(&ctx, "proj").await, (None, None));
+        let owners = ctx
+            .db
+            .read(|db| repo::messages::move_target_owners(db, "acc", "fld"))
+            .await
+            .expect("owners");
+        assert!(
+            owners.contains_key("proj"),
+            "the second inverse owns the new pending trip"
+        );
+        apply_graph_delta(
+            &ctx,
+            &account,
+            &folder,
+            crate::graph::messages::MessageDelta {
+                messages: Vec::new(),
+                delta_link: Some("cursor-after-stale-page".into()),
+                pending_cursor: crate::graph::messages::PendingCursor::Keep,
+                adopted_local_ids: cached.adopted_local_ids,
+                full_sync: false,
+                removed_remote_ids: vec!["m-old".into()],
+            },
+        )
+        .await
+        .expect("apply stale page after a new claim");
+        assert_eq!(
+            message_row_count(&ctx, "proj").await,
+            1,
+            "a page mapping captured before the new claim cannot delete its projection"
+        );
+    }
+
+    /// A rule-driven move claims the projection's identity slot in the same
+    /// transaction that queues the move, so a retry of an earlier batch cannot
+    /// backfill its stale destination and let `@removed` delete the new trip.
+    #[tokio::test]
+    async fn graph_rule_move_claims_before_an_old_backfill() {
+        use nuncio_core::models::{
+            MailRule, RuleAction, RuleActionKind, RuleCondition, RuleField, RuleOp,
+        };
+        let (ctx, account, folder) = graph_delta_fixture().await;
+        insert_pending_projection(&ctx, "proj", "same@example.com").await;
+        let older = insert_confirmed_move_op(&ctx, "proj", "m-old").await;
+        ctx.db
+            .write(|db| {
+                let source = Folder::new("src", "acc", "Source", FolderRole::Other);
+                repo::folders::insert(db, &source)?;
+                repo::messages::move_to_folder_pending(db, &["proj".to_string()], "src")?;
+                repo::messages::set_graph_identity(db, "proj", 7, "m-source")?;
+                Ok(())
+            })
+            .await
+            .expect("seed source projection");
+        let summary = ctx
+            .db
+            .read(|db| repo::messages::get_required(db, "proj").map(|row| row.summary))
+            .await
+            .expect("summary");
+        let rule = MailRule {
+            id: "return-rule".into(),
+            account_id: Some("acc".into()),
+            name: "Return".into(),
+            enabled: true,
+            match_all: true,
+            stop_processing: true,
+            sort_order: 0,
+            conditions: vec![RuleCondition {
+                field: RuleField::Subject,
+                op: RuleOp::Contains,
+                value: "subject".into(),
+            }],
+            actions: vec![RuleAction {
+                kind: RuleActionKind::Move,
+                folder_id: Some("fld".into()),
+            }],
+        };
+        assert_eq!(
+            crate::rules::apply_rule(&ctx, &account, &rule, &[summary])
+                .await
+                .expect("apply rule"),
+            1
+        );
+        ctx.db
+            .write(move |db| {
+                repo::sync_state::set(db, "acc", "mail", "graph_folder:Inbox", "remote-inbox")?;
+                db.execute(
+                    "UPDATE pending_op SET next_retry_at = '2099-01-01T00:00:00Z' WHERE id <> ?1",
+                    rusqlite::params![older],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("defer other operations");
+        let client = crate::graph::GraphMailClient::with_base("http://127.0.0.1:9".to_string());
+        let result = crate::ops::executor::run_due_graph_with(&ctx, &account, &client)
+            .await
+            .expect("retry the earlier batch");
+        assert_eq!(
+            result.done, 1,
+            "retry the earlier confirmed batch through the real executor"
+        );
+        apply_graph_delta(
+            &ctx,
+            &account,
+            &folder,
+            crate::graph::messages::MessageDelta {
+                messages: Vec::new(),
+                delta_link: Some("cursor-rule".into()),
+                pending_cursor: crate::graph::messages::PendingCursor::Keep,
+                adopted_local_ids: std::collections::HashMap::new(),
+                full_sync: false,
+                removed_remote_ids: vec!["m-old".into()],
+            },
+        )
+        .await
+        .expect("apply removal of the old destination");
+        assert_eq!(
+            message_row_count(&ctx, "proj").await,
+            1,
+            "a rule-created newer trip must survive the old backfill and tombstone"
+        );
+    }
+
+    async fn review_confirm_latest_trip(ctx: &nuncio_core::CoreContext, remote: &str, bind: bool) {
+        let remote = remote.to_string();
+        ctx.db
+            .write(move |db| {
+                let op = repo::pending_ops::list(db, Some("acc"))?
+                    .into_iter()
+                    .max_by_key(|op| op.sequence)
+                    .unwrap();
+                let mut payload: crate::ops::MoveOp = repo::pending_ops::payload(&op)?;
+                payload.outcomes.push(crate::ops::OpMessageOutcome {
+                    message_id: "proj".into(),
+                    source_uid: Some(payload.uids[0]),
+                    state: crate::ops::OpMessageState::Confirmed,
+                    target_folder_id: Some(payload.target_folder_id.clone()),
+                    target_uid: Some(synthetic_uid(&remote)),
+                    target_uidvalidity: None,
+                    target_remote_id: Some(remote.clone()),
+                    attempt_remote_id: None,
+                    copy_phase: Default::default(),
+                    delete_flag_phase: Default::default(),
+                    expunge_phase: Default::default(),
+                });
+                repo::pending_ops::update_payload(
+                    db,
+                    &op.id,
+                    &serde_json::to_value(&payload).unwrap(),
+                )?;
+                repo::pending_ops::mark_done(db, &op.id)?;
+                repo::messages::set_move_target_identity(
+                    db,
+                    "acc",
+                    "proj",
+                    &payload.target_folder_id,
+                    &remote,
+                    &op.id,
+                    op.sequence,
+                )?;
+                if bind {
+                    repo::messages::set_graph_identity(db, "proj", synthetic_uid("proj"), &remote)?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn review_owner_fixture() -> (
+        nuncio_core::CoreContext,
+        nuncio_core::models::Account,
+        Folder,
+        crate::MailService,
+    ) {
+        let (ctx, account, folder) = graph_delta_fixture().await;
+        insert_pending_projection(&ctx, "proj", "same@example.com").await;
+        ctx.db
+            .write(|db| {
+                repo::folders::insert(db, &Folder::new("src", "acc", "Source", FolderRole::Other))?;
+                db.execute(
+                    "UPDATE account SET oauth_provider = 'microsoft' WHERE id = 'acc'",
+                    [],
+                )?;
+                repo::messages::set_graph_identity(db, "proj", synthetic_uid("proj"), "m-start")?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let service = crate::MailService::new(ctx.clone());
+        (ctx, account, folder, service)
+    }
+
+    /// Regression: a `NotExecuted` (non-compensating) undo restores the row to
+    /// its source folder and must put back the provable Graph source identity.
+    /// A retained confirmation from an earlier trip into the same folder must
+    /// then not resolve the row, so its `@removed` cannot delete the restored
+    /// message.
+    #[tokio::test]
+    async fn review_graph_not_executed_undo_does_not_adopt_a_historical_receipt() {
+        use nuncio_core::models::MessageAction;
+        let (ctx, account, folder, service) = review_owner_fixture().await;
+        // A retained partial batch confirmed this row on a previous trip.
+        let older = insert_confirmed_move_op(&ctx, "proj", "m-old").await;
+        ctx.db
+            .write(|db| {
+                repo::messages::set_graph_identity(db, "proj", synthetic_uid("proj"), "m-old")?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        service
+            .message_act(
+                &["proj".into()],
+                &MessageAction::Move {
+                    folder_id: "src".into(),
+                },
+            )
+            .await
+            .unwrap();
+        review_confirm_latest_trip(&ctx, "m-out", true).await;
+        service
+            .message_act(
+                &["proj".into()],
+                &MessageAction::Move {
+                    folder_id: "fld".into(),
+                },
+            )
+            .await
+            .unwrap();
+        review_confirm_latest_trip(&ctx, "m-current", true).await;
+        prune_finished_ops(&ctx).await;
+        assert!(ctx
+            .db
+            .read(move |db| repo::pending_ops::get(db, &older))
+            .await
+            .unwrap()
+            .is_some());
+        // A later move is explicitly refused while verification is unavailable.
+        let undo = service
+            .message_act(
+                &["proj".into()],
+                &MessageAction::Move {
+                    folder_id: "src".into(),
+                },
+            )
+            .await
+            .unwrap();
+        ctx.db
+            .write(|db| {
+                let op = repo::pending_ops::list(db, Some("acc"))?
+                    .into_iter()
+                    .max_by_key(|op| op.sequence)
+                    .unwrap();
+                let mut payload: crate::ops::MoveOp = repo::pending_ops::payload(&op)?;
+                payload.outcomes.push(crate::ops::OpMessageOutcome {
+                    message_id: "proj".into(),
+                    source_uid: Some(payload.uids[0]),
+                    state: crate::ops::OpMessageState::NotExecuted,
+                    target_folder_id: Some(payload.target_folder_id.clone()),
+                    target_uid: None,
+                    target_uidvalidity: None,
+                    target_remote_id: None,
+                    attempt_remote_id: None,
+                    copy_phase: Default::default(),
+                    delete_flag_phase: Default::default(),
+                    expunge_phase: Default::default(),
+                });
+                repo::pending_ops::update_payload(
+                    db,
+                    &op.id,
+                    &serde_json::to_value(payload).unwrap(),
+                )?;
+                repo::pending_ops::mark_failed(
+                    db,
+                    &op.id,
+                    "Graph rejected the move; verification unavailable",
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(service.message_undo(&undo).await.unwrap());
+        assert_eq!(
+            pending_projection_state(&ctx, "proj").await,
+            (
+                Some(synthetic_uid("proj")),
+                Some("m-current".to_string()),
+                0
+            ),
+            "the refusal must restore the provable source identity"
+        );
+        assert!(ctx
+            .db
+            .read(|db| repo::messages::move_target_owners(db, "acc", "fld"))
+            .await
+            .unwrap()
+            .is_empty());
+        apply_graph_delta(
+            &ctx,
+            &account,
+            &folder,
+            crate::graph::messages::MessageDelta {
+                messages: vec![],
+                delta_link: Some("cursor-refused-undo".into()),
+                pending_cursor: crate::graph::messages::PendingCursor::Keep,
+                adopted_local_ids: std::collections::HashMap::new(),
+                full_sync: false,
+                removed_remote_ids: vec!["m-old".into()],
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            message_row_count(&ctx, "proj").await,
+            1,
+            "NotExecuted Undo must not let an older trip's receipt delete the restored message"
+        );
+    }
+
+    /// Regression: an undo moves the claimed row out and back again. The page
+    /// alias captured before the undo names the old trip's id; discarding it
+    /// must not let the Message-ID heuristic bind that id to the claimed row
+    /// (which would clear `target_pending` and the current owner).
+    #[tokio::test]
+    async fn review_graph_claim_only_undo_does_not_bind_stale_update() {
+        use nuncio_core::models::MessageAction;
+        let (ctx, account, folder, service) = review_owner_fixture().await;
+        let first = service
+            .message_act(
+                &["proj".into()],
+                &MessageAction::Move {
+                    folder_id: "src".into(),
+                },
+            )
+            .await
+            .unwrap();
+        review_confirm_latest_trip(&ctx, "m-out", true).await;
+        let second = service
+            .message_act(
+                &["proj".into()],
+                &MessageAction::Move {
+                    folder_id: "fld".into(),
+                },
+            )
+            .await
+            .unwrap();
+        review_confirm_latest_trip(&ctx, "m-old", false).await;
+        let cached = crate::graph::messages::cached_identities(&ctx, "acc", "fld")
+            .await
+            .unwrap();
+        assert!(service.message_undo(&second).await.unwrap());
+        assert!(service.message_undo(&first).await.unwrap());
+        assert!(ctx
+            .db
+            .read(|db| repo::messages::move_target_owners(db, "acc", "fld"))
+            .await
+            .unwrap()
+            .contains_key("proj"));
+        let stale = crate::graph::messages::map_graph_json(
+            serde_json::json!({
+                "id": "m-old", "subject": "Old trip", "receivedDateTime": "2026-11-16T08:00:00Z", "internetMessageId": "<same@example.com>"
+            }),
+            "acc",
+            "fld",
+        )
+        .unwrap();
+        apply_graph_delta(
+            &ctx,
+            &account,
+            &folder,
+            crate::graph::messages::MessageDelta {
+                messages: vec![stale],
+                delta_link: Some("cursor-stale-update".into()),
+                pending_cursor: crate::graph::messages::PendingCursor::Keep,
+                adopted_local_ids: cached.adopted_local_ids,
+                full_sync: false,
+                removed_remote_ids: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            pending_projection_state(&ctx, "proj").await,
+            (None, None, 1),
+            "discarding the page alias must not let its old id consume the claimed row through Message-ID"
+        );
+    }
+
+    /// Regression: `gm_msgid` is overloaded. On Gmail IMAP it holds
+    /// `X-GM-MSGID`, so a `NotExecuted` undo must not treat it as a Graph id and
+    /// fabricate a synthetic UID. After the source generation changed, the row
+    /// must stay isolated (`uid IS NULL`, `target_pending = 1`) for the next
+    /// sync to re-associate.
+    #[tokio::test]
+    async fn gmail_not_executed_undo_does_not_fabricate_a_graph_uid() {
+        use nuncio_core::models::MessageAction;
+        let (ctx, _, _, service) = review_owner_fixture().await;
+        ctx.db
+            .write(|db| {
+                db.execute(
+                    "UPDATE account SET provider = 'gmail', oauth_provider = 'google' WHERE id = 'acc'",
+                    [],
+                )?;
+                repo::folders::set_sync_flags(db, "fld", Some(7), None, None)?;
+                repo::messages::set_uid_and_graph_identity(
+                    db,
+                    "proj",
+                    Some(42),
+                    Some(7),
+                    Some("123456789012345"),
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let undo = service
+            .message_act(
+                &["proj".into()],
+                &MessageAction::Move {
+                    folder_id: "src".into(),
+                },
+            )
+            .await
+            .unwrap();
+        ctx.db
+            .write(|db| {
+                let op = repo::pending_ops::list(db, Some("acc"))?
+                    .into_iter()
+                    .max_by_key(|op| op.sequence)
+                    .unwrap();
+                let mut payload: crate::ops::MoveOp = repo::pending_ops::payload(&op)?;
+                payload.outcomes.push(crate::ops::OpMessageOutcome {
+                    message_id: "proj".into(),
+                    source_uid: Some(42),
+                    state: crate::ops::OpMessageState::NotExecuted,
+                    target_folder_id: Some("src".into()),
+                    target_uid: None,
+                    target_uidvalidity: None,
+                    target_remote_id: None,
+                    attempt_remote_id: None,
+                    copy_phase: Default::default(),
+                    delete_flag_phase: Default::default(),
+                    expunge_phase: Default::default(),
+                });
+                repo::pending_ops::update_payload(
+                    db,
+                    &op.id,
+                    &serde_json::to_value(&payload).unwrap(),
+                )?;
+                repo::pending_ops::mark_failed(
+                    db,
+                    &op.id,
+                    "COPY refused before the mailbox generation changed",
+                )?;
+                repo::folders::set_sync_flags(db, "fld", Some(8), None, None)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(service.message_undo(&undo).await.unwrap());
+        let row = ctx
+            .db
+            .read(|db| repo::messages::get_required(db, "proj"))
+            .await
+            .unwrap();
+        let pending = pending_projection_state(&ctx, "proj").await;
+        assert!(
+            row.uid.is_none() && pending.2 == 1,
+            "X-GM-MSGID is not a Graph id: a changed-generation IMAP row must stay unbound, got uid={:?}, uidvalidity={:?}, pending={}",
+            row.uid,
+            row.uidvalidity,
+            pending.2
+        );
+    }
+
+    /// Regression: a settled failure that persisted a send intent may already
+    /// have reached the server. Undo must keep it pending/deferred and must not
+    /// apply the `NotExecuted` identity restore.
+    #[tokio::test]
+    async fn graph_failed_send_intent_undo_stays_pending() {
+        use nuncio_core::models::{MessageAction, UndoState};
+        let (ctx, _, _, service) = review_owner_fixture().await;
+        service
+            .message_act(
+                &["proj".into()],
+                &MessageAction::Move {
+                    folder_id: "src".into(),
+                },
+            )
+            .await
+            .unwrap();
+        review_confirm_latest_trip(&ctx, "m-out", true).await;
+        service
+            .message_act(
+                &["proj".into()],
+                &MessageAction::Move {
+                    folder_id: "fld".into(),
+                },
+            )
+            .await
+            .unwrap();
+        review_confirm_latest_trip(&ctx, "m-current", true).await;
+        let undo = service
+            .message_act(
+                &["proj".into()],
+                &MessageAction::Move {
+                    folder_id: "src".into(),
+                },
+            )
+            .await
+            .unwrap();
+        ctx.db
+            .write(|db| {
+                let op = repo::pending_ops::list(db, Some("acc"))?
+                    .into_iter()
+                    .max_by_key(|op| op.sequence)
+                    .unwrap();
+                repo::pending_ops::mark_send_intent(db, &op.id)?;
+                repo::pending_ops::mark_failed(
+                    db,
+                    &op.id,
+                    "connection reset after the request was persisted",
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(service.message_undo(&undo).await.unwrap());
+        assert_eq!(
+            pending_projection_state(&ctx, "proj").await,
+            (None, None, 1),
+            "a possible send must stay pending; the NotExecuted identity restore must not run"
+        );
+        let state = ctx
+            .db
+            .read({
+                let undo = undo.clone();
+                move |db| Ok(repo::undo::get_request(db, &undo)?.map(|request| request.state))
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(state, Some(UndoState::Deferred | UndoState::Pending)),
+            "a possible send keeps the request retryable, got {state:?}"
+        );
     }
 }

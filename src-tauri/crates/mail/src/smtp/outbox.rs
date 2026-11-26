@@ -3,7 +3,10 @@
 //! recipient history).
 
 use chrono::Utc;
-use nuncio_core::models::{Address, Draft, FolderRole, OutboxItem, OutboxState, ReplyMode};
+use nuncio_core::models::{
+    Address, Draft, FolderRole, OutboxDraftCleanup, OutboxItem, OutboxState, ProviderKind,
+    ReplyMode,
+};
 use nuncio_core::{events, repo, AppError, CoreContext, Result};
 use tracing::{debug, info, warn};
 
@@ -84,12 +87,7 @@ pub async fn process_one(
     // inside one window that stays below `SENDING_LEASE`.
     let deadline = tokio::time::Instant::now() + crate::smtp::send::SEND_DEADLINE;
 
-    let bytes = match tokio::time::timeout_at(
-        deadline,
-        tokio::fs::read(&item.rfc822_path),
-    )
-    .await
-    {
+    let bytes = match tokio::time::timeout_at(deadline, tokio::fs::read(&item.rfc822_path)).await {
         Ok(Ok(bytes)) => bytes,
         Ok(Err(error)) => {
             let message = format!("staged message is missing: {error}");
@@ -187,7 +185,17 @@ async fn post_send(
     let mut affected_folders = Vec::new();
     if let Some(draft) = &draft {
         apply_source_flags(ctx, account, draft).await?;
-        remove_remote_draft(ctx, account, draft).await?;
+        // Consume the cleanup decision persisted when the message was queued.
+        // This path must never enqueue a delete from `remote_draft_message_id`:
+        // a queued delete or an in-flight APPEND already owns the remote copy,
+        // and a candidate must be kept. Only a local projection with no server
+        // UID (a ghost of the now-deleted draft) is reclaimed here.
+        if item.draft_cleanup == OutboxDraftCleanup::None {
+            if let Some(folder_id) = reclaim_unaddressable_projection(ctx, account, &draft_id).await
+            {
+                affected_folders.push(folder_id);
+            }
+        }
         affected_folders.extend(
             ctx.db
                 .read({
@@ -220,7 +228,7 @@ async fn post_send(
 
 async fn apply_source_flags(
     ctx: &CoreContext,
-    account: &nuncio_core::models::Account,
+    _account: &nuncio_core::models::Account,
     draft: &Draft,
 ) -> Result<()> {
     let Some(source_id) = draft.source_message_id.clone() else {
@@ -247,67 +255,107 @@ async fn apply_source_flags(
     if !answered && !forwarded {
         return Ok(());
     }
-    let id = stored.summary.id.clone();
+    // Captured outside the transaction and re-checked inside it. The send may
+    // have taken long enough for a sync to delete/rebind the source projection;
+    // the queue row and its writer must not be created for a copy that no
+    // longer carries this identity.
+    let identity = repo::messages::MessageIdentity::of(&stored);
+    // A reply/forward may be sent from a different account than the one that
+    // holds the original message. Folder/UID only identify a copy inside the
+    // *source* mailbox, so the queued operation must belong to that account;
+    // executing it under the sender would SELECT the same folder/UID on the
+    // wrong server and mark an unrelated message.
+    let source_account_id = stored.summary.account_id.clone();
+    let source_local_only = ctx
+        .db
+        .read({
+            let source_account_id = source_account_id.clone();
+            move |db| repo::accounts::get(db, &source_account_id)
+        })
+        .await?
+        .map(|source| matches!(source.provider, ProviderKind::Local | ProviderKind::Pop3))
+        // A vanished source account cannot receive server mail; never create
+        // an orphan queue row under it.
+        .unwrap_or(true);
+    let queued = if source_local_only {
+        None
+    } else {
+        stored
+            .uid
+            .map(|uid| {
+                let payload = crate::ops::SetFlagsOp {
+                    folder_id: stored.summary.folder_id.clone(),
+                    uids: vec![uid],
+                    seen: None,
+                    flagged: None,
+                    answered: answered.then_some(true),
+                    forwarded: forwarded.then_some(true),
+                    source_uidvalidity: stored.uidvalidity,
+                    previous: vec![crate::ops::FlagRollback {
+                        uid,
+                        seen: stored.summary.seen,
+                        flagged: stored.summary.flagged,
+                        answered: stored.summary.answered,
+                        forwarded: stored.summary.forwarded,
+                    }],
+                    message_ids: vec![stored.summary.id.clone()],
+                    outcomes: Vec::new(),
+                    remote_ids: stored
+                        .gm_msgid
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(|value| vec![value.to_string()])
+                        .unwrap_or_default(),
+                };
+                serde_json::to_value(payload)
+                    .map(|payload| (source_account_id.clone(), payload))
+                    .map_err(|error| AppError::internal(format!("cannot encode setFlags: {error}")))
+            })
+            .transpose()?
+    };
     ctx.db
         .write(move |db| {
-            repo::messages::set_flags(
+            crate::ops::apply_source_flags_in_db(
                 db,
-                &[id],
-                None,
-                None,
-                answered.then_some(true),
-                forwarded.then_some(true),
+                &identity,
+                answered,
+                forwarded,
+                queued.as_ref(),
             )
         })
         .await?;
-    if let Some(uid) = stored.uid {
-        crate::ops::enqueue_set_flags(
-            ctx,
-            &account.id,
-            &stored.summary.folder_id,
-            &[uid],
-            None,
-            None,
-            answered.then_some(true),
-            forwarded.then_some(true),
-            "Mark original as replied/forwarded",
-        )
-        .await?;
-    }
     Ok(())
 }
 
-async fn remove_remote_draft(
+/// Remove the Drafts projection of a sent draft when it has no server UID.
+///
+/// A projection with a UID is a real server copy: its cleanup belongs to the
+/// queued delete or in-flight APPEND, never to the SMTP post-send path. Only an
+/// unaddressable local echo is reclaimed so Drafts does not keep an unopenable
+/// row.
+async fn reclaim_unaddressable_projection(
     ctx: &CoreContext,
     account: &nuncio_core::models::Account,
-    draft: &Draft,
-) -> Result<()> {
-    let Some(remote_id) = draft.remote_draft_message_id.clone() else {
-        return Ok(());
-    };
-    let stored = ctx
-        .db
-        .read({
-            let remote_id = remote_id.clone();
-            move |db| repo::messages::get(db, &remote_id)
+    draft_id: &str,
+) -> Option<String> {
+    let message_id = crate::util::draft_message_id(draft_id);
+    let account_id = account.id.clone();
+    ctx.db
+        .write(move |db| {
+            let Some(stored) = repo::messages::get(db, &message_id)? else {
+                return Ok(None);
+            };
+            if stored.summary.account_id != account_id || stored.uid.is_some() {
+                return Ok(None);
+            }
+            let folder_id = stored.summary.folder_id.clone();
+            repo::messages::delete_local(db, &[message_id], true)?;
+            Ok(Some(folder_id))
         })
-        .await?;
-    if let Some(stored) = stored {
-        if let Some(uid) = stored.uid {
-            crate::ops::enqueue_delete_remote_draft(
-                ctx,
-                &account.id,
-                &stored.summary.folder_id,
-                uid,
-            )
-            .await?;
-        }
-        let ids = vec![stored.summary.id.clone()];
-        ctx.db
-            .write(move |db| repo::messages::delete_local(db, &ids, true))
-            .await?;
-    }
-    Ok(())
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Whether this send must APPEND its own copy to Sent.

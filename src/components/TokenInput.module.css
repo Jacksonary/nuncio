@@ -31,9 +31,9 @@
   background: var(--control-bg-hover);
 }
 
+/* Matches `Input`: four even 1px accent sides, no thicker underline. */
 .tokenField:focus-within {
   border-color: var(--accent);
-  box-shadow: inset 0 -2px 0 var(--accent);
 }
 
 .invalid {

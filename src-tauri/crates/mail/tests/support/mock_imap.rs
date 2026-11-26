@@ -42,6 +42,14 @@ pub struct MockFolder {
     pub messages: Vec<MockMessage>,
 }
 
+/// A server-assigned arrival time. The executor correlates an unacknowledged
+/// APPEND with a copy through this value, so it must be near the client clock.
+fn now_internaldate() -> String {
+    chrono::Utc::now()
+        .format("%d-%b-%Y %H:%M:%S +0000")
+        .to_string()
+}
+
 impl MockFolder {
     fn new(name: &str, attributes: &[&str]) -> Self {
         Self {
@@ -71,8 +79,59 @@ pub struct MockState {
     content_search_empty: AtomicBool,
     /// Omit the `UIDNEXT` response code from SELECT/EXAMINE (NetEase 163).
     omit_uidnext: AtomicBool,
+    /// Answer `UID SEARCH` with a tagged `NO`/`BAD` while sending no untagged
+    /// results. Models a server whose refusal looks like an empty set to the
+    /// typed `async-imap` helper.
+    search_fail: Mutex<Option<String>>,
+    /// Answer every `UID STORE` with `NO` (models a server that refuses the
+    /// flag update while still accepting the connection).
+    fail_store: AtomicBool,
+    /// Answer every `UID EXPUNGE`/`EXPUNGE` with `NO` (models a server that
+    /// acknowledges the flag update but refuses the removal).
+    fail_expunge: AtomicBool,
+    /// Include a UIDPLUS `APPENDUID` response code on APPEND.
+    append_uid_plus: AtomicBool,
+    /// Include a UIDPLUS `COPYUID` response code on UID MOVE/COPY.
+    copy_uid_plus: AtomicBool,
+    /// Store the APPEND and then drop the connection without sending the
+    /// tagged completion (models a lost receipt after the server committed).
+    append_drop_completion: AtomicBool,
+    /// Apply `UID MOVE` and then drop the connection without sending the
+    /// tagged completion. Models a move whose receipt was lost even though the
+    /// server committed it.
+    move_drop_completion: AtomicBool,
+    /// Apply `UID COPY` and then drop the connection without sending the
+    /// tagged completion. Models a copy whose receipt was lost even though the
+    /// server committed it.
+    copy_drop_completion: AtomicBool,
+    /// Apply `UID STORE` and then drop the connection without sending the
+    /// tagged completion. Models a flag update whose receipt was lost even
+    /// though the server committed it.
+    store_drop_completion: AtomicBool,
+    /// Read the APPEND literal (so it is provably on the wire) and answer a
+    /// tagged `NO` without storing it. Models a server that explicitly refuses
+    /// an upload.
+    fail_append: AtomicBool,
+    /// Folder names whose `DELETE` answers `NO` (used to model servers that
+    /// refuse to remove a mailbox and leave it selected).
+    fail_deletes: Mutex<Vec<String>>,
     /// Every command received, as `"COMMAND args"` in arrival order.
     commands: Mutex<Vec<String>>,
+    /// Commands received per accepted connection (index = accept order). Lets
+    /// a timeout test prove that a poisoned connection received nothing after
+    /// the command that hung.
+    connection_commands: Mutex<Vec<Vec<String>>>,
+    /// Connections whose handler is still open (not closed by either side).
+    open_connections: AtomicUsize,
+    /// Command names that should be received but never acknowledged, one
+    /// entry consumed per occurrence. Models a server that is half-dead.
+    hang_next: Mutex<Vec<String>>,
+    /// When set, an APPEND blocks until a permit is available. Lets a test
+    /// pause the executor in the middle of an in-flight upload.
+    append_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// Called synchronously while handling a successful expunge. Tests use it
+    /// to mutate the staged draft between validation and upload.
+    on_expunge: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl MockState {
@@ -91,9 +150,131 @@ impl MockState {
         self.omit_uidnext.store(value, Ordering::SeqCst);
     }
 
+    /// Answer `UID SEARCH` with the given tagged status (`"NO"` / `"BAD"`)
+    /// and no untagged result.
+    pub fn set_fail_search(&self, status: Option<&str>) {
+        *self.search_fail.lock().expect("mock search fail lock") =
+            status.map(|value| value.to_string());
+    }
+
+    /// Make every `UID STORE` answer `NO` without changing flags.
+    pub fn set_fail_store(&self, value: bool) {
+        self.fail_store.store(value, Ordering::SeqCst);
+    }
+
+    /// Make every `EXPUNGE`/`UID EXPUNGE` answer `NO` without removing mail.
+    pub fn set_fail_expunge(&self, value: bool) {
+        self.fail_expunge.store(value, Ordering::SeqCst);
+    }
+
+    /// Pause every APPEND until a permit is added to `gate`.
+    pub fn set_append_gate(&self, gate: Arc<tokio::sync::Semaphore>) {
+        *self.append_gate.lock().expect("mock append gate lock") = Some(gate);
+    }
+
+    /// Run `hook` while a successful EXPUNGE/UID EXPUNGE is being handled.
+    pub fn set_on_expunge<F>(&self, hook: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        *self.on_expunge.lock().expect("mock expunge hook lock") = Some(Arc::new(hook));
+    }
+
+    /// Emit `APPENDUID <uidvalidity> <uid>` on APPEND, as UIDPLUS servers do.
+    pub fn set_append_uid_plus(&self, value: bool) {
+        self.append_uid_plus.store(value, Ordering::SeqCst);
+    }
+
+    /// Emit `COPYUID <uidvalidity> <source set> <destination set>` on
+    /// UID MOVE/COPY, as UIDPLUS servers do.
+    pub fn set_copy_uid_plus(&self, value: bool) {
+        self.copy_uid_plus.store(value, Ordering::SeqCst);
+    }
+
+    /// Store the APPEND, then close the connection before the tagged
+    /// completion. The client sees a network failure but the message exists.
+    pub fn set_append_drop_completion(&self, value: bool) {
+        self.append_drop_completion.store(value, Ordering::SeqCst);
+    }
+
+    /// Apply `UID MOVE`/`UID COPY`, then close the connection before the
+    /// tagged completion. The copy is committed, but the client cannot know.
+    pub fn set_move_drop_completion(&self, value: bool) {
+        self.move_drop_completion.store(value, Ordering::SeqCst);
+    }
+
+    /// Apply `UID COPY`, then close the connection before the tagged
+    /// completion. The copy is committed, but the client cannot know.
+    pub fn set_copy_drop_completion(&self, value: bool) {
+        self.copy_drop_completion.store(value, Ordering::SeqCst);
+    }
+
+    /// Apply `UID STORE`, then close the connection before the tagged
+    /// completion. The flags are committed, but the client cannot know.
+    pub fn set_store_drop_completion(&self, value: bool) {
+        self.store_drop_completion.store(value, Ordering::SeqCst);
+    }
+
+    /// Accept the APPEND literal but answer `NO`, storing nothing.
+    pub fn set_fail_append(&self, value: bool) {
+        self.fail_append.store(value, Ordering::SeqCst);
+    }
+
+    /// Make `DELETE` of `folder` answer `NO`, leaving the mailbox in place.
+    pub fn fail_delete(&self, folder: &str) {
+        self.fail_deletes
+            .lock()
+            .expect("mock fail deletes lock")
+            .push(folder.to_string());
+    }
+
     /// Commands received so far, as `"COMMAND args"`.
     pub fn commands(&self) -> Vec<String> {
         self.commands.lock().expect("mock commands lock").clone()
+    }
+
+    /// Commands received on one accepted connection (accept order).
+    pub fn commands_on_connection(&self, index: usize) -> Vec<String> {
+        self.connection_commands
+            .lock()
+            .expect("mock connection commands lock")
+            .get(index)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Number of commands received on each accepted connection.
+    pub fn connection_command_counts(&self) -> Vec<usize> {
+        self.connection_commands
+            .lock()
+            .expect("mock connection commands lock")
+            .iter()
+            .map(Vec::len)
+            .collect()
+    }
+
+    /// Accept the next occurrence of `command` (case-insensitive) and never
+    /// answer it. The command is still recorded, so a test can prove it
+    /// reached the server.
+    pub fn hang_next_command(&self, command: &str) {
+        self.hang_next
+            .lock()
+            .expect("mock hang lock")
+            .push(command.to_ascii_uppercase());
+    }
+
+    fn take_hang(&self, command: &str) -> bool {
+        let mut hangs = self.hang_next.lock().expect("mock hang lock");
+        match hangs
+            .iter()
+            .position(|item| item.eq_ignore_ascii_case(command))
+        {
+            Some(index) => {
+                hangs.remove(index);
+                true
+            }
+            None => false,
+        }
     }
 
     fn idle_timeout(&self) -> Option<Duration> {
@@ -102,6 +283,11 @@ impl MockState {
 
     pub fn connection_count(&self) -> usize {
         self.connections.load(Ordering::SeqCst)
+    }
+
+    /// Connections whose handler has not returned (still open).
+    pub fn open_connection_count(&self) -> usize {
+        self.open_connections.load(Ordering::SeqCst)
     }
 
     pub fn add_message(&self, folder: &str, raw: &[u8]) -> u32 {
@@ -117,7 +303,7 @@ impl MockState {
         folder.messages.push(MockMessage {
             uid,
             flags: Vec::new(),
-            internaldate: "12-Nov-2026 08:00:00 +0000".into(),
+            internaldate: now_internaldate(),
             raw: raw.to_vec(),
             modseq,
             gm_msgid: None,
@@ -200,6 +386,21 @@ impl MockState {
             .map(|folder| folder.messages.len())
             .unwrap_or(0)
     }
+
+    /// Raw bytes of every message in a folder, in UID order.
+    pub fn message_bodies(&self, folder: &str) -> Vec<Vec<u8>> {
+        let folders = self.folders.lock().expect("mock folders lock");
+        folders
+            .iter()
+            .find(|item| item.name.eq_ignore_ascii_case(folder))
+            .map(|item| {
+                item.messages
+                    .iter()
+                    .map(|message| message.raw.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 pub struct MockImap {
@@ -236,7 +437,23 @@ impl MockImap {
             idle_timeout: Mutex::new(None),
             content_search_empty: AtomicBool::new(false),
             omit_uidnext: AtomicBool::new(false),
+            search_fail: Mutex::new(None),
+            fail_store: AtomicBool::new(false),
+            fail_expunge: AtomicBool::new(false),
+            append_uid_plus: AtomicBool::new(false),
+            copy_uid_plus: AtomicBool::new(false),
+            append_drop_completion: AtomicBool::new(false),
+            move_drop_completion: AtomicBool::new(false),
+            copy_drop_completion: AtomicBool::new(false),
+            store_drop_completion: AtomicBool::new(false),
+            fail_append: AtomicBool::new(false),
+            fail_deletes: Mutex::new(Vec::new()),
+            append_gate: Mutex::new(None),
+            on_expunge: Mutex::new(None),
             commands: Mutex::new(Vec::new()),
+            connection_commands: Mutex::new(Vec::new()),
+            open_connections: AtomicUsize::new(0),
+            hang_next: Mutex::new(Vec::new()),
             folders: Mutex::new(
                 folders
                     .iter()
@@ -254,10 +471,22 @@ impl MockImap {
                     accepted = listener.accept() => {
                         match accepted {
                             Ok((stream, _)) => {
-                                accept_state.connections.fetch_add(1, Ordering::SeqCst);
+                                let index =
+                                    accept_state.connections.fetch_add(1, Ordering::SeqCst);
+                                accept_state.open_connections.fetch_add(1, Ordering::SeqCst);
+                                {
+                                    let mut per = accept_state
+                                        .connection_commands
+                                        .lock()
+                                        .expect("mock connection commands lock");
+                                    while per.len() <= index {
+                                        per.push(Vec::new());
+                                    }
+                                }
                                 let state = accept_state.clone();
                                 tokio::spawn(async move {
-                                    let _ = handle_connection(stream, state).await;
+                                    let _ = handle_connection(stream, state.clone(), index).await;
+                                    state.open_connections.fetch_sub(1, Ordering::SeqCst);
                                 });
                             }
                             Err(_) => break,
@@ -279,7 +508,11 @@ struct Session {
     selected: Option<String>,
 }
 
-async fn handle_connection(stream: TcpStream, state: Arc<MockState>) -> io::Result<()> {
+async fn handle_connection(
+    stream: TcpStream,
+    state: Arc<MockState>,
+    connection_index: usize,
+) -> io::Result<()> {
     let mut reader = BufReader::new(stream);
     write_str(&mut reader, "* OK Nuncio mock IMAP ready\r\n").await?;
     let mut session = Session { selected: None };
@@ -300,7 +533,7 @@ async fn handle_connection(stream: TcpStream, state: Arc<MockState>) -> io::Resu
         if line.is_empty() {
             continue;
         }
-        if !handle_command(&mut reader, &state, &mut session, &line).await? {
+        if !handle_command(&mut reader, &state, &mut session, &line, connection_index).await? {
             return Ok(());
         }
     }
@@ -311,6 +544,7 @@ async fn handle_command(
     state: &Arc<MockState>,
     session: &mut Session,
     line: &str,
+    connection_index: usize,
 ) -> io::Result<bool> {
     let tokens = tokenize(line);
     if tokens.len() < 2 {
@@ -319,11 +553,35 @@ async fn handle_command(
     let tag = tokens[0].clone();
     let command = tokens[1].to_ascii_uppercase();
     let args = &tokens[2..];
+    let recorded = format!("{command} {}", args.join(" "));
     state
         .commands
         .lock()
         .expect("mock commands lock")
-        .push(format!("{command} {}", args.join(" ")));
+        .push(recorded.clone());
+    if let Some(per) = state
+        .connection_commands
+        .lock()
+        .expect("mock connection commands lock")
+        .get_mut(connection_index)
+    {
+        per.push(recorded);
+    }
+
+    // Test-only knob: a SEARCH whose criteria carry this marker is answered
+    // slowly, for exercising the FETCH/SEARCH budget independently of the
+    // interactive command budget.
+    if command == "UID" && line.contains("audit-slow-search") {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    // Received but deliberately never acknowledged: models a server whose
+    // socket is half-dead. The connection stays open (and silent) until the
+    // client gives up.
+    if state.take_hang(&command) {
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        return Ok(false);
+    }
 
     match command.as_str() {
         "CAPABILITY" => {
@@ -454,39 +712,80 @@ async fn handle_command(
                 return Ok(true);
             };
             let len: usize = line[open + 1..close].parse().unwrap_or(0);
+            // Tests can hold the APPEND here to discard/send a draft while the
+            // executor is genuinely in flight.
+            let gate = state
+                .append_gate
+                .lock()
+                .expect("mock append gate lock")
+                .clone();
+            if let Some(gate) = gate {
+                let _permit = gate.acquire().await.expect("mock append gate was closed");
+            }
             write_str(reader, "+ Ready for literal data\r\n").await?;
             let mut data = vec![0u8; len];
             reader.read_exact(&mut data).await?;
             let mut crlf = [0u8; 2];
             let _ = reader.read_exact(&mut crlf).await;
+            // Test-only knob: once the literal is on the wire, emit a tunable
+            // burst of unsolicited `EXISTS` before the tagged completion. A
+            // per-read timeout would keep extending; the total APPEND budget
+            // must still expire.
+            if data
+                .windows(b"AUDIT_APPEND_CHATTER".len())
+                .any(|window| window == b"AUDIT_APPEND_CHATTER")
+            {
+                for _ in 0..8 {
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    write_str(reader, "* 1 EXISTS\r\n").await?;
+                }
+            }
+            if state.fail_append.load(Ordering::SeqCst) {
+                // The literal was received but the server refuses it: the
+                // client may retry the same APPEND safely.
+                write_str(reader, &format!("{tag} NO APPEND rejected\r\n")).await?;
+                return Ok(true);
+            }
             let flags: Vec<String> = line
                 .split_once('(')
                 .and_then(|(_, rest)| rest.split_once(')'))
                 .map(|(inside, _)| inside.split_whitespace().map(str::to_string).collect())
                 .unwrap_or_default();
-            {
+            let appended = {
                 let mut folders = state.folders.lock().expect("folders lock");
-                if let Some(folder) = folders
+                folders
                     .iter_mut()
                     .find(|folder| folder.name.eq_ignore_ascii_case(&mailbox))
-                {
-                    let uid = folder.next_uid;
-                    folder.next_uid += 1;
-                    let modseq = folder.next_modseq;
-                    folder.next_modseq += 1;
-                    folder.messages.push(MockMessage {
-                        uid,
-                        flags,
-                        internaldate: "12-Nov-2026 08:00:00 +0000".into(),
-                        raw: data,
-                        modseq,
-                        gm_msgid: None,
-                        gm_thrid: None,
-                        gm_labels: Vec::new(),
-                    });
-                }
+                    .map(|folder| {
+                        let uid = folder.next_uid;
+                        folder.next_uid += 1;
+                        let modseq = folder.next_modseq;
+                        folder.next_modseq += 1;
+                        folder.messages.push(MockMessage {
+                            uid,
+                            flags,
+                            internaldate: now_internaldate(),
+                            raw: data,
+                            modseq,
+                            gm_msgid: None,
+                            gm_thrid: None,
+                            gm_labels: Vec::new(),
+                        });
+                        (folder.uidvalidity, uid)
+                    })
+            };
+            if state.append_drop_completion.load(Ordering::SeqCst) {
+                // The message is committed, but the client never learns it.
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "mock APPEND completion lost",
+                ));
             }
-            write_str(reader, &format!("{tag} OK APPEND completed\r\n")).await?;
+            let code = appended
+                .filter(|_| state.append_uid_plus.load(Ordering::SeqCst))
+                .map(|(validity, uid)| format!(" [APPENDUID {validity} {uid}]"))
+                .unwrap_or_default();
+            write_str(reader, &format!("{tag} OK{code} APPEND completed\r\n")).await?;
         }
         "CREATE" => {
             let name = args.first().cloned().unwrap_or_default();
@@ -503,12 +802,22 @@ async fn handle_command(
         }
         "DELETE" => {
             let name = args.first().cloned().unwrap_or_default();
-            state
-                .folders
+            let fails = state
+                .fail_deletes
                 .lock()
-                .expect("folders lock")
-                .retain(|folder| !folder.name.eq_ignore_ascii_case(&name));
-            write_str(reader, &format!("{tag} OK DELETE completed\r\n")).await?;
+                .expect("fail deletes lock")
+                .iter()
+                .any(|folder| folder.eq_ignore_ascii_case(&name));
+            if fails {
+                write_str(reader, &format!("{tag} NO DELETE failed\r\n")).await?;
+            } else {
+                state
+                    .folders
+                    .lock()
+                    .expect("folders lock")
+                    .retain(|folder| !folder.name.eq_ignore_ascii_case(&name));
+                write_str(reader, &format!("{tag} OK DELETE completed\r\n")).await?;
+            }
         }
         "RENAME" => {
             let from = args.first().cloned().unwrap_or_default();
@@ -569,6 +878,17 @@ async fn handle_search(
         write_str(reader, &format!("{tag} BAD no mailbox selected\r\n")).await?;
         return Ok(());
     };
+    let search_fail = state
+        .search_fail
+        .lock()
+        .expect("mock search fail lock")
+        .clone();
+    if let Some(status) = search_fail {
+        // No untagged `SEARCH` line: a parser that ignores the tagged status
+        // would report an empty result here.
+        write_str(reader, &format!("{tag} {status} SEARCH failed\r\n")).await?;
+        return Ok(());
+    }
     let criteria = args.join(" ").to_ascii_uppercase();
     let content_key = ["TEXT", "SUBJECT", "FROM", "TO", "CC", "BODY", "HEADER"]
         .iter()
@@ -844,6 +1164,10 @@ async fn handle_store(
     tag: &str,
     args: &[String],
 ) -> io::Result<()> {
+    if state.fail_store.load(Ordering::SeqCst) {
+        write_str(reader, &format!("{tag} NO STORE rejected\r\n")).await?;
+        return Ok(());
+    }
     let Some(folder_name) = session.selected.clone() else {
         write_str(reader, &format!("{tag} BAD no mailbox selected\r\n")).await?;
         return Ok(());
@@ -895,6 +1219,15 @@ async fn handle_store(
         }
         updates
     };
+    if state.store_drop_completion.load(Ordering::SeqCst) {
+        // The flags are committed, but the client never learns it. A retry
+        // may be skipped after the writer moves on; the executor must keep
+        // the take-off `Unknown` in that case.
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "mock STORE completion lost",
+        ));
+    }
     if !silent {
         for (index, uid, flags) in updates {
             write_str(
@@ -927,6 +1260,7 @@ async fn handle_copy(
     };
     let spec = args.first().cloned().unwrap_or_default();
     let target = args.get(1).cloned().unwrap_or_default();
+    let mut copyuid: Option<(u32, Vec<i64>, Vec<i64>)> = None;
     let target_exists = {
         let folders = state.folders.lock().expect("folders lock");
         folders
@@ -961,14 +1295,21 @@ async fn handle_copy(
                 .filter(|message| wanted.contains(&message.uid))
                 .cloned()
                 .collect();
+            let mut sources = Vec::new();
+            let mut destinations = Vec::new();
             for mut message in messages {
                 let target = &mut folders[target_index];
+                sources.push(message.uid as i64);
+                destinations.push(target.next_uid as i64);
                 message.uid = target.next_uid;
                 target.next_uid += 1;
                 message.modseq = target.next_modseq;
                 target.next_modseq += 1;
                 target.messages.push(message);
             }
+            // COPYUID reports the *destination* mailbox's UIDVALIDITY, not
+            // the source's (RFC 4315 §3).
+            copyuid = Some((folders[target_index].uidvalidity, sources, destinations));
             if remove_source {
                 let uids: HashSet<u32> = folders[source_index]
                     .messages
@@ -979,6 +1320,44 @@ async fn handle_copy(
                 folders[source_index]
                     .messages
                     .retain(|message| !uids.contains(&message.uid));
+            }
+        }
+    }
+    if remove_source && state.move_drop_completion.load(Ordering::SeqCst) {
+        // The move is committed, but the client never learns it.
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "mock MOVE completion lost",
+        ));
+    }
+    if !remove_source && state.copy_drop_completion.load(Ordering::SeqCst) {
+        // The copy is committed, but the client never learns it.
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "mock COPY completion lost",
+        ));
+    }
+    if state.copy_uid_plus.load(Ordering::SeqCst) {
+        if let Some((uidvalidity, sources, destinations)) = copyuid {
+            if !sources.is_empty() && sources.len() == destinations.len() {
+                let source_set = sources
+                    .iter()
+                    .map(|uid| uid.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let destination_set = destinations
+                    .iter()
+                    .map(|uid| uid.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                write_str(
+                    reader,
+                    &format!(
+                        "{tag} OK [COPYUID {uidvalidity} {source_set} {destination_set}] completed\r\n"
+                    ),
+                )
+                .await?;
+                return Ok(());
             }
         }
     }
@@ -993,6 +1372,10 @@ async fn expunge(
     tag: &str,
     spec: Option<&str>,
 ) -> io::Result<()> {
+    if state.fail_expunge.load(Ordering::SeqCst) {
+        write_str(reader, &format!("{tag} NO EXPUNGE rejected\r\n")).await?;
+        return Ok(());
+    }
     let Some(folder_name) = session.selected.clone() else {
         write_str(reader, &format!("{tag} BAD no mailbox selected\r\n")).await?;
         return Ok(());
@@ -1033,6 +1416,16 @@ async fn expunge(
     };
     for seq in removed.into_iter().rev() {
         write_str(reader, &format!("* {seq} EXPUNGE\r\n")).await?;
+    }
+    // Tests that need to change the staged draft between the executor's
+    // validation read and its upload hook in here.
+    let hook = state
+        .on_expunge
+        .lock()
+        .expect("mock expunge hook lock")
+        .clone();
+    if let Some(hook) = hook {
+        hook();
     }
     write_str(reader, &format!("{tag} OK EXPUNGE completed\r\n")).await?;
     Ok(())

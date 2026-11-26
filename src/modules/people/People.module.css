@@ -221,25 +221,6 @@
   font-variant-numeric: tabular-nums;
 }
 
-.bulkBar {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-1);
-  flex-wrap: wrap;
-  padding: var(--sp-1) var(--sp-2);
-  border-radius: var(--radius-m);
-  background: var(--accent-subtle);
-  border: 1px solid var(--accent-border);
-}
-
-.bulkLabel {
-  flex: 1;
-  min-width: 140px;
-  font-size: 12px;
-  font-weight: var(--weight-medium);
-  color: var(--text);
-}
-
 .listBody {
   flex: 1;
   min-height: 0;

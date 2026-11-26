@@ -8,6 +8,8 @@ function status(overrides: Partial<SyncStatus> = {}): SyncStatus {
     module: "mail",
     state: "idle",
     progress: null,
+    fullSync: false,
+    seq: 0,
     message: null,
     lastSyncAt: null,
     ...overrides,
@@ -44,6 +46,19 @@ describe("presentationFor", () => {
     expect(result.kind).toBe("syncing");
     expect(result.labelKey).toBeNull();
     expect(result.detail).toBeNull();
+  });
+
+  it("captions a first full import but stays silent for a routine sync", () => {
+    const full = presentationFor(
+      [status({ module: "mail", state: "syncing", fullSync: true })],
+      "mail",
+    );
+    expect(full.kind).toBe("syncing");
+    expect(full.labelKey).toBe("sync.fullSync");
+
+    const routine = presentationFor([syncing("mail", null)], "mail");
+    expect(routine.kind).toBe("syncing");
+    expect(routine.labelKey).toBeNull();
   });
 
   it("reports syncing for any account of the module", () => {

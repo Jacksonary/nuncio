@@ -38,8 +38,30 @@ impl MailService {
         if let Some(item) = self.outbox_item(id).await? {
             return self.outbox_detail(&item, allow_remote).await;
         }
-        let mut stored = self.stored(id).await?;
-        let raw = self.raw_message(&stored).await?;
+        // Capture the copy and the flag revision together, at the *start* of
+        // the open and before the body download (which can take seconds)
+        // begins. `mark_seen_on_open` re-checks both inside the write
+        // transaction: a sync that rebinds the row, or a user action that
+        // changes the flag while the body loads, must not be overwritten by
+        // this automatic mark. A single read transaction is required: two
+        // separate autocommit reads could straddle a concurrent write, and the
+        // newer revision would then be recorded as this open's baseline.
+        let (mut stored, opened_copy, observed_flag_revision) = {
+            let message_id = id.to_string();
+            self.inner
+                .ctx
+                .db
+                .read_tx(move |db| {
+                    let stored = repo::messages::get(db, &message_id)?.ok_or_else(|| {
+                        AppError::not_found(format!("message {message_id} not found"))
+                    })?;
+                    let copy = repo::messages::body_identity_key(&stored);
+                    let revision = repo::messages::flag_revision(db, &message_id)?;
+                    Ok((stored, copy, revision))
+                })
+                .await?
+        };
+        let raw = self.raw_message(&stored).await?.bytes;
         // A body download refreshes headers/attachments/preview in the DB.
         stored = self.stored(id).await?;
 
@@ -47,7 +69,8 @@ impl MailService {
         // that is already open. Marking it read again would silently undo a
         // "mark as unread" the user made after opening it.
         if !light_background {
-            self.mark_seen_on_open(&mut stored).await?;
+            self.mark_seen_on_open(&mut stored, opened_copy, observed_flag_revision)
+                .await?;
         }
 
         let parsed = parse(&raw)?;
@@ -559,7 +582,7 @@ impl MailService {
         let headers = match headers {
             Some(headers) => headers,
             None => {
-                let raw = self.raw_message(&stored).await?;
+                let raw = self.raw_message(&stored).await?.bytes;
                 parse(&raw)?.headers
             }
         };
@@ -669,12 +692,26 @@ impl MailService {
         message.cc = data.cc;
         let (raw, _) = nuncio_mime::build_message(message)?;
         let _ = self
-            .queue_outbox(&account, None, subject, message_to_recipients(&raw)?, raw)
+            .queue_outbox(
+                &account,
+                None,
+                subject,
+                message_to_recipients(&raw)?,
+                raw,
+                nuncio_core::models::OutboxDraftCleanup::None,
+                None,
+            )
             .await?;
         Ok(())
     }
 
     /// Queue already-built RFC822 bytes in the outbox and try to send now.
+    ///
+    /// `on_enqueued` runs in the *same* transaction as the outbox insert. The
+    /// source draft's suppression/cleanup intent therefore commits only if the
+    /// message is durably queued: a staging or insert failure cannot leave a
+    /// draft suppressed or a remote copy deleted for a send that never reached
+    /// the outbox.
     pub(crate) async fn queue_outbox(
         &self,
         account: &Account,
@@ -682,10 +719,19 @@ impl MailService {
         subject: String,
         recipients: Vec<Address>,
         raw: Vec<u8>,
-    ) -> Result<bool> {
+        draft_cleanup: nuncio_core::models::OutboxDraftCleanup,
+        on_enqueued: Option<
+            Box<
+                dyn FnOnce(&rusqlite::Connection) -> Result<nuncio_core::models::OutboxDraftCleanup>
+                    + Send,
+            >,
+        >,
+    ) -> Result<(bool, nuncio_core::models::OutboxDraftCleanup)> {
         if recipients.is_empty() {
             return Err(AppError::invalid_input("message has no recipients"));
         }
+        // Stage the bytes first: nothing may be persisted (or deleted) when the
+        // message cannot even be written to disk.
         let path = self
             .inner
             .ctx
@@ -696,18 +742,27 @@ impl MailService {
         tokio::fs::write(&path, &raw)
             .await
             .map_err(|error| AppError::io(format!("cannot stage outgoing message: {error}")))?;
-        let item = nuncio_core::models::OutboxItem::new(
+        let mut item = nuncio_core::models::OutboxItem::new(
             account.id.clone(),
             draft_id,
             recipients.clone(),
             subject,
             path.to_string_lossy().to_string(),
         );
+        item.draft_cleanup = draft_cleanup;
         let item = self
             .inner
             .ctx
             .db
-            .write(move |db| repo::outbox::enqueue(db, &item))
+            .write(move |db| {
+                let mut item = item;
+                // The applied cleanup decides the persisted classification (a
+                // concurrent APPEND may have taken ownership meanwhile).
+                if let Some(action) = on_enqueued {
+                    item.draft_cleanup = action(db)?;
+                }
+                repo::outbox::enqueue(db, &item)
+            })
             .await?;
         if let Err(error) =
             crate::service::outbox::refresh_outbox_folder(&self.inner.ctx, &account.id).await
@@ -744,15 +799,24 @@ impl MailService {
             Vec::new(),
             MailChangeKind::Updated,
         );
-        let sent = self
+        let settled = self
             .inner
             .ctx
             .db
             .read(move |db| repo::outbox::get_required(db, &item.id))
             .await
+            .ok();
+        // Return the classification the transaction actually stored, not the
+        // caller's pre-transaction plan: a concurrent APPEND may have taken
+        // ownership between the read and the commit.
+        let cleanup = settled
+            .as_ref()
+            .map(|item| item.draft_cleanup)
+            .unwrap_or(item.draft_cleanup);
+        let sent = settled
             .map(|item| item.state == nuncio_core::models::OutboxState::Sent)
             .unwrap_or(false);
-        Ok(sent)
+        Ok((sent, cleanup))
     }
 }
 

@@ -7,12 +7,14 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { QueryClientProvider } from "@tanstack/react-query";
 import App from "@/App";
+import { installContextMenuGuard } from "@/lib/contextMenuGuard";
 import { queryClient } from "@/lib/queryClient";
 import { bootstrapTheme } from "@/lib/theme";
 import "@/styles/tokens.css";
 import "@/styles/global.css";
 
 bootstrapTheme();
+installContextMenuGuard();
 
 const container = document.getElementById("root");
 if (!container) {

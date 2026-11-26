@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use nuncio_core::events::{emit_calendar_changed, emit_op_failed};
 use nuncio_core::models::{
     new_id, Account, Address, Attendee, AttendeeRole, AttendeeStatus, Calendar, CalendarEvent,
@@ -26,7 +26,7 @@ use tracing::{debug, info, warn};
 
 use crate::backend::{backend_for, is_implicit_dav_auth_failure, Backend};
 use crate::contacts::ContactsService;
-use crate::dav::{DavClient, DavKind, DavProvider};
+use crate::dav::{href_key, DavClient, DavKind, DavProvider};
 use crate::error::{invalid, unsupported, AppError, Result};
 use crate::google::GoogleProvider;
 use crate::graph::GraphProvider;
@@ -893,6 +893,11 @@ impl PimService {
     ) -> Result<bool> {
         let calendar_id = calendar.id.clone();
         let provider_name = provider.name().to_string();
+        // Everything a local write does after this instant is invisible to the
+        // delta we are about to request, so applying it would roll the user's
+        // change back. The apply transaction uses this timestamp to skip such
+        // objects (including writes that finish uploading in the meantime).
+        let fetch_start = Utc::now();
         let (ctag, sync_token, etags) = self
             .inner
             .ctx
@@ -918,64 +923,118 @@ impl PimService {
             etags,
         };
         let window = EventWindow::default_window(Utc::now());
-        let delta = provider
+        let mut delta = provider
             .sync_events(account, remote, &cursor, window)
             .await?;
+        delta.window_start = Some(fetch_start);
         let changed = delta.full_sync
             || !delta.events.is_empty()
             || !delta.deleted_remote_ids.is_empty()
             || !delta.deleted_hrefs.is_empty();
 
-        self.apply_event_delta(calendar, delta.clone()).await?;
+        // A skipped change means this batch is not safe to acknowledge: the
+        // cursor must keep pointing before it so the next pass re-delivers it
+        // (after the queued edit settles or fails). Without this, a remote
+        // deletion hidden behind a pending edit would never be seen again once
+        // the edit rolled back.
+        let skipped = self.apply_event_delta(calendar, delta.clone()).await?;
 
-        let next_ctag = delta.ctag.clone().or(cursor.ctag);
-        let next_token = delta.sync_token.clone().or(cursor.sync_token);
-        let calendar_id = calendar.id.clone();
-        self.inner
-            .ctx
-            .db
-            .write(move |conn| {
-                repo::calendars::set_sync_markers(
-                    conn,
-                    &calendar_id,
-                    next_ctag.as_deref(),
-                    next_token.as_deref(),
-                )
-            })
-            .await?;
+        if !skipped {
+            let next_ctag = delta.ctag.clone().or(cursor.ctag);
+            let next_token = delta.sync_token.clone().or(cursor.sync_token);
+            let calendar_id = calendar.id.clone();
+            self.inner
+                .ctx
+                .db
+                .write(move |conn| {
+                    repo::calendars::set_sync_markers(
+                        conn,
+                        &calendar_id,
+                        next_ctag.as_deref(),
+                        next_token.as_deref(),
+                    )
+                })
+                .await?;
+        }
         Ok(changed)
     }
 
+    /// Apply a provider batch and report whether anything had to be skipped.
+    ///
+    /// `true` means the caller must **not** advance the sync cursor: the
+    /// skipped change has to be delivered again once the blocking local write
+    /// settles (or rolls back), otherwise it would be lost forever.
     async fn apply_event_delta(
         &self,
         calendar: &Calendar,
         delta: crate::provider::EventDelta,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let calendar_id = calendar.id.clone();
         let account_id = calendar.account_id.clone();
         self.inner
             .ctx
             .db
             .write(move |conn| {
+                // A delta describes the server, which does not know about an
+                // edit that is still queued, nor about one that finished
+                // uploading after this batch was requested. Applying it would
+                // discard the user's change.
+                let protected = event_writes_to_protect(conn, &account_id, delta.window_start)?;
+                // An incomplete provider round named at least one object whose
+                // identity could not be read. The objects that *were* read are
+                // safe to apply, but the cursor must not move: the unread
+                // change has to be requested again.
+                let mut skipped = delta.incomplete;
                 for remote_id in &delta.deleted_remote_ids {
+                    let mut matched = false;
                     if let Some(stored) = events_repo::by_remote_id(conn, &calendar_id, remote_id)?
                     {
+                        if protected.contains_local(&stored.event.id) {
+                            skipped = true;
+                            continue;
+                        }
                         delete_stored(conn, &stored)?;
                         continue;
                     }
                     let all = events_repo::list_for_calendar(conn, &calendar_id)?;
                     for stored in all {
                         if stored.event.uid == *remote_id {
-                            delete_stored(conn, &stored)?;
+                            matched = true;
+                            if protected.contains_local(&stored.event.id) {
+                                skipped = true;
+                            } else {
+                                delete_stored(conn, &stored)?;
+                            }
                         }
+                    }
+                    // A queued delete (or series split) removed the local row,
+                    // so the notification no longer matches one. The pending
+                    // snapshot still names the same remote object: keep the
+                    // cursor before it so a failed upload can replay it.
+                    if !matched && protected.remote_ids.contains(remote_id) {
+                        skipped = true;
                     }
                 }
                 for href in &delta.deleted_hrefs {
+                    let key = href_key(href);
+                    let mut matched = false;
                     let all = events_repo::list_for_calendar(conn, &calendar_id)?;
                     for stored in all {
-                        if stored.href.as_deref() == Some(href.as_str()) {
-                            delete_stored(conn, &stored)?;
+                        if stored
+                            .href
+                            .as_deref()
+                            .is_some_and(|stored| href_key(stored) == key)
+                        {
+                            matched = true;
+                            if protected.contains_local(&stored.event.id) {
+                                skipped = true;
+                            } else {
+                                delete_stored(conn, &stored)?;
+                            }
                         }
+                    }
+                    if !matched && protected.hrefs.contains(&key) {
+                        skipped = true;
                     }
                 }
 
@@ -984,12 +1043,16 @@ impl PimService {
                 ordered.sort_by_key(|remote| remote.series_remote_id.is_some());
                 let mut remote_to_local: HashMap<String, String> = HashMap::new();
                 let mut seen_remote: HashSet<String> = HashSet::new();
+                let mut seen_hrefs: HashSet<String> = HashSet::new();
                 let mut seen_by_href: HashMap<String, HashSet<String>> = HashMap::new();
 
                 for remote in ordered {
+                    if let Some(href) = &remote.href {
+                        seen_hrefs.insert(href_key(href));
+                    }
                     if let (Some(href), Some(remote_id)) = (&remote.href, &remote.remote_id) {
                         seen_by_href
-                            .entry(href.clone())
+                            .entry(href_key(href))
                             .or_default()
                             .insert(remote_id.clone());
                     }
@@ -997,6 +1060,21 @@ impl PimService {
                         seen_remote.insert(remote_id.clone());
                     }
                     let existing = find_existing_event(conn, &calendar_id, &remote)?;
+                    if let Some(stored) = &existing {
+                        if protected.contains_local(&stored.event.id) {
+                            // Keep every local field (the queued op owns
+                            // them); this remote row is still marked as seen
+                            // above so a full sync will not delete it either.
+                            skipped = true;
+                            continue;
+                        }
+                    } else if protected.matches_remote(&remote) {
+                        // The local row was removed by a queued delete or a
+                        // series split. Re-inserting the server copy here would
+                        // undo that edit before it is uploaded.
+                        skipped = true;
+                        continue;
+                    }
                     let id = existing
                         .as_ref()
                         .map(|stored| stored.event.id.clone())
@@ -1053,7 +1131,15 @@ impl PimService {
                 for (href, seen_ids) in &seen_by_href {
                     let all = events_repo::list_for_calendar(conn, &calendar_id)?;
                     for stored in all {
-                        if stored.href.as_deref() == Some(href.as_str()) {
+                        if stored
+                            .href
+                            .as_deref()
+                            .is_some_and(|stored| href_key(stored) == *href)
+                        {
+                            if protected.contains_local(&stored.event.id) {
+                                skipped = true;
+                                continue;
+                            }
                             if let Some(remote_id) = stored.remote_id.as_deref() {
                                 if !seen_ids.contains(remote_id) {
                                     events_repo::delete(conn, &stored.event.id)?;
@@ -1066,14 +1152,44 @@ impl PimService {
                 if delta.full_sync {
                     let all = events_repo::list_for_calendar(conn, &calendar_id)?;
                     for stored in all {
+                        // A row with a queued write may be absent from the
+                        // server response simply because the upload has not
+                        // happened yet; deleting it would drop the edit.
+                        if protected.contains_local(&stored.event.id) {
+                            skipped = true;
+                            continue;
+                        }
                         if let Some(remote_id) = stored.remote_id.as_deref() {
                             if !seen_remote.contains(remote_id) {
                                 delete_stored(conn, &stored)?;
                             }
                         }
                     }
+                    // A pending delete already removed its local row, so a
+                    // full response cannot list it and the loop above cannot
+                    // observe the absence. Hold the cursor until the delete
+                    // settles; if it fails and restores the rows, a later
+                    // incremental batch must still see the server state.
+                    if protected
+                        .deleted_remote_ids
+                        .get(&calendar_id)
+                        .is_some_and(|ids| ids.iter().any(|id| !seen_remote.contains(id)))
+                    {
+                        skipped = true;
+                    }
+                    if protected
+                        .deleted_hrefs
+                        .get(&calendar_id)
+                        .is_some_and(|hrefs| {
+                            hrefs
+                                .iter()
+                                .any(|href| !seen_hrefs.contains(&href_key(href)))
+                        })
+                    {
+                        skipped = true;
+                    }
                 }
-                Ok(())
+                Ok(skipped)
             })
             .await
     }
@@ -1545,6 +1661,7 @@ impl PimService {
                     notify_attendees: false,
                     snapshot: Vec::new(),
                     following_id: None,
+                    exception_id: None,
                 }
             } else {
                 PimOp::EventCreate {
@@ -1565,6 +1682,7 @@ impl PimService {
                 notify_attendees: false,
                 snapshot: Vec::new(),
                 following_id: None,
+                exception_id: None,
             }
         } else {
             PimOp::EventCreate {
@@ -1594,6 +1712,7 @@ impl PimService {
                     notify_attendees: false,
                     snapshot: Vec::new(),
                     following_id: None,
+                    exception_id: None,
                 }
             };
             self.enqueue_op(&account.id, &op, "导入日程".to_string())
@@ -1832,22 +1951,28 @@ impl PimService {
         let event_id = event.id.clone();
         let stored = StoredEvent::new(event);
         let insert = stored.clone();
+        let is_provider_account = self.is_provider(&account);
+        let account_id = account.id.clone();
+        let title = stored.event.title.clone();
         self.inner
             .ctx
             .db
-            .write(move |conn| events_repo::upsert(conn, &insert))
+            .write(move |conn| {
+                events_repo::upsert(conn, &insert)?;
+                // Insert and enqueue atomically: no sync may observe the new
+                // row before the upload that owns it has been queued.
+                if is_provider_account {
+                    let op = PimOp::EventCreate {
+                        event_id,
+                        notify_attendees: input.notify_attendees,
+                    };
+                    enqueue_op_sync(conn, &account_id, &op, format!("创建日程「{title}」"))?;
+                }
+                Ok(())
+            })
             .await?;
-        if self.is_provider(&account) {
-            let op = PimOp::EventCreate {
-                event_id: event_id.clone(),
-                notify_attendees: input.notify_attendees,
-            };
-            self.enqueue_op(
-                &account.id,
-                &op,
-                format!("创建日程「{}」", stored.event.title),
-            )
-            .await?;
+        if is_provider_account {
+            self.inner.ops_notify.notify_one();
         }
         emit_calendar_changed(self.inner.ctx.events.as_ref(), vec![calendar.id.clone()]);
         self.inner.reminders.notify_changed();
@@ -1893,14 +2018,14 @@ impl PimService {
         let instance_start_after = instance_start_owned.clone();
         let input_clone = input.clone();
         let master_id = master.event.id.clone();
-        let (result, snapshot) =
+        let result =
             self.inner
                 .ctx
                 .db
                 .write(move |conn| {
                     let series = series_events(conn, &master.event.calendar_id, &master.event.uid)?;
                     let snapshot = ops::snapshots(&series);
-                    match scope {
+                    let (result, snapshot): (CalendarEvent, Vec<EventSnapshot>) = match scope {
                         RecurrenceEditScope::All => {
                             let mut updated = build_event(
                                 master.event.id.clone(),
@@ -1930,7 +2055,7 @@ impl PimService {
                                     }
                                 }
                             }
-                            Ok((updated, snapshot))
+                            Ok::<_, AppError>((updated, snapshot))
                         }
                         RecurrenceEditScope::This => {
                             let instance_start = instance_start_owned
@@ -1981,7 +2106,7 @@ impl PimService {
                             stored_override.event = exception.clone();
                             stored_override.href = master.href.clone();
                             events_repo::upsert(conn, &stored_override)?;
-                            Ok((exception, snapshot))
+                            Ok::<_, AppError>((exception, snapshot))
                         }
                         RecurrenceEditScope::ThisAndFollowing => {
                             let instance_start = instance_start_owned
@@ -2042,40 +2167,56 @@ impl PimService {
                                     events_repo::delete(conn, &item.event.id)?;
                                 }
                             }
-                            Ok((following, snapshot))
+                            Ok::<_, AppError>((following, snapshot))
                         }
+                    }?;
+
+                    // The local edit and the queued upload must commit
+                    // together: committing the row first would let an older
+                    // delta overwrite it before the operation exists, and the
+                    // worker would then upload the stale value.
+                    if is_provider_account {
+                        let (op_scope, op_instance, following_id) = match scope {
+                            RecurrenceEditScope::All => (RecurrenceEditScope::All, None, None),
+                            RecurrenceEditScope::This => (
+                                RecurrenceEditScope::This,
+                                result
+                                    .recurrence_id
+                                    .clone()
+                                    .or_else(|| instance_start_after.clone())
+                                    .or_else(|| fallback_instance_after.clone()),
+                                None,
+                            ),
+                            RecurrenceEditScope::ThisAndFollowing => (
+                                RecurrenceEditScope::ThisAndFollowing,
+                                instance_start_after.clone(),
+                                Some(result.id.clone()),
+                            ),
+                        };
+                        let exception_id =
+                            (op_scope == RecurrenceEditScope::This).then(|| result.id.clone());
+                        let op = PimOp::EventUpdate {
+                            event_id: master_id.clone(),
+                            scope: op_scope,
+                            instance_start: op_instance,
+                            notify_attendees: input_clone.notify_attendees,
+                            snapshot,
+                            following_id,
+                            exception_id,
+                        };
+                        enqueue_op_sync(
+                            conn,
+                            &account_id,
+                            &op,
+                            format!("更新日程「{}」", result.title),
+                        )?;
                     }
+                    Ok(result)
                 })
                 .await?;
 
         if is_provider_account {
-            let (scope, instance_start, following_id) = match scope {
-                RecurrenceEditScope::All => (RecurrenceEditScope::All, None, None),
-                RecurrenceEditScope::This => (
-                    RecurrenceEditScope::This,
-                    result
-                        .recurrence_id
-                        .clone()
-                        .or_else(|| instance_start_after.clone())
-                        .or_else(|| fallback_instance_after.clone()),
-                    None,
-                ),
-                RecurrenceEditScope::ThisAndFollowing => (
-                    RecurrenceEditScope::ThisAndFollowing,
-                    instance_start_after.clone(),
-                    Some(result.id.clone()),
-                ),
-            };
-            let op = PimOp::EventUpdate {
-                event_id: master_id.clone(),
-                scope,
-                instance_start,
-                notify_attendees: input.notify_attendees,
-                snapshot,
-                following_id,
-            };
-            self.enqueue_op(&account_id, &op, format!("更新日程「{}」", result.title))
-                .await?;
+            self.inner.ops_notify.notify_one();
         }
         emit_calendar_changed(self.inner.ctx.events.as_ref(), vec![calendar_id]);
         self.inner.reminders.notify_changed();
@@ -2109,12 +2250,13 @@ impl PimService {
         let master_id = master.event.id.clone();
         let master_title = master.event.title.clone();
         let calendar_id = calendar.id.clone();
+        let is_provider_account = self.is_provider(&account);
+        let account_id = account.id.clone();
         let instance_owned = instance_start
             .map(str::to_string)
             .or_else(|| stored.event.recurrence_id.clone());
         let instance_for_db = instance_owned.clone();
-        let snapshot = self
-            .inner
+        self.inner
             .ctx
             .db
             .write(move |conn| {
@@ -2179,24 +2321,34 @@ impl PimService {
                         }
                     }
                 }
-                Ok(snapshot)
+                // The local mutation and the queued deletion commit together:
+                // an enqueue failure must leave the event in place instead of
+                // returning an error for a deletion no operation owns.
+                if is_provider_account {
+                    let (scope, instance_start) = match scope {
+                        RecurrenceEditScope::All => (RecurrenceEditScope::All, None),
+                        _ => (scope, instance_owned),
+                    };
+                    let op = PimOp::EventDelete {
+                        event_id: master_id,
+                        scope,
+                        instance_start,
+                        notify_attendees,
+                        snapshot,
+                    };
+                    enqueue_op_sync(
+                        conn,
+                        &account_id,
+                        &op,
+                        format!("删除日程「{}」", master_title),
+                    )?;
+                }
+                Ok(())
             })
             .await?;
 
-        if self.is_provider(&account) {
-            let (scope, instance_start) = match scope {
-                RecurrenceEditScope::All => (RecurrenceEditScope::All, None),
-                _ => (scope, instance_owned),
-            };
-            let op = PimOp::EventDelete {
-                event_id: master_id,
-                scope,
-                instance_start,
-                notify_attendees,
-                snapshot,
-            };
-            self.enqueue_op(&account.id, &op, format!("删除日程「{}」", master_title))
-                .await?;
+        if is_provider_account {
+            self.inner.ops_notify.notify_one();
         }
         emit_calendar_changed(self.inner.ctx.events.as_ref(), vec![calendar_id]);
         self.inner.reminders.notify_changed();
@@ -2210,6 +2362,10 @@ impl PimService {
         comment: Option<&str>,
         send_reply: bool,
     ) -> Result<()> {
+        // Only identity/config is read outside the transaction. The row and
+        // the rollback snapshot are read inside it: a concurrent edit (or a
+        // delta) may have changed the event since this command started, and
+        // overwriting it with the outer copy would revert that change.
         let stored = self.load_event(event_id).await?;
         let master = match &stored.event.series_id {
             Some(series_id) => self.load_event(series_id).await?,
@@ -2218,45 +2374,44 @@ impl PimService {
         let calendar = self.load_calendar(&master.event.calendar_id).await?;
         let account = self.load_account(&calendar.account_id).await?;
         let email = account.email.clone();
-        let snapshot_series = {
-            let calendar_id = master.event.calendar_id.clone();
-            let uid = master.event.uid.clone();
-            self.inner
-                .ctx
-                .db
-                .read(move |conn| series_events(conn, &calendar_id, &uid))
-                .await?
-        };
-        let snapshot = ops::snapshots(&snapshot_series);
         let master_id = master.event.id.clone();
-        let master_title = master.event.title.clone();
         let email_for_db = email.clone();
+        let comment_owned = comment.map(str::to_string);
+        let is_provider_account = self.is_provider(&account);
+        let account_id = account.id.clone();
+        // Test-only rendezvous: lets the interleaving test commit a concurrent
+        // edit after the caller-side reads but before this write transaction.
+        #[cfg(test)]
+        crate::test_support::wait_for_write(&master_id).await;
         self.inner
             .ctx
             .db
             .write(move |conn| {
-                let mut updated = master.clone();
+                let mut updated = events_repo::get_required(conn, &master_id)?;
+                let snapshot_series =
+                    series_events(conn, &updated.event.calendar_id, &updated.event.uid)?;
+                let snapshot = ops::snapshots(&snapshot_series);
                 set_attendee_status(&mut updated.event, &email_for_db, response);
-                events_repo::upsert(conn, &updated)
+                let title = updated.event.title.clone();
+                events_repo::upsert(conn, &updated)?;
+                // The response and the reply upload commit together; a failed
+                // enqueue must not leave a local answer no operation sends.
+                if is_provider_account {
+                    let op = PimOp::EventRespond {
+                        event_id: master_id,
+                        response,
+                        comment: comment_owned,
+                        send_reply,
+                        snapshot,
+                    };
+                    enqueue_op_sync(conn, &account_id, &op, format!("回复日程邀请「{title}」"))?;
+                }
+                Ok(())
             })
             .await?;
 
-        if self.is_provider(&account) {
-            let op = PimOp::EventRespond {
-                event_id: master_id,
-                response,
-                comment: comment.map(str::to_string),
-                send_reply,
-                snapshot,
-            };
-            self.enqueue_op(
-                &account.id,
-                &op,
-                format!("回复日程邀请「{}」", master_title),
-            )
-            .await?;
-        } else if send_reply && !account.provider.is_local() {
-            // Local-only accounts have no mail transport; nothing to send.
+        if is_provider_account {
+            self.inner.ops_notify.notify_one();
         }
         let calendar_id = calendar.id;
         emit_calendar_changed(self.inner.ctx.events.as_ref(), vec![calendar_id]);
@@ -3203,16 +3358,23 @@ impl PimService {
     }
 
     async fn fail_op(&self, op: &PendingOp, error: &AppError) {
-        let op_id = op.id.clone();
+        let op_row = op.clone();
         let message = error.message();
-        let _ = self
+        // Settle and roll back in one transaction: a delta must never observe
+        // the operation as no longer outstanding while the local row still
+        // carries the failed edit (it would delete/replace the row, and the
+        // rollback would then resurrect it).
+        if let Err(error) = self
             .inner
             .ctx
             .db
-            .write(move |conn| pending_ops::mark_failed(conn, &op_id, &message))
-            .await;
-        if let Ok(decoded) = ops::decode(op) {
-            let _ = self.rollback_op(&decoded).await;
+            .write(move |conn| {
+                pending_ops::mark_failed(conn, &op_row.id, &message)?;
+                rollback_op_conn(conn, &op_row)
+            })
+            .await
+        {
+            warn!(op = %op.id, %error, "could not settle and roll back a failed operation");
         }
         emit_op_failed(
             self.inner.ctx.events.as_ref(),
@@ -3223,125 +3385,14 @@ impl PimService {
         self.inner.reminders.notify_changed();
     }
 
-    async fn rollback_op(&self, op: &PimOp) -> Result<()> {
-        match op {
-            PimOp::EventCreate { event_id, .. } => {
-                let id = event_id.clone();
-                self.inner
-                    .ctx
-                    .db
-                    .write(move |conn| {
-                        if let Some(stored) = events_repo::get(conn, &id)? {
-                            delete_stored(conn, &stored)?;
-                        }
-                        Ok(())
-                    })
-                    .await
-            }
-            PimOp::EventUpdate {
-                snapshot,
-                following_id,
-                ..
-            } => {
-                let restore = ops::restore_events(snapshot);
-                let following = following_id.clone();
-                self.inner
-                    .ctx
-                    .db
-                    .write(move |conn| {
-                        if let Some(following) = &following {
-                            events_repo::delete(conn, following)?;
-                        }
-                        if let Some(first) = restore.first() {
-                            let calendar_id = first.event.calendar_id.clone();
-                            let uids: std::collections::HashSet<String> = restore
-                                .iter()
-                                .map(|stored| stored.event.uid.clone())
-                                .collect();
-                            let ids: std::collections::HashSet<String> = restore
-                                .iter()
-                                .map(|stored| stored.event.id.clone())
-                                .collect();
-                            let current = events_repo::list_for_calendar(conn, &calendar_id)?;
-                            for stored in current {
-                                if uids.contains(&stored.event.uid)
-                                    && !ids.contains(&stored.event.id)
-                                {
-                                    events_repo::delete(conn, &stored.event.id)?;
-                                }
-                            }
-                        }
-                        for stored in &restore {
-                            events_repo::upsert(conn, stored)?;
-                        }
-                        Ok(())
-                    })
-                    .await
-            }
-            PimOp::EventDelete { snapshot, .. } | PimOp::EventRespond { snapshot, .. } => {
-                let restore = ops::restore_events(snapshot);
-                self.inner
-                    .ctx
-                    .db
-                    .write(move |conn| {
-                        for stored in &restore {
-                            events_repo::upsert(conn, stored)?;
-                        }
-                        Ok(())
-                    })
-                    .await
-            }
-            PimOp::CalendarCreate { calendar_id } => {
-                let id = calendar_id.clone();
-                self.inner
-                    .ctx
-                    .db
-                    .write(move |conn| {
-                        let _ = repo::calendars::delete(conn, &id);
-                        Ok(())
-                    })
-                    .await
-            }
-            PimOp::CalendarUpdate {
-                calendar_id,
-                previous_name,
-                previous_color,
-            } => {
-                let id = calendar_id.clone();
-                let name = previous_name.clone();
-                let color = previous_color.clone();
-                self.inner
-                    .ctx
-                    .db
-                    .write(move |conn| {
-                        if repo::calendars::get(conn, &id)?.is_some() {
-                            repo::calendars::update(conn, &id, Some(&name), Some(&color))?;
-                        }
-                        Ok(())
-                    })
-                    .await
-            }
-            PimOp::CalendarDelete { snapshot, .. } => {
-                let calendar = snapshot.calendar.clone();
-                let remote = snapshot.remote.clone();
-                let events = ops::restore_events(&snapshot.events);
-                self.inner
-                    .ctx
-                    .db
-                    .write(move |conn| {
-                        let mut calendar = calendar;
-                        repo::calendars::insert(conn, &mut calendar)?;
-                        if let Some(remote) = &remote {
-                            store::set(conn, remote)?;
-                        }
-                        for stored in &events {
-                            events_repo::upsert(conn, stored)?;
-                        }
-                        Ok(())
-                    })
-                    .await
-            }
-        }
+    #[cfg(test)]
+    async fn rollback_op(&self, op: &PendingOp) -> Result<()> {
+        let op = op.clone();
+        self.inner
+            .ctx
+            .db
+            .write(move |conn| rollback_op_conn(conn, &op))
+            .await
     }
 
     fn spawn_sync_after_write(&self, account_id: String) {
@@ -3864,6 +3915,376 @@ fn delete_stored(conn: &rusqlite::Connection, stored: &StoredEvent) -> Result<()
     Ok(())
 }
 
+/// Local events owned by a write that has not reached the provider.
+///
+/// `local_ids` covers rows that still exist, `remote_ids`/`hrefs` cover rows a
+/// queued delete (or series split) removed locally: a delta must not resurrect
+/// them either.
+#[derive(Default)]
+struct PendingEventWrites {
+    local_ids: HashSet<String>,
+    remote_ids: HashSet<String>,
+    hrefs: HashSet<String>,
+    /// Remote objects named by *outstanding* deletes, keyed by calendar. The
+    /// local rows are gone, so a full response cannot list them; their absence
+    /// must still hold the cursor until the delete settles.
+    deleted_remote_ids: HashMap<String, HashSet<String>>,
+    deleted_hrefs: HashMap<String, HashSet<String>>,
+}
+
+impl PendingEventWrites {
+    fn contains_local(&self, id: &str) -> bool {
+        self.local_ids.contains(id)
+    }
+
+    fn matches_remote(&self, remote: &RemoteEvent) -> bool {
+        remote
+            .remote_id
+            .as_ref()
+            .is_some_and(|id| self.remote_ids.contains(id))
+            || remote
+                .href
+                .as_ref()
+                .is_some_and(|href| self.hrefs.contains(&href_key(href)))
+    }
+}
+
+/// Queue a calendar operation on an existing transaction.
+///
+/// Local mutations call this inside their write closure so the row and its
+/// upload intent commit atomically (an enqueue failure rolls the mutation
+/// back).
+fn enqueue_op_sync(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+    op: &PimOp,
+    description: String,
+) -> Result<()> {
+    let new_op = NewPendingOp::new(account_id, op.kind(), ops::to_value(op)?, description);
+    pending_ops::enqueue(conn, new_op)?;
+    Ok(())
+}
+
+/// Undo a permanently failed operation on an existing transaction.
+///
+/// Runs in the same transaction as [`pending_ops::mark_failed`] so a delta can
+/// never observe "operation gone, local row still present" in between. Without
+/// that, a deletion racing the failure could remove the row and the snapshot
+/// restore would immediately resurrect it.
+fn rollback_op_conn(conn: &rusqlite::Connection, op: &PendingOp) -> Result<()> {
+    let decoded = ops::decode(op)?;
+    match &decoded {
+        PimOp::EventCreate { event_id, .. } => {
+            // Deleting the row is only safe while the create (and every later
+            // edit) owns it; a newer local edit must survive the failed upload.
+            if !events_unchanged_since(conn, op, std::slice::from_ref(event_id))? {
+                warn!(
+                    op = %op.id,
+                    event_id = %event_id,
+                    "keeping local event: it changed after the failed create was queued"
+                );
+                return Ok(());
+            }
+            if let Some(stored) = events_repo::get(conn, event_id)? {
+                delete_stored(conn, &stored)?;
+            }
+        }
+        PimOp::EventUpdate {
+            event_id,
+            snapshot,
+            following_id,
+            exception_id,
+            ..
+        } => {
+            let restore = ops::restore_events(snapshot);
+            let mut guard_ids = vec![event_id.clone()];
+            guard_ids.extend(restore.iter().map(|stored| stored.event.id.clone()));
+            guard_ids.extend(following_id.iter().cloned());
+            guard_ids.extend(exception_id.iter().cloned());
+            if !events_unchanged_since(conn, op, &guard_ids)? {
+                warn!(
+                    op = %op.id,
+                    event_id = %event_id,
+                    "keeping local event: it was edited after the failed update was queued"
+                );
+                return Ok(());
+            }
+            // The update never removes its own primary row. If it is missing
+            // now, a delta deleted it while the operation was queued; putting
+            // the snapshot back would resurrect data the server removed.
+            if events_repo::get(conn, event_id)?.is_none() {
+                warn!(
+                    op = %op.id,
+                    event_id = %event_id,
+                    "not restoring events: the primary row no longer exists"
+                );
+                return Ok(());
+            }
+            if let Some(following) = following_id {
+                events_repo::delete(conn, following)?;
+            }
+            if let Some(first) = restore.first() {
+                let calendar_id = first.event.calendar_id.clone();
+                let uids: std::collections::HashSet<String> = restore
+                    .iter()
+                    .map(|stored| stored.event.uid.clone())
+                    .collect();
+                let ids: std::collections::HashSet<String> = restore
+                    .iter()
+                    .map(|stored| stored.event.id.clone())
+                    .collect();
+                let current = events_repo::list_for_calendar(conn, &calendar_id)?;
+                for stored in current {
+                    if uids.contains(&stored.event.uid) && !ids.contains(&stored.event.id) {
+                        events_repo::delete(conn, &stored.event.id)?;
+                    }
+                }
+            }
+            for stored in &restore {
+                events_repo::upsert(conn, stored)?;
+            }
+        }
+        PimOp::EventDelete {
+            event_id, snapshot, ..
+        } => {
+            // The primary row is intentionally absent (the delete created that
+            // state); restoring the snapshot is the whole point.
+            let restore = ops::restore_events(snapshot);
+            let mut guard_ids = vec![event_id.clone()];
+            guard_ids.extend(restore.iter().map(|stored| stored.event.id.clone()));
+            if !events_unchanged_since(conn, op, &guard_ids)? {
+                warn!(
+                    op = %op.id,
+                    "keeping local event: it was edited after the failed delete was queued"
+                );
+                return Ok(());
+            }
+            for stored in &restore {
+                events_repo::upsert(conn, stored)?;
+            }
+        }
+        PimOp::EventRespond {
+            event_id, snapshot, ..
+        } => {
+            let restore = ops::restore_events(snapshot);
+            let mut guard_ids = vec![event_id.clone()];
+            guard_ids.extend(restore.iter().map(|stored| stored.event.id.clone()));
+            if !events_unchanged_since(conn, op, &guard_ids)? {
+                warn!(
+                    op = %op.id,
+                    event_id = %event_id,
+                    "keeping local event: it was edited after the failed operation was queued"
+                );
+                return Ok(());
+            }
+            if events_repo::get(conn, event_id)?.is_none() {
+                warn!(
+                    op = %op.id,
+                    event_id = %event_id,
+                    "not restoring events: the row no longer exists"
+                );
+                return Ok(());
+            }
+            for stored in &restore {
+                events_repo::upsert(conn, stored)?;
+            }
+        }
+        PimOp::CalendarCreate { calendar_id } => {
+            let _ = repo::calendars::delete(conn, calendar_id);
+        }
+        PimOp::CalendarUpdate {
+            calendar_id,
+            previous_name,
+            previous_color,
+        } => {
+            if repo::calendars::get(conn, calendar_id)?.is_some() {
+                repo::calendars::update(
+                    conn,
+                    calendar_id,
+                    Some(previous_name),
+                    Some(previous_color),
+                )?;
+            }
+        }
+        PimOp::CalendarDelete { snapshot, .. } => {
+            let mut calendar = snapshot.calendar.clone();
+            repo::calendars::insert(conn, &mut calendar)?;
+            if let Some(remote) = &snapshot.remote {
+                store::set(conn, remote)?;
+            }
+            for stored in ops::restore_events(&snapshot.events) {
+                events_repo::upsert(conn, &stored)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Event ids a `pim.event.*` payload refers to (event plus series snapshot).
+///
+/// `following_id`/`exception_id` cover rows the edit *created*, which cannot
+/// appear in the pre-edit snapshot: without them a delta could overwrite the
+/// new exception (single-occurrence edit) or the new tail series before the
+/// queued upload lands.
+fn event_op_ids(op: &PimOp) -> Vec<String> {
+    match op {
+        PimOp::EventCreate { event_id, .. } => vec![event_id.clone()],
+        PimOp::EventUpdate {
+            event_id,
+            snapshot,
+            following_id,
+            exception_id,
+            ..
+        } => {
+            let mut ids = vec![event_id.clone()];
+            ids.extend(snapshot.iter().map(|stored| stored.event.id.clone()));
+            ids.extend(following_id.iter().cloned());
+            ids.extend(exception_id.iter().cloned());
+            ids
+        }
+        PimOp::EventDelete {
+            event_id, snapshot, ..
+        }
+        | PimOp::EventRespond {
+            event_id, snapshot, ..
+        } => {
+            let mut ids = vec![event_id.clone()];
+            ids.extend(snapshot.iter().map(|stored| stored.event.id.clone()));
+            ids
+        }
+        PimOp::CalendarCreate { .. }
+        | PimOp::CalendarUpdate { .. }
+        | PimOp::CalendarDelete { .. } => Vec::new(),
+    }
+}
+
+fn writes_from_ops(ops: impl IntoIterator<Item = PendingOp>) -> Result<PendingEventWrites> {
+    let mut writes = PendingEventWrites::default();
+    for op in ops {
+        let Ok(decoded) = ops::decode(&op) else {
+            continue;
+        };
+        writes.local_ids.extend(event_op_ids(&decoded));
+        match &decoded {
+            PimOp::EventDelete { snapshot, .. } => {
+                for stored in snapshot {
+                    let calendar_id = stored.event.calendar_id.clone();
+                    if let Some(remote_id) = &stored.remote_id {
+                        writes.remote_ids.insert(remote_id.clone());
+                        writes
+                            .deleted_remote_ids
+                            .entry(calendar_id.clone())
+                            .or_default()
+                            .insert(remote_id.clone());
+                    }
+                    if let Some(href) = &stored.href {
+                        let key = href_key(href);
+                        writes.hrefs.insert(key.clone());
+                        writes
+                            .deleted_hrefs
+                            .entry(calendar_id)
+                            .or_default()
+                            .insert(key);
+                    }
+                }
+            }
+            PimOp::EventUpdate { snapshot, .. } | PimOp::EventRespond { snapshot, .. } => {
+                for stored in snapshot {
+                    if let Some(remote_id) = &stored.remote_id {
+                        writes.remote_ids.insert(remote_id.clone());
+                    }
+                    if let Some(href) = &stored.href {
+                        writes.hrefs.insert(href_key(href));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(writes)
+}
+
+/// Objects a delta must not overwrite.
+///
+/// Two sources are unioned:
+/// * outstanding operations (the upload has not settled yet), and
+/// * operations whose row changed at/after `window_start` — a `done` row has
+///   already been uploaded, but a batch requested *before* that upload still
+///   carries the old server state.
+///
+/// `window_start = None` (direct helper calls/tests) treats every operation as
+/// a possible race, which is conservative and never loses an edit.
+fn event_writes_to_protect(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+    window_start: Option<DateTime<Utc>>,
+) -> Result<PendingEventWrites> {
+    let mut writes = writes_from_ops(
+        pending_ops::list(conn, Some(account_id))?
+            .into_iter()
+            .filter(pending_ops::is_outstanding),
+    )?;
+    let recent = match window_start {
+        Some(since) => pending_ops::list_touched_since(conn, Some(account_id), since)?,
+        None => pending_ops::list(conn, Some(account_id))?,
+    };
+    let recent = writes_from_ops(recent)?;
+    writes.local_ids.extend(recent.local_ids);
+    writes.remote_ids.extend(recent.remote_ids);
+    writes.hrefs.extend(recent.hrefs);
+    // `deleted_*` stay limited to outstanding operations: a settled (failed)
+    // delete whose snapshot rollback restored the rows must not keep their
+    // absence protected forever.
+    Ok(writes)
+}
+
+/// May a failed operation restore its snapshot?
+///
+/// Only when every referenced local row still holds the value the operation
+/// left behind: no later operation for the same object exists and its
+/// `updated_at` has not advanced past the failed operation's enqueue time.
+/// Otherwise a second edit would be silently reverted to an older snapshot.
+fn events_unchanged_since(
+    conn: &rusqlite::Connection,
+    op: &PendingOp,
+    ids: &[String],
+) -> Result<bool> {
+    let ids: HashSet<&str> = ids
+        .iter()
+        .map(String::as_str)
+        .filter(|id| !id.is_empty())
+        .collect();
+    if ids.is_empty() {
+        return Ok(true);
+    }
+    for other in pending_ops::list(conn, Some(&op.account_id))? {
+        if other.id == op.id || other.sequence <= op.sequence {
+            continue;
+        }
+        let Ok(decoded) = ops::decode(&other) else {
+            continue;
+        };
+        if event_op_ids(&decoded)
+            .iter()
+            .any(|id| ids.contains(id.as_str()))
+        {
+            return Ok(false);
+        }
+    }
+    for id in &ids {
+        if let Some(stored) = events_repo::get(conn, id)? {
+            if stored
+                .event
+                .updated_at
+                .is_some_and(|updated| updated > op.created_at)
+            {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
 fn find_existing_event(
     conn: &rusqlite::Connection,
     calendar_id: &str,
@@ -3875,10 +4296,16 @@ fn find_existing_event(
         }
     }
     if let Some(href) = &remote.href {
+        let key = href_key(href);
         let all = events_repo::list_for_calendar(conn, calendar_id)?;
         let by_href: Vec<&StoredEvent> = all
             .iter()
-            .filter(|stored| stored.href.as_deref() == Some(href.as_str()))
+            .filter(|stored| {
+                stored
+                    .href
+                    .as_deref()
+                    .is_some_and(|stored| href_key(stored) == key)
+            })
             .collect();
         if let Some(recurrence_id) = &remote.event.recurrence_id {
             if let Some(found) = by_href.iter().find(|stored| {
@@ -4158,6 +4585,885 @@ fn normalized_reminders(values: &[i32]) -> Vec<i32> {
     out.sort_unstable();
     out.dedup();
     out
+}
+
+#[cfg(test)]
+mod pending_write_tests {
+    use super::*;
+    use crate::provider::EventDelta;
+    use nuncio_core::models::{AuthKind, ProviderKind, RecurrenceFreq, RecurrenceRule, ShowAs};
+    use nuncio_core::traits::testing::NoopMailSender;
+    use nuncio_core::{CoreContext, Paths};
+
+    async fn provider_service() -> (CoreContext, PimService, Calendar) {
+        let dir = std::env::temp_dir().join(format!("nuncio-pim-pending-cal-{}", new_id()));
+        let ctx = CoreContext::for_test(Paths::new(dir)).await.expect("ctx");
+        let service = PimService::new(ctx.clone(), Arc::new(NoopMailSender)).expect("service");
+        let mut account = ctx
+            .db
+            .read(repo::accounts::local)
+            .await
+            .expect("local account");
+        account.id = "dav1".into();
+        account.provider = ProviderKind::Imap;
+        account.auth_kind = AuthKind::Password;
+        account.email = "me@example.com".into();
+        account.oauth_provider = None;
+        account.caldav_url = Some("https://dav.example.com/cal/".into());
+        account.calendar_enabled = true;
+        ctx.db
+            .write(move |conn| repo::accounts::insert(conn, &account))
+            .await
+            .expect("account");
+        let calendar = Calendar {
+            id: "dav-cal".into(),
+            account_id: "dav1".into(),
+            name: "Calendar".into(),
+            color: "#0078D4".into(),
+            is_read_only: false,
+            is_visible: true,
+            is_default: true,
+            subscription_url: None,
+        };
+        let mut seeded = calendar.clone();
+        ctx.db
+            .write(move |conn| repo::calendars::insert(conn, &mut seeded))
+            .await
+            .expect("calendar");
+        (ctx, service, calendar)
+    }
+
+    fn input(calendar_id: &str, title: &str) -> EventInput {
+        EventInput {
+            calendar_id: calendar_id.into(),
+            title: title.into(),
+            location: String::new(),
+            description: String::new(),
+            start: "2026-11-12T09:00:00Z".into(),
+            end: "2026-11-12T09:30:00Z".into(),
+            all_day: false,
+            time_zone: "UTC".into(),
+            recurrence: None,
+            show_as: ShowAs::Busy,
+            is_private: false,
+            attendees: Vec::new(),
+            reminders: Vec::new(),
+            online_meeting_url: None,
+            color: None,
+            notify_attendees: false,
+        }
+    }
+
+    fn remote(calendar: &Calendar, uid: &str, title: &str) -> RemoteEvent {
+        RemoteEvent {
+            event: CalendarEvent::new(
+                "ignored-remote-id",
+                calendar.id.clone(),
+                calendar.account_id.clone(),
+                uid,
+                title,
+                "2026-11-12T09:00:00Z",
+                "2026-11-12T09:30:00Z",
+            ),
+            remote_id: None,
+            href: None,
+            etag: None,
+            rrule: None,
+            exdates: Vec::new(),
+            raw_ics: None,
+            series_remote_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_event_edit_survives_stale_delta() {
+        let (_ctx, service, calendar) = provider_service().await;
+        let created = service
+            .event_create(input(&calendar.id, "Original"))
+            .await
+            .expect("create");
+        service
+            .event_update(
+                &created.id,
+                input(&calendar.id, "Local edit"),
+                RecurrenceEditScope::All,
+                None,
+            )
+            .await
+            .expect("update");
+
+        let delta = EventDelta {
+            events: vec![remote(&calendar, &created.uid, "Remote old")],
+            ..Default::default()
+        };
+        service
+            .apply_event_delta(&calendar, delta)
+            .await
+            .expect("delta");
+
+        let stored = service
+            .event_get(&created.id, None)
+            .await
+            .expect("get event");
+        assert_eq!(
+            stored.title, "Local edit",
+            "a queued local edit must not be overwritten by an older delta"
+        );
+    }
+
+    #[tokio::test]
+    async fn delta_without_pending_still_applies() {
+        let (ctx, service, calendar) = provider_service().await;
+        let original = CalendarEvent::new(
+            new_id(),
+            calendar.id.clone(),
+            calendar.account_id.clone(),
+            "uid-no-pending",
+            "Before",
+            "2026-11-12T09:00:00Z",
+            "2026-11-12T09:30:00Z",
+        );
+        let event_id = original.id.clone();
+        let stored = StoredEvent::new(original);
+        ctx.db
+            .write(move |conn| events_repo::upsert(conn, &stored))
+            .await
+            .expect("seed");
+
+        let delta = EventDelta {
+            events: vec![remote(&calendar, "uid-no-pending", "From remote")],
+            ..Default::default()
+        };
+        service
+            .apply_event_delta(&calendar, delta)
+            .await
+            .expect("delta");
+        let stored = service.event_get(&event_id, None).await.expect("get");
+        assert_eq!(stored.title, "From remote");
+    }
+
+    #[tokio::test]
+    async fn failed_update_rollback_keeps_newer_local_edit() {
+        let (ctx, service, calendar) = provider_service().await;
+        let created = service
+            .event_create(input(&calendar.id, "Original"))
+            .await
+            .expect("create");
+        service
+            .event_update(
+                &created.id,
+                input(&calendar.id, "First edit"),
+                RecurrenceEditScope::All,
+                None,
+            )
+            .await
+            .expect("first update");
+        service
+            .event_update(
+                &created.id,
+                input(&calendar.id, "Second edit"),
+                RecurrenceEditScope::All,
+                None,
+            )
+            .await
+            .expect("second update");
+
+        let first_update = ctx
+            .db
+            .read(|conn| pending_ops::list(conn, Some("dav1")))
+            .await
+            .expect("ops")
+            .into_iter()
+            .find(|op| op.kind == ops::KIND_EVENT_UPDATE)
+            .expect("update op");
+        service.rollback_op(&first_update).await.expect("rollback");
+
+        let stored = service
+            .event_get(&created.id, None)
+            .await
+            .expect("get event");
+        assert_eq!(
+            stored.title, "Second edit",
+            "rolling back the older op must not revert the newer edit"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_update_rollback_restores_when_unchanged() {
+        let (ctx, service, calendar) = provider_service().await;
+        let created = service
+            .event_create(input(&calendar.id, "Original"))
+            .await
+            .expect("create");
+        service
+            .event_update(
+                &created.id,
+                input(&calendar.id, "Failed edit"),
+                RecurrenceEditScope::All,
+                None,
+            )
+            .await
+            .expect("update");
+
+        let update = ctx
+            .db
+            .read(|conn| pending_ops::list(conn, Some("dav1")))
+            .await
+            .expect("ops")
+            .into_iter()
+            .find(|op| op.kind == ops::KIND_EVENT_UPDATE)
+            .expect("update op");
+        service.rollback_op(&update).await.expect("rollback");
+
+        let stored = service
+            .event_get(&created.id, None)
+            .await
+            .expect("get event");
+        assert_eq!(stored.title, "Original");
+    }
+
+    fn stored_remote_event(
+        calendar: &Calendar,
+        uid: &str,
+        remote_id: &str,
+        href: &str,
+        title: &str,
+    ) -> StoredEvent {
+        let event = CalendarEvent::new(
+            new_id(),
+            calendar.id.clone(),
+            calendar.account_id.clone(),
+            uid,
+            title,
+            "2026-11-12T09:00:00Z",
+            "2026-11-12T09:30:00Z",
+        );
+        let mut stored = StoredEvent::new(event);
+        stored.remote_id = Some(remote_id.into());
+        stored.href = Some(href.into());
+        stored.etag = Some("etag-1".into());
+        stored
+    }
+
+    fn remote_with_id(
+        calendar: &Calendar,
+        uid: &str,
+        remote_id: &str,
+        href: &str,
+        title: &str,
+    ) -> RemoteEvent {
+        let mut event = CalendarEvent::new(
+            "ignored",
+            calendar.id.clone(),
+            calendar.account_id.clone(),
+            uid,
+            title,
+            "2026-11-12T09:00:00Z",
+            "2026-11-12T09:30:00Z",
+        );
+        event.updated_at = None;
+        RemoteEvent {
+            event,
+            remote_id: Some(remote_id.into()),
+            href: Some(href.into()),
+            etag: Some("etag-1".into()),
+            rrule: None,
+            exdates: Vec::new(),
+            raw_ics: None,
+            series_remote_id: None,
+        }
+    }
+
+    async fn seed_stored(ctx: &CoreContext, stored: StoredEvent) -> String {
+        let id = stored.event.id.clone();
+        ctx.db
+            .write(move |conn| events_repo::upsert(conn, &stored))
+            .await
+            .expect("seed");
+        id
+    }
+
+    /// Issue 1: the optimistic update must roll back when the queue insert
+    /// fails, instead of leaving a row no operation owns.
+    #[tokio::test]
+    async fn event_update_and_enqueue_commit_atomically() {
+        let (ctx, service, calendar) = provider_service().await;
+        let created = service
+            .event_create(input(&calendar.id, "Original"))
+            .await
+            .expect("create");
+        ctx.db
+            .write(|conn| {
+                conn.execute_batch(
+                    "CREATE TRIGGER block_pending_insert
+                     BEFORE INSERT ON pending_op
+                     BEGIN SELECT RAISE(ABORT, 'blocked'); END;",
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("trigger");
+
+        let result = service
+            .event_update(
+                &created.id,
+                input(&calendar.id, "Must not land"),
+                RecurrenceEditScope::All,
+                None,
+            )
+            .await;
+        assert!(result.is_err(), "enqueue failure must fail the update");
+
+        let stored = service.event_get(&created.id, None).await.expect("get");
+        assert_eq!(
+            stored.title, "Original",
+            "the local edit must roll back with the failed enqueue"
+        );
+        let ops = ctx
+            .db
+            .read(|conn| pending_ops::list(conn, Some("dav1")))
+            .await
+            .expect("ops");
+        assert_eq!(ops.len(), 1, "only the original create may remain");
+    }
+
+    /// The delta may spell a resource differently from the stored href
+    /// (RFC 3986 §6.2.2). A `404` for `A.ics` must delete the row stored as
+    /// `%41.ics`; comparing raw strings left the row behind forever once the
+    /// cursor advanced past the acknowledged deletion.
+    #[tokio::test]
+    async fn deletion_matches_an_equivalent_href_spelling() {
+        let (ctx, service, calendar) = provider_service().await;
+        let stored = stored_remote_event(
+            &calendar,
+            "uid-1",
+            "remote-1",
+            "https://dav.example.com/cal/%41.ics",
+            "Before",
+        );
+        let event_id = seed_stored(&ctx, stored).await;
+        let delta = EventDelta {
+            deleted_hrefs: vec!["https://dav.example.com/cal/A.ics".into()],
+            window_start: Some(Utc::now()),
+            ..Default::default()
+        };
+        let skipped = service
+            .apply_event_delta(&calendar, delta)
+            .await
+            .expect("delta");
+        assert!(!skipped, "nothing blocks the deletion");
+        assert!(
+            service.event_get(&event_id, None).await.is_err(),
+            "the equivalent spelling must delete the stored event"
+        );
+    }
+
+    /// Issue 2: an operation that finished uploading after the delta request
+    /// started must still protect its object from that older batch.
+    #[tokio::test]
+    async fn late_delta_after_successful_upload_keeps_local_event() {
+        let (ctx, service, calendar) = provider_service().await;
+        let href = "https://dav.example.com/cal/uid-1.ics";
+        let stored = stored_remote_event(&calendar, "uid-1", "remote-1", href, "Before");
+        let event_id = seed_stored(&ctx, stored).await;
+
+        service
+            .event_update(
+                &event_id,
+                input(&calendar.id, "Uploaded edit"),
+                RecurrenceEditScope::All,
+                None,
+            )
+            .await
+            .expect("update");
+        let op = ctx
+            .db
+            .read(|conn| pending_ops::list(conn, Some("dav1")))
+            .await
+            .expect("ops")
+            .into_iter()
+            .find(|op| op.kind == ops::KIND_EVENT_UPDATE)
+            .expect("update op");
+        let op_id = op.id.clone();
+        ctx.db
+            .write(move |conn| pending_ops::mark_done(conn, &op_id))
+            .await
+            .expect("settle upload");
+
+        let delta = EventDelta {
+            events: vec![remote_with_id(
+                &calendar,
+                "uid-1",
+                "remote-1",
+                href,
+                "Remote old",
+            )],
+            window_start: Some(Utc::now() - chrono::Duration::seconds(1)),
+            ..Default::default()
+        };
+        let skipped = service
+            .apply_event_delta(&calendar, delta)
+            .await
+            .expect("delta");
+        assert!(skipped, "the stale row must be reported as skipped");
+        let reloaded = service.event_get(&event_id, None).await.expect("get");
+        assert_eq!(
+            reloaded.title, "Uploaded edit",
+            "a stale delta must not revert an already uploaded edit"
+        );
+    }
+
+    /// Issue 3: a deletion skipped because of a queued edit must not be
+    /// acknowledged; it is replayed once the edit has rolled back.
+    #[tokio::test]
+    async fn skipped_deletion_is_replayed_after_failed_update_rolls_back() {
+        let (ctx, service, calendar) = provider_service().await;
+        let href = "https://dav.example.com/cal/uid-2.ics";
+        let stored = stored_remote_event(&calendar, "uid-2", "remote-2", href, "Before");
+        let event_id = seed_stored(&ctx, stored).await;
+        service
+            .event_update(
+                &event_id,
+                input(&calendar.id, "Local edit"),
+                RecurrenceEditScope::All,
+                None,
+            )
+            .await
+            .expect("update");
+        let op = ctx
+            .db
+            .read(|conn| pending_ops::list(conn, Some("dav1")))
+            .await
+            .expect("ops")
+            .into_iter()
+            .find(|op| op.kind == ops::KIND_EVENT_UPDATE)
+            .expect("update op");
+
+        let deletion = EventDelta {
+            deleted_remote_ids: vec!["remote-2".into()],
+            window_start: Some(Utc::now()),
+            ..Default::default()
+        };
+        let skipped = service
+            .apply_event_delta(&calendar, deletion)
+            .await
+            .expect("delta");
+        assert!(skipped, "the deletion must wait for the queued edit");
+        assert_eq!(
+            service.event_get(&event_id, None).await.expect("get").title,
+            "Local edit"
+        );
+
+        // The upload fails and the edit is rolled back.
+        let op_id = op.id.clone();
+        ctx.db
+            .write(move |conn| pending_ops::mark_failed(conn, &op_id, "boom"))
+            .await
+            .expect("mark failed");
+        service.rollback_op(&op).await.expect("rollback");
+        assert_eq!(
+            service.event_get(&event_id, None).await.expect("get").title,
+            "Before"
+        );
+
+        // A later sync re-delivers the deletion and now applies it.
+        let replay = EventDelta {
+            deleted_remote_ids: vec!["remote-2".into()],
+            window_start: Some(Utc::now() + chrono::Duration::seconds(1)),
+            ..Default::default()
+        };
+        let skipped = service
+            .apply_event_delta(&calendar, replay)
+            .await
+            .expect("replay");
+        assert!(!skipped, "nothing blocks the replayed deletion now");
+        assert!(
+            service.event_get(&event_id, None).await.is_err(),
+            "the replayed deletion must remove the event"
+        );
+    }
+
+    /// Issue 4: the override created by a single-occurrence edit is a new row;
+    /// it must be part of the pending-protection set too.
+    #[tokio::test]
+    async fn single_occurrence_edit_protects_the_new_exception() {
+        let (ctx, service, calendar) = provider_service().await;
+        let mut master_event = CalendarEvent::new(
+            new_id(),
+            calendar.id.clone(),
+            calendar.account_id.clone(),
+            "series-uid",
+            "Daily",
+            "2026-11-12T09:00:00Z",
+            "2026-11-12T09:30:00Z",
+        );
+        master_event.recurrence = Some(RecurrenceRule {
+            freq: RecurrenceFreq::Daily,
+            interval: 1,
+            ..Default::default()
+        });
+        let master_id = master_event.id.clone();
+        let mut stored = StoredEvent::new(master_event);
+        stored.remote_id = Some("remote-series".into());
+        stored.href = Some("https://dav.example.com/cal/series.ics".into());
+        stored.etag = Some("etag-1".into());
+        seed_stored(&ctx, stored.clone()).await;
+
+        let occurrence = "2026-11-13T09:00:00Z";
+        let exception = service
+            .event_update(
+                &master_id,
+                input(&calendar.id, "Local occurrence"),
+                RecurrenceEditScope::This,
+                Some(occurrence),
+            )
+            .await
+            .expect("occurrence edit");
+
+        let op = ctx
+            .db
+            .read(|conn| pending_ops::list(conn, Some("dav1")))
+            .await
+            .expect("ops")
+            .into_iter()
+            .find(|op| op.kind == ops::KIND_EVENT_UPDATE)
+            .expect("update op");
+        match ops::decode(&op).expect("decode") {
+            PimOp::EventUpdate { exception_id, .. } => assert_eq!(
+                exception_id.as_deref(),
+                Some(exception.id.as_str()),
+                "the new exception id must be recorded in the operation"
+            ),
+            other => panic!("unexpected op: {other:?}"),
+        }
+
+        // The server still has the old override for the same occurrence.
+        let mut remote_event = CalendarEvent::new(
+            "ignored",
+            calendar.id.clone(),
+            calendar.account_id.clone(),
+            "series-uid",
+            "Remote old occurrence",
+            occurrence,
+            "2026-11-13T09:30:00Z",
+        );
+        remote_event.recurrence_id = Some(occurrence.into());
+        let delta = EventDelta {
+            events: vec![RemoteEvent {
+                event: remote_event,
+                remote_id: None,
+                href: Some("https://dav.example.com/cal/series.ics".into()),
+                etag: None,
+                rrule: None,
+                exdates: Vec::new(),
+                raw_ics: None,
+                series_remote_id: Some("remote-series".into()),
+            }],
+            window_start: Some(Utc::now()),
+            ..Default::default()
+        };
+        service
+            .apply_event_delta(&calendar, delta)
+            .await
+            .expect("delta");
+
+        let reloaded = service
+            .event_get(&exception.id, None)
+            .await
+            .expect("get exception");
+        assert_eq!(
+            reloaded.title, "Local occurrence",
+            "a delta must not overwrite the newly created exception"
+        );
+    }
+
+    /// Issue 5: rollback must not resurrect a row the server deleted.
+    #[tokio::test]
+    async fn failed_update_rollback_does_not_reinsert_missing_event() {
+        let (ctx, service, calendar) = provider_service().await;
+        let href = "https://dav.example.com/cal/uid-3.ics";
+        let stored = stored_remote_event(&calendar, "uid-3", "remote-3", href, "Before");
+        let event_id = seed_stored(&ctx, stored).await;
+        service
+            .event_update(
+                &event_id,
+                input(&calendar.id, "Failed edit"),
+                RecurrenceEditScope::All,
+                None,
+            )
+            .await
+            .expect("update");
+        let op = ctx
+            .db
+            .read(|conn| pending_ops::list(conn, Some("dav1")))
+            .await
+            .expect("ops")
+            .into_iter()
+            .find(|op| op.kind == ops::KIND_EVENT_UPDATE)
+            .expect("update op");
+
+        let id = event_id.clone();
+        ctx.db
+            .write(move |conn| events_repo::delete(conn, &id))
+            .await
+            .expect("delete");
+        let op_id = op.id.clone();
+        ctx.db
+            .write(move |conn| pending_ops::mark_failed(conn, &op_id, "boom"))
+            .await
+            .expect("mark failed");
+        service.rollback_op(&op).await.expect("rollback");
+
+        assert!(
+            service.event_get(&event_id, None).await.is_err(),
+            "rollback must not re-insert an event that no longer exists"
+        );
+    }
+
+    async fn block_pending_insert(ctx: &CoreContext) {
+        ctx.db
+            .write(|conn| {
+                conn.execute_batch(
+                    "CREATE TRIGGER block_pending_insert
+                     BEFORE INSERT ON pending_op
+                     BEGIN SELECT RAISE(ABORT, 'blocked'); END;",
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("trigger");
+    }
+
+    /// A failed queue insert must keep the event: returning an error for a
+    /// deletion that already removed the row would leave the remote event
+    /// alive with no operation to delete it.
+    #[tokio::test]
+    async fn event_delete_and_enqueue_commit_atomically() {
+        let (ctx, service, calendar) = provider_service().await;
+        let created = service
+            .event_create(input(&calendar.id, "Keep me"))
+            .await
+            .expect("create");
+        block_pending_insert(&ctx).await;
+
+        let result = service
+            .event_delete(&created.id, RecurrenceEditScope::All, None, false)
+            .await;
+        assert!(result.is_err(), "enqueue failure must fail the delete");
+
+        assert!(
+            service.event_get(&created.id, None).await.is_ok(),
+            "the local deletion must roll back with the failed enqueue"
+        );
+        let ops = ctx
+            .db
+            .read(|conn| pending_ops::list(conn, Some("dav1")))
+            .await
+            .expect("ops");
+        assert_eq!(ops.len(), 1, "only the original create may remain");
+    }
+
+    /// A queued delete removes the local row, so a remote deletion
+    /// notification has nothing to match. The pending snapshot still names the
+    /// remote object; the batch must be skipped so a failed upload can replay
+    /// the notification instead of losing it with the cursor.
+    #[tokio::test]
+    async fn deleted_notification_for_already_deleted_event_holds_cursor() {
+        let (ctx, service, calendar) = provider_service().await;
+        let href = "https://dav.example.com/cal/uid-4.ics";
+        let stored = stored_remote_event(&calendar, "uid-4", "remote-4", href, "Before");
+        let event_id = seed_stored(&ctx, stored).await;
+        service
+            .event_delete(&event_id, RecurrenceEditScope::All, None, false)
+            .await
+            .expect("delete");
+        assert!(service.event_get(&event_id, None).await.is_err());
+
+        let by_id = EventDelta {
+            deleted_remote_ids: vec!["remote-4".into()],
+            window_start: Some(Utc::now()),
+            ..Default::default()
+        };
+        assert!(
+            service
+                .apply_event_delta(&calendar, by_id)
+                .await
+                .expect("delta"),
+            "the deletion must be skipped through the pending snapshot"
+        );
+
+        let by_href = EventDelta {
+            deleted_hrefs: vec![href.into()],
+            window_start: Some(Utc::now()),
+            ..Default::default()
+        };
+        assert!(
+            service
+                .apply_event_delta(&calendar, by_href)
+                .await
+                .expect("href delta"),
+            "the href deletion must also be recognised without a local row"
+        );
+    }
+
+    /// Same for an RSVP: the answer and the reply upload are one unit.
+    #[tokio::test]
+    async fn event_respond_and_enqueue_commit_atomically() {
+        let (ctx, service, calendar) = provider_service().await;
+        let created = service
+            .event_create(input(&calendar.id, "Invite"))
+            .await
+            .expect("create");
+        block_pending_insert(&ctx).await;
+
+        let result = service
+            .event_respond(
+                &created.id,
+                AttendeeStatus::Accepted,
+                Some("on my way"),
+                false,
+            )
+            .await;
+        assert!(result.is_err(), "enqueue failure must fail the response");
+
+        let stored = service.event_get(&created.id, None).await.expect("get");
+        assert_ne!(
+            stored.my_response,
+            Some(AttendeeStatus::Accepted),
+            "the local answer must roll back with the failed enqueue"
+        );
+        assert!(stored.attendees.is_empty());
+        let ops = ctx
+            .db
+            .read(|conn| pending_ops::list(conn, Some("dav1")))
+            .await
+            .expect("ops");
+        assert_eq!(ops.len(), 1, "only the original create may remain");
+    }
+
+    /// The RSVP row and its rollback snapshot must be read inside the write
+    /// transaction. Overwriting the row with the copy read before the lock
+    /// would revert a concurrent edit (for example a title change).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn event_respond_rereads_the_row_inside_the_transaction() {
+        let (ctx, service, calendar) = provider_service().await;
+        let created = service
+            .event_create(input(&calendar.id, "Invite"))
+            .await
+            .expect("create");
+
+        // Park the response immediately before it takes the write lock. The
+        // signal fires only after every caller-side read has completed, so the
+        // copy read outside the transaction is provably the pre-edit one.
+        let (gate, entered) = crate::test_support::WriteGate::new();
+        let _gate = crate::test_support::install(created.id.clone(), gate.clone());
+
+        let respond_service = service.clone();
+        let respond_id = created.id.clone();
+        let responding = tokio::spawn(async move {
+            respond_service
+                .event_respond(&respond_id, AttendeeStatus::Accepted, None, false)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), entered)
+            .await
+            .expect("the response must reach the write gate")
+            .expect("write gate sender");
+
+        // The response is parked, so the concurrent edit can be committed now.
+        // Only an in-transaction re-read can observe it afterwards.
+        let holder_id = created.id.clone();
+        ctx.db
+            .write(move |conn| {
+                conn.execute(
+                    "UPDATE event SET title = 'Concurrent edit' WHERE id = ?1",
+                    rusqlite::params![holder_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("concurrent edit");
+
+        gate.release();
+        responding.await.expect("respond join").expect("respond");
+
+        let stored = service
+            .event_get(&created.id, None)
+            .await
+            .expect("get event");
+        assert_eq!(
+            stored.title, "Concurrent edit",
+            "the RSVP must not revert a concurrent title edit"
+        );
+        assert_eq!(stored.my_response, Some(AttendeeStatus::Accepted));
+
+        let op = ctx
+            .db
+            .read(|conn| pending_ops::list(conn, Some("dav1")))
+            .await
+            .expect("ops")
+            .into_iter()
+            .find(|op| op.kind == ops::KIND_EVENT_RESPOND)
+            .expect("respond op");
+        match ops::decode(&op).expect("decode") {
+            PimOp::EventRespond { snapshot, .. } => assert_eq!(
+                snapshot[0].event.title, "Concurrent edit",
+                "the rollback snapshot must describe the row the RSVP changed"
+            ),
+            other => panic!("unexpected op: {other:?}"),
+        }
+    }
+
+    /// Full sync only iterates rows that still exist. A pending delete removes
+    /// its row, so the absence of that object from the response must still
+    /// hold the cursor until the delete settles; otherwise a failed delete
+    /// rollback would restore a row no later delta can correct.
+    #[tokio::test]
+    async fn full_sync_holds_cursor_for_a_pending_delete_absent_from_response() {
+        let (ctx, service, calendar) = provider_service().await;
+        let href = "https://dav.example.com/cal/uid-9.ics";
+        let stored = stored_remote_event(&calendar, "uid-9", "remote-9", href, "Before");
+        let event_id = seed_stored(&ctx, stored).await;
+        service
+            .event_delete(&event_id, RecurrenceEditScope::All, None, false)
+            .await
+            .expect("delete");
+
+        let delta = EventDelta {
+            full_sync: true,
+            sync_token: Some("token-1".into()),
+            window_start: Some(Utc::now()),
+            ..Default::default()
+        };
+        assert!(
+            service
+                .apply_event_delta(&calendar, delta)
+                .await
+                .expect("full sync"),
+            "a pending delete missing from a full response must hold the cursor"
+        );
+    }
+
+    /// A provider round that could not read a listed object (for example a
+    /// per-resource `503` in the ETag fallback) must not acknowledge the
+    /// cursor, even when the batch itself contains no events or deletions.
+    #[tokio::test]
+    async fn incomplete_event_delta_holds_the_cursor() {
+        let (_ctx, service, calendar) = provider_service().await;
+        let delta = EventDelta {
+            incomplete: true,
+            sync_token: Some("token-2".into()),
+            window_start: Some(Utc::now()),
+            ..Default::default()
+        };
+        assert!(
+            service
+                .apply_event_delta(&calendar, delta)
+                .await
+                .expect("incomplete delta"),
+            "an incomplete round must not advance the cursor"
+        );
+    }
 }
 
 #[cfg(test)]

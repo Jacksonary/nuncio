@@ -5,8 +5,9 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use nuncio_core::models::{
-    new_id, Contact, ContactField, ContactFieldType, ContactListQuery, Importance, MessageSummary,
-    NewTaskFromMessage, StoredMessage, TaskInput, TaskQuery,
+    new_id, AuthKind, Contact, ContactField, ContactFieldType, ContactListQuery, Importance,
+    MessageSummary, NewTaskFromMessage, ProviderCapabilities, ProviderKind, Security, ServerConfig,
+    StoredMessage, TaskInput, TaskQuery,
 };
 use nuncio_core::repo;
 use nuncio_core::traits::testing::NoopMailSender;
@@ -292,6 +293,108 @@ async fn message_create_task_flags_only_when_asked() {
     assert!(message.summary.flagged);
 }
 
+/// Creating a task from a mail and starring it is not an undoable mail action,
+/// so it bypasses `MailService::message_act`'s writer recording. The queue row
+/// must still carry `messageIds` (otherwise Graph treats it as a legacy
+/// payload and replays it after the user cancels) and record the writer in the
+/// same transaction.
+#[tokio::test]
+async fn message_create_task_queues_flag_with_message_id_and_writer() {
+    let (ctx, service) = service().await;
+    let mut imap = ctx
+        .db
+        .read(repo::accounts::local)
+        .await
+        .expect("local account");
+    imap.id = "imap1".into();
+    imap.provider = ProviderKind::Imap;
+    imap.auth_kind = AuthKind::Password;
+    imap.email = "imap@example.com".into();
+    imap.imap = Some(ServerConfig {
+        host: "127.0.0.1".into(),
+        port: 1,
+        security: Security::None,
+        username: "imap@example.com".into(),
+    });
+    imap.capabilities = ProviderCapabilities::defaults_for(ProviderKind::Imap);
+    ctx.db
+        .write(move |conn| repo::accounts::insert(conn, &imap))
+        .await
+        .expect("imap account");
+
+    let message_id = ctx
+        .db
+        .write(|conn| {
+            let folder = repo::folders::create(conn, "imap1", None, "Inbox")?;
+            let summary = MessageSummary::new(
+                new_id(),
+                "imap1",
+                folder.id.clone(),
+                "thread-imap",
+                Utc::now(),
+            );
+            let mut stored = StoredMessage::new(summary);
+            stored.summary.subject = "Flag from task".into();
+            stored.uid = Some(77);
+            stored.uidvalidity = Some(1);
+            repo::messages::upsert(conn, &stored)?;
+            Ok(stored.summary.id.clone())
+        })
+        .await
+        .expect("message");
+
+    service
+        .message_create_task(
+            &message_id,
+            NewTaskFromMessage {
+                title: "Flag from task".into(),
+                notes: String::new(),
+                list_id: "local-tasks".into(),
+                due_date: None,
+                reminder_at: None,
+                my_day_date: None,
+                mark_flagged: true,
+            },
+        )
+        .await
+        .expect("task");
+
+    let ops = ctx
+        .db
+        .read(|conn| repo::pending_ops::list(conn, Some("imap1")))
+        .await
+        .expect("ops");
+    let flag_op = ops
+        .into_iter()
+        .find(|op| op.kind == "setFlags")
+        .expect("the star must queue a setFlags operation");
+    assert_eq!(
+        flag_op.payload["messageIds"],
+        serde_json::json!([message_id]),
+        "the payload must carry the per-message id"
+    );
+    let writer = ctx
+        .db
+        .read({
+            let id = message_id.clone();
+            move |conn| repo::messages::flag_writer(conn, &id, "flagged")
+        })
+        .await
+        .expect("writer")
+        .expect("the queued operation must own the flagged field");
+    assert_eq!(writer.owner_id, flag_op.id);
+    assert_eq!(writer.value, Some(true));
+    let stored = ctx
+        .db
+        .read({
+            let id = message_id.clone();
+            move |conn| repo::messages::get_required(conn, &id)
+        })
+        .await
+        .expect("stored message");
+    assert!(stored.summary.flagged);
+}
+
 #[tokio::test]
 async fn soft_deleted_message_drops_the_task_link() {
     let (ctx, service) = service().await;
@@ -339,7 +442,10 @@ async fn soft_deleted_message_drops_the_task_link() {
         .await
         .expect("query");
     let stored = tasks.iter().find(|item| item.id == task.id).expect("task");
-    assert!(stored.linked_message_id.is_none(), "stale link must be cleared");
+    assert!(
+        stored.linked_message_id.is_none(),
+        "stale link must be cleared"
+    );
 
     let counts = service
         .task_smart_counts("2026-11-12".into())

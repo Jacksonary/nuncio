@@ -15,6 +15,7 @@ import {
   SNAP_MINUTES,
   addDaysLocal,
   combineDateAndMinutes,
+  createRange,
   isSameDayLocal,
   isWorkDay,
   isoWeekNumber,
@@ -155,6 +156,8 @@ export function TimeGridView({
   );
 
   const showWeekNumber = settings.showWeekNumbers && days.length > 1;
+  // A "now" line only makes sense while today is on screen.
+  const showNowLine = days.some((day) => isSameDayLocal(day, today));
   const gridStyle = {
     gridTemplateColumns: `var(--time-gutter) repeat(${days.length}, minmax(0, 1fr))`,
   };
@@ -274,15 +277,11 @@ export function TimeGridView({
     setCreateDrag(null);
     const day = days[current.dayIndex];
     if (!day) return;
-    const min = Math.min(current.anchorMin, current.currentMin);
-    const max = Math.max(current.anchorMin, current.currentMin);
-    let startMin = min;
-    let endMin = max;
-    if (endMin - startMin < SNAP_MINUTES) {
-      const duration = Math.max(SNAP_MINUTES, settings.defaultEventDurationMinutes);
-      startMin = Math.min(min, 1440 - duration);
-      endMin = startMin + duration;
-    }
+    const { start: startMin, end: endMin } = createRange(
+      current.anchorMin,
+      current.currentMin,
+      settings.defaultEventDurationMinutes,
+    );
     const start = combineDateAndMinutes(day, startMin);
     const end = combineDateAndMinutes(day, endMin);
     onQuickCreate(
@@ -443,17 +442,30 @@ export function TimeGridView({
         <div className={styles.body} style={gridStyle}>
           <div className={styles.timeColumn}>
             {Array.from({ length: 24 }, (_, hour) => (
-              <div key={hour} className={styles.hourLabel} style={{ top: hour * HOUR_HEIGHT }}>
-                {formatTime(new Date(2000, 0, 1, hour, 0), { locale })}
-              </div>
+              // The "now" pill sits in this gutter too; drop the hour label it
+              // would land on so the same minute is never printed twice.
+              showNowLine && Math.abs(nowMinutes - hour * 60) < 10 ? null : (
+                <div key={hour} className={styles.hourLabel} style={{ top: hour * HOUR_HEIGHT }}>
+                  {formatTime(new Date(2000, 0, 1, hour, 0), { locale })}
+                </div>
+              )
             ))}
           </div>
           {dayLayouts.map((layout, dayIndex) => {
             const isToday = isSameDayLocal(layout.day, today);
             const working = isWorkDay(layout.day, settings);
             const create = createDrag?.dayIndex === dayIndex ? createDrag : null;
-            const createStart = create ? Math.min(create.anchorMin, create.currentMin) : 0;
-            const createEnd = create ? Math.max(create.anchorMin, create.currentMin) : 0;
+            // Same range the commit uses, so the ghost always matches what the
+            // quick-create dialog opens with.
+            const ghost = create
+              ? createRange(
+                  create.anchorMin,
+                  create.currentMin,
+                  settings.defaultEventDurationMinutes,
+                )
+              : null;
+            const createStart = ghost?.start ?? 0;
+            const createEnd = ghost?.end ?? 0;
             return (
               <div
                 key={layout.day.toISOString()}
@@ -498,18 +510,25 @@ export function TimeGridView({
                   />
                 ) : null}
                 {layout.placed.map((placed) => renderPlaced(placed, layout.day))}
-                {isToday ? (
-                  <div
-                    className={styles.nowLine}
-                    style={{ top: (nowMinutes / 60) * HOUR_HEIGHT }}
-                    aria-hidden="true"
-                  >
-                    <span className={styles.nowDot} />
-                  </div>
-                ) : null}
               </div>
             );
           })}
+          {/* One "now" line across every day column, with the time on it, the
+              way Google Calendar and Apple Calendar draw it. It only appears
+              when today is one of the visible days. */}
+          {showNowLine ? (
+            <div
+              className={styles.nowLine}
+              style={{ top: (nowMinutes / 60) * HOUR_HEIGHT }}
+              aria-hidden="true"
+            >
+              <span className={styles.nowTime}>
+                {formatTime(new Date(2000, 0, 1, Math.floor(nowMinutes / 60), nowMinutes % 60), {
+                  locale,
+                })}
+              </span>
+            </div>
+          ) : null}
         </div>
       </div>
 

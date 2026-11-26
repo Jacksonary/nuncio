@@ -369,9 +369,10 @@
   background: color-mix(in srgb, var(--event-color, var(--accent)) 35%, transparent);
 }
 
+/* Current time: one line across the whole grid with the time on it. */
 .nowLine {
   position: absolute;
-  left: 0;
+  left: var(--time-gutter);
   right: 0;
   height: 2px;
   background: var(--danger);
@@ -379,14 +380,24 @@
   pointer-events: none;
 }
 
-.nowDot {
+/* Pill for the current time, aligned with the hour labels in the time gutter.
+   The hour label it would collide with is not rendered (see TimeGridView), so
+   the gutter never shows the same minute twice. */
+.nowTime {
   position: absolute;
-  left: -4px;
-  top: -3px;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
+  top: 50%;
+  right: 100%;
+  margin-right: 4px;
+  transform: translateY(-50%);
+  padding: 1px 5px;
+  border-radius: var(--radius-s);
   background: var(--danger);
+  /* White on the light theme's red; dark ink on the dark theme's pink. */
+  color: var(--surface-solid);
+  font-size: 10px;
+  font-weight: var(--weight-semibold);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .morePopover {

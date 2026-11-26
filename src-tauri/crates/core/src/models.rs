@@ -884,6 +884,19 @@ pub struct MessageSummary {
     pub thread_count: i64,
     /// Unread messages in the conversation.
     pub thread_unread: i64,
+    /// Non-NULL while the row waits for a targeted server reconciliation
+    /// (`pendingDelete`, `rebind` or `moveRollback`). The UI shows it so a
+    /// message is not silently stuck, and the retry command can be offered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconcile_reason: Option<String>,
+    /// For a draft projection: why its remote copy is not settled yet.
+    ///
+    /// * `pendingConfirmation` – an APPEND (or its cleanup) cannot be verified
+    ///   yet and will be retried. The UI offers "keep local draft".
+    /// * `localOnly` – the user chose to keep the draft local; no more remote
+    ///   work is queued. Nothing remote is deleted by that choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_sync_state: Option<String>,
 }
 
 impl MessageSummary {
@@ -916,6 +929,8 @@ impl MessageSummary {
             size: 0,
             thread_count: 1,
             thread_unread: 1,
+            reconcile_reason: None,
+            draft_sync_state: None,
         }
     }
 }
@@ -1219,6 +1234,145 @@ pub struct DraftAttachment {
     pub content_id: Option<String>,
 }
 
+/// How a draft's remote copy was attributed to this client.
+///
+/// Only [`RemoteDraftAttribution::Confirmed`] (an `APPENDUID` received by this
+/// client's APPEND) and [`RemoteDraftAttribution::Explicit`] (the user opened
+/// that exact server draft) authorize deleting the copy. `Candidate` records
+/// that a same-header copy exists but cannot be attributed; it must be kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RemoteDraftAttribution {
+    /// No remote copy is known for this draft.
+    #[default]
+    None,
+    /// The server returned this copy's UID to one of our APPENDs.
+    Confirmed,
+    /// The draft was opened from this exact server row.
+    Explicit,
+    /// A copy exists but cannot be attributed to this client.
+    Candidate,
+}
+
+/// Durable identity of the remote copy a local draft supersedes.
+///
+/// Pinned when the draft is opened (explicit binding) or when an APPEND receipt
+/// binds the uploaded copy (confirmed). Later saves must use this snapshot
+/// instead of re-reading a UID from the Drafts projection, which a sync can
+/// rebind, move or rebuild.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDraftIdentity {
+    pub attribution: RemoteDraftAttribution,
+    #[serde(default)]
+    pub folder_id: Option<Id>,
+    #[serde(default)]
+    pub uid: Option<i64>,
+    #[serde(default)]
+    pub uidvalidity: Option<i64>,
+    /// Provider message id of the copy, for providers without UIDs (Graph).
+    /// This is the direct analogue of the IMAP `APPENDUID`: only an id returned
+    /// to one of this draft's own uploads may be stored here.
+    #[serde(default)]
+    pub remote_id: Option<String>,
+    /// Local message row that projected this copy when the identity was
+    /// pinned. Used to verify the queued UID still belongs to this draft.
+    #[serde(default)]
+    pub projection_id: Option<Id>,
+}
+
+impl RemoteDraftIdentity {
+    pub fn confirmed(
+        folder_id: &str,
+        uid: i64,
+        uidvalidity: Option<i64>,
+        projection_id: Option<Id>,
+    ) -> Self {
+        Self {
+            attribution: RemoteDraftAttribution::Confirmed,
+            folder_id: Some(folder_id.to_string()),
+            uid: Some(uid),
+            uidvalidity,
+            remote_id: None,
+            projection_id,
+        }
+    }
+
+    /// A Graph upload receipt. Graph assigns the message id directly, so the
+    /// identity carries `remote_id` instead of a UID; the local synthetic UID
+    /// is derived from that id by the sync/executor.
+    pub fn confirmed_graph(folder_id: &str, remote_id: &str, projection_id: Option<Id>) -> Self {
+        Self {
+            attribution: RemoteDraftAttribution::Confirmed,
+            folder_id: Some(folder_id.to_string()),
+            uid: None,
+            uidvalidity: None,
+            remote_id: Some(remote_id.to_string()),
+            projection_id,
+        }
+    }
+
+    pub fn explicit(
+        folder_id: &str,
+        uid: Option<i64>,
+        uidvalidity: Option<i64>,
+        projection_id: Option<Id>,
+    ) -> Self {
+        Self {
+            attribution: RemoteDraftAttribution::Explicit,
+            folder_id: Some(folder_id.to_string()),
+            uid,
+            uidvalidity,
+            remote_id: None,
+            projection_id,
+        }
+    }
+
+    /// The Graph equivalent of [`Self::explicit`]: the user opened this exact
+    /// server row, so its provider message id may authorize a delete.
+    pub fn explicit_graph(folder_id: &str, remote_id: &str, projection_id: Option<Id>) -> Self {
+        Self {
+            attribution: RemoteDraftAttribution::Explicit,
+            folder_id: Some(folder_id.to_string()),
+            uid: None,
+            uidvalidity: None,
+            remote_id: Some(remote_id.to_string()),
+            projection_id,
+        }
+    }
+
+    pub fn candidate(folder_id: Option<Id>, projection_id: Option<Id>) -> Self {
+        Self {
+            attribution: RemoteDraftAttribution::Candidate,
+            folder_id,
+            uid: None,
+            uidvalidity: None,
+            remote_id: None,
+            projection_id,
+        }
+    }
+
+    /// Whether this identity may authorize a remote delete.
+    pub fn is_deletable(&self) -> bool {
+        matches!(
+            self.attribution,
+            RemoteDraftAttribution::Confirmed | RemoteDraftAttribution::Explicit
+        ) && self.uid.is_some()
+            && self.uidvalidity.is_some()
+            && self.folder_id.is_some()
+    }
+
+    /// The Graph equivalent of [`Self::is_deletable`]: a receipt naming the
+    /// exact provider message id may authorize its own delete.
+    pub fn is_deletable_graph(&self) -> bool {
+        matches!(
+            self.attribution,
+            RemoteDraftAttribution::Confirmed | RemoteDraftAttribution::Explicit
+        ) && self.remote_id.is_some()
+            && self.folder_id.is_some()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Draft {
@@ -1243,6 +1397,15 @@ pub struct Draft {
     pub request_read_receipt: bool,
     /// Remote message id of the draft in the Drafts folder, if synced.
     pub remote_draft_message_id: Option<Id>,
+    /// Durable identity of the server copy this draft supersedes. Pinned when
+    /// the draft is opened or an APPEND receipt is accepted.
+    #[serde(default)]
+    pub remote_draft: Option<RemoteDraftIdentity>,
+    /// The user chose "keep local draft" after a remote copy could not be
+    /// confirmed. Saves stay local and no upload/cleanup is retried. Remote
+    /// deletion rules are unchanged: nothing is deleted automatically.
+    #[serde(default)]
+    pub sync_suppressed: bool,
     pub updated_at: Option<DateTime<Utc>>,
 }
 
@@ -2882,6 +3045,22 @@ pub struct SyncStatus {
     pub state: SyncState,
     /// e.g. `{ done: 120, total: 800 }` during initial sync.
     pub progress: Option<SyncProgress>,
+    /// `true` while a provider is importing a folder's first full pass.
+    ///
+    /// Unlike [`Self::progress`] this does not claim to know the total: an
+    /// unfiltered Graph delta scan may span several paginated passes for a
+    /// large mailbox, and the UI only needs to say that this work is in
+    /// progress. Cleared when the pass finishes, fails, or a new cycle begins.
+    #[serde(default)]
+    pub full_sync: bool,
+    /// Monotonic sequence assigned by [`crate::sync_status::SyncStatusHub`] when
+    /// a change is committed under the hub lock.
+    ///
+    /// The change is published only after the lock is released, so delivery can
+    /// reorder two snapshots. Consumers must keep the snapshot with the highest
+    /// `seq` per `(account_id, module)` instead of trusting arrival order.
+    #[serde(default)]
+    pub seq: u64,
     pub message: Option<String>,
     pub last_sync_at: Option<DateTime<Utc>>,
 }
@@ -2893,6 +3072,8 @@ impl SyncStatus {
             module,
             state: SyncState::Idle,
             progress: None,
+            full_sync: false,
+            seq: 0,
             message: None,
             last_sync_at: None,
         }
@@ -2991,6 +3172,10 @@ pub struct StoredMessage {
     pub raw_headers: Option<String>,
     pub body_path: Option<String>,
     pub body_cached_at: Option<DateTime<Utc>>,
+    /// Provider copy recorded together with `body_path`. Read from the same row
+    /// snapshot as the path, so a reader can prove which copy the bytes it read
+    /// came from instead of re-querying the binding afterwards.
+    pub body_identity: Option<String>,
     pub internal_date: Option<DateTime<Utc>>,
     pub is_deleted_local: bool,
 }
@@ -3012,6 +3197,7 @@ impl StoredMessage {
             raw_headers: None,
             body_path: None,
             body_cached_at: None,
+            body_identity: None,
             internal_date: None,
             is_deleted_local: false,
         }
@@ -3097,6 +3283,12 @@ impl FromStr for PendingOpState {
             "done" => Ok(Self::Done),
             "failed" => Ok(Self::Failed),
             "cancelled" => Ok(Self::Cancelled),
+            // A short-lived build wrote `quarantined` for isolated legacy
+            // deletes. Older binaries cannot parse that string and would fall
+            // back to `pending`, so the state must never be written again.
+            // Read it as `cancelled` (the executor selects only `pending`)
+            // while the payload's `quarantined` marker keeps the audit record.
+            "quarantined" => Ok(Self::Cancelled),
             other => Err(AppError::invalid_input(format!(
                 "unknown pending op state: {other}"
             ))),
@@ -3113,11 +3305,24 @@ pub struct PendingOp {
     pub kind: String,
     pub payload: Value,
     pub state: PendingOpState,
+    /// Explicit insertion order. Execution and "newest evidence" scans must use
+    /// this instead of the implicit `rowid`, which a table rebuild may renumber.
+    pub sequence: i64,
     pub attempts: u32,
     pub next_retry_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub description: String,
     pub last_error: Option<String>,
+    /// A wire command for this operation was about to be (or was) issued.
+    /// Persisted *before* the command, so a crash or an ambiguous error can
+    /// never make the operation look untouched.
+    #[serde(default)]
+    pub send_intent: bool,
+    /// The outcome of a command with `send_intent` could not be determined.
+    /// Recovery and retries keep this marker; undo must not treat the row as
+    /// "not sent" again.
+    #[serde(default)]
+    pub outcome_unknown: bool,
 }
 
 impl PendingOp {
@@ -3190,6 +3395,51 @@ impl FromStr for OutboxState {
     }
 }
 
+/// The persistent remote-draft cleanup decision captured when the message was
+/// queued. SMTP post-send processing may only consume this decision; it must
+/// never derive a delete from the draft's projection id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OutboxDraftCleanup {
+    /// No remote copy is known; only a local projection may be reclaimed.
+    #[default]
+    None,
+    /// A delete operation was queued and removes the projection after the
+    /// server confirms.
+    Queued,
+    /// An in-flight APPEND owns the cleanup (`discardRequested`).
+    Deferred,
+    /// A remote copy exists but cannot be attributed; keep it.
+    Unconfirmed,
+}
+
+impl OutboxDraftCleanup {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Queued => "queued",
+            Self::Deferred => "deferred",
+            Self::Unconfirmed => "unconfirmed",
+        }
+    }
+}
+
+impl FromStr for OutboxDraftCleanup {
+    type Err = AppError;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "none" => Ok(Self::None),
+            "queued" => Ok(Self::Queued),
+            "deferred" => Ok(Self::Deferred),
+            "unconfirmed" => Ok(Self::Unconfirmed),
+            other => Err(AppError::invalid_input(format!(
+                "unknown outbox draft cleanup: {other}"
+            ))),
+        }
+    }
+}
+
 /// A message waiting to be sent over SMTP (offline outbox).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -3201,6 +3451,9 @@ pub struct OutboxItem {
     pub subject: String,
     /// Path of the built RFC822 message inside `Paths::staging`.
     pub rfc822_path: String,
+    /// Persistent cleanup decision for the source draft's remote copy.
+    #[serde(default)]
+    pub draft_cleanup: OutboxDraftCleanup,
     pub state: OutboxState,
     pub attempts: u32,
     pub next_retry_at: Option<DateTime<Utc>>,
@@ -3226,6 +3479,7 @@ impl OutboxItem {
             recipients,
             subject: subject.into(),
             rfc822_path: rfc822_path.into(),
+            draft_cleanup: OutboxDraftCleanup::None,
             state: OutboxState::Pending,
             attempts: 0,
             next_retry_at: None,
@@ -3265,6 +3519,194 @@ impl UndoEntry {
             created_at: now(),
         }
     }
+}
+
+/// Lifecycle of a durable undo request.
+///
+/// An undo is no longer a single all-or-nothing decision over a batch of
+/// operations: every message is tracked separately and a request can wait for
+/// an in-flight operation to settle before continuing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UndoState {
+    /// Started, entries are being classified.
+    Pending,
+    /// At least one entry waits for an in-flight operation to settle.
+    Deferred,
+    /// Inverse operations are being queued for the entries that already ran.
+    Compensating,
+    /// Every entry settled successfully.
+    Done,
+    /// At least one entry could not be undone.
+    Failed,
+}
+
+impl UndoState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Deferred => "deferred",
+            Self::Compensating => "compensating",
+            Self::Done => "done",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl FromStr for UndoState {
+    type Err = AppError;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "pending" => Ok(Self::Pending),
+            "deferred" => Ok(Self::Deferred),
+            "compensating" => Ok(Self::Compensating),
+            "done" => Ok(Self::Done),
+            "failed" => Ok(Self::Failed),
+            other => Err(AppError::invalid_input(format!(
+                "unknown undo state: {other}"
+            ))),
+        }
+    }
+}
+
+/// Per-message outcome of an undo request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UndoEntryResult {
+    Pending,
+    Done,
+    Failed,
+}
+
+impl UndoEntryResult {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Done => "done",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl FromStr for UndoEntryResult {
+    type Err = AppError;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "pending" => Ok(Self::Pending),
+            "done" => Ok(Self::Done),
+            "failed" => Ok(Self::Failed),
+            other => Err(AppError::invalid_input(format!(
+                "unknown undo entry result: {other}"
+            ))),
+        }
+    }
+}
+
+/// Durable undo request (one reversible user action being reverted).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UndoRequest {
+    pub id: Id,
+    pub account_id: Id,
+    pub kind: String,
+    pub value: Option<bool>,
+    pub state: UndoState,
+    pub attempt: u32,
+    pub op_ids: Vec<String>,
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// One message tracked by an [`UndoRequest`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UndoRequestEntry {
+    pub id: Id,
+    pub request_id: Id,
+    pub account_id: Id,
+    pub message_id: Id,
+    pub original_folder_id: Id,
+    pub target_folder_id: Option<Id>,
+    /// Folder-local identity of the message at its target after the original
+    /// action reached the server. Persisted once resolved so a retry never has
+    /// to guess the target again.
+    pub target_uid: Option<i64>,
+    pub target_uidvalidity: Option<i64>,
+    /// Stable Graph id when the target is a Graph message.
+    pub target_graph_id: Option<String>,
+    pub permanent: bool,
+    pub result: UndoEntryResult,
+    /// The single inverse operation queued for this entry. Non-null is the
+    /// durable claim that compensation was enqueued (and must not repeat).
+    pub inverse_op_id: Option<Id>,
+    /// Pending operations that the original action queued for this message.
+    pub op_ids: Vec<String>,
+    /// One or more referenced operation rows (or their payloads) could not be
+    /// resolved. The entry must be treated as "evidence missing", never as
+    /// "this message had no server operation".
+    #[serde(default)]
+    pub evidence_missing: bool,
+    /// How many fresh inverse operations were queued after a predecessor
+    /// provably never ran. Bounds the automatic re-planning loop so a target
+    /// that keeps failing reaches a visible terminal state instead of being
+    /// retried forever.
+    #[serde(default)]
+    pub replans: u32,
+    /// Opaque snapshot used by the mail service to restore local state.
+    pub payload: Value,
+    pub ordinal: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Values required to create an [`UndoRequest`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewUndoRequest {
+    pub id: Id,
+    pub account_id: Id,
+    pub kind: String,
+    pub value: Option<bool>,
+    pub op_ids: Vec<String>,
+}
+
+impl NewUndoRequest {
+    pub fn new(
+        id: impl Into<Id>,
+        account_id: impl Into<Id>,
+        kind: impl Into<String>,
+        value: Option<bool>,
+        op_ids: Vec<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            account_id: account_id.into(),
+            kind: kind.into(),
+            value,
+            op_ids,
+        }
+    }
+}
+
+/// Values required to create an [`UndoRequestEntry`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewUndoEntry {
+    pub id: Id,
+    pub request_id: Id,
+    pub account_id: Id,
+    pub message_id: Id,
+    pub original_folder_id: Id,
+    pub target_folder_id: Option<Id>,
+    pub target_uid: Option<i64>,
+    pub target_uidvalidity: Option<i64>,
+    pub target_graph_id: Option<String>,
+    pub permanent: bool,
+    pub op_ids: Vec<String>,
+    pub evidence_missing: bool,
+    pub payload: Value,
+    pub ordinal: i64,
 }
 
 /// Payload of `app://navigate` (also used for notification clicks).
@@ -3641,7 +4083,10 @@ mod tests {
         ] {
             let caps = ProviderCapabilities::defaults_for(kind);
             assert!(!caps.idle, "{kind:?} should not pre-advertise IDLE");
-            assert!(!caps.condstore, "{kind:?} should not pre-advertise CONDSTORE");
+            assert!(
+                !caps.condstore,
+                "{kind:?} should not pre-advertise CONDSTORE"
+            );
             assert!(!caps.qresync, "{kind:?} should not pre-advertise QRESYNC");
             assert!(!caps.r#move, "{kind:?} should not pre-advertise MOVE");
             assert!(!caps.uidplus, "{kind:?} should not pre-advertise UIDPLUS");

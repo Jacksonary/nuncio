@@ -52,9 +52,14 @@ pub fn settle_sync_idle(ctx: &CoreContext, account_id: &str) {
     if status.state == SyncState::NeedsReauth {
         return;
     }
-    if status.state != SyncState::Idle || status.progress.is_some() || status.message.is_some() {
+    if status.state != SyncState::Idle
+        || status.progress.is_some()
+        || status.full_sync
+        || status.message.is_some()
+    {
         status.state = SyncState::Idle;
         status.progress = None;
+        status.full_sync = false;
         status.message = None;
         ctx.sync_status.set(status);
     }

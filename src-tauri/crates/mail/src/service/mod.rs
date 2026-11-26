@@ -15,9 +15,14 @@ mod attachments;
 mod compose;
 mod detail;
 mod folders;
-mod messages;
+// The operation payloads embed [`messages::StoredSnapshot`] so a permanently
+// deleted row can be rebuilt after a refused server command.
+pub(crate) mod messages;
 pub(crate) mod outbox;
-mod undo;
+pub(crate) mod undo;
+
+/// Advance deferred undo requests (also called by the queue worker).
+pub use undo::resume_deferred_undo_requests;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -32,6 +37,19 @@ use nuncio_core::{events, repo, AppError, CoreContext, Result};
 use tracing::{debug, info, warn};
 
 use crate::Engine;
+
+/// Raw message bytes plus the provenance of the cache file they came from.
+///
+/// `version` is parsed from the versioned cache file name and is a digest of
+/// the provider copy key and the exact bytes, so a caller can recompute it for
+/// a candidate copy and prove whether those bytes were published for it.
+/// `identity` is the key recorded with the path in the same row snapshot and
+/// is only meaningful for legacy, unversioned files.
+pub(crate) struct RawMessage {
+    pub bytes: Vec<u8>,
+    pub version: Option<String>,
+    pub identity: Option<String>,
+}
 
 /// Maximum number of externally opened `.eml` files kept for cid rendering.
 const EXTERNAL_LIMIT: usize = 12;
@@ -420,7 +438,7 @@ impl MailService {
     /// Read the raw RFC822 message, downloading/caching it when needed.
     /// Works with POP3 (body cached during sync) and directly with IMAP when
     /// the background worker is not running.
-    pub(crate) async fn raw_message(&self, stored: &StoredMessage) -> Result<Vec<u8>> {
+    pub(crate) async fn raw_message(&self, stored: &StoredMessage) -> Result<RawMessage> {
         if let Some(path) = stored.body_path.as_deref() {
             match tokio::fs::metadata(path).await {
                 Ok(metadata) if metadata.len() > crate::sync::body::MAX_MESSAGE_BYTES => {
@@ -429,7 +447,19 @@ impl MailService {
                     ));
                 }
                 Ok(_) => match tokio::fs::read(path).await {
-                    Ok(bytes) => return Ok(bytes),
+                    // The identity is the one recorded in the *same snapshot*
+                    // as `body_path`; re-querying it later could describe a
+                    // different copy than the file we just read. The file name
+                    // additionally carries a version binding the bytes to it.
+                    Ok(bytes) => {
+                        return Ok(RawMessage {
+                            bytes,
+                            version: crate::sync::body::body_cache_version_from_path(
+                                std::path::Path::new(path),
+                            ),
+                            identity: stored.body_identity.clone(),
+                        });
+                    }
                     Err(error) => debug!(
                         message = %stored.summary.id,
                         %error,
@@ -452,9 +482,7 @@ impl MailService {
                 let path =
                     crate::pop3::body::fetch_body(&self.inner.ctx, &account, &stored.summary.id)
                         .await?;
-                return tokio::fs::read(&path).await.map_err(|error| {
-                    AppError::io(format!("cannot read cached message body: {error}"))
-                });
+                return self.read_published_body(&path, &stored.summary.id).await;
             }
             return Err(AppError::not_found(format!(
                 "message {} has no cached body",
@@ -477,9 +505,38 @@ impl MailService {
             }
             Err(error) => return Err(error),
         };
-        tokio::fs::read(&path)
+        self.read_published_body(&path, &message_id).await
+    }
+
+    /// Read a body file the fetch just published and report its provenance.
+    async fn read_published_body(
+        &self,
+        path: &std::path::Path,
+        message_id: &str,
+    ) -> Result<RawMessage> {
+        let bytes = tokio::fs::read(path)
             .await
-            .map_err(|error| AppError::io(format!("cannot read cached message body: {error}")))
+            .map_err(|error| AppError::io(format!("cannot read cached message body: {error}")))?;
+        let version = crate::sync::body::body_cache_version_from_path(path);
+        // The publisher wrote its source identity atomically with the path. It
+        // is only a fallback for legacy, unversioned files; the version itself
+        // already binds these bytes to the copy they were fetched for.
+        let identity = self
+            .inner
+            .ctx
+            .db
+            .read({
+                let message_id = message_id.to_string();
+                move |db| repo::messages::body_identity(db, &message_id)
+            })
+            .await
+            .ok()
+            .flatten();
+        Ok(RawMessage {
+            bytes,
+            version,
+            identity,
+        })
     }
 
     /// Read raw bytes by local message id.
@@ -488,7 +545,7 @@ impl MailService {
             return Ok(raw);
         }
         let stored = self.stored(message_id).await?;
-        self.raw_message(&stored).await
+        Ok(self.raw_message(&stored).await?.bytes)
     }
 
     /// Decide whether remote images may load.

@@ -22,10 +22,8 @@ use crate::state::AppState;
 /// how the window was left at the last close).
 pub fn window_state_flags() -> tauri_plugin_window_state::StateFlags {
     use tauri_plugin_window_state::StateFlags;
-    let flags = StateFlags::SIZE
-        | StateFlags::POSITION
-        | StateFlags::MAXIMIZED
-        | StateFlags::FULLSCREEN;
+    let flags =
+        StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED | StateFlags::FULLSCREEN;
     // macOS keeps native decorations (overlay title bar). Windows/Linux use a
     // custom title bar drawn by the frontend, so restoring a persisted
     // "decorations" value would reintroduce the native bar.
@@ -159,10 +157,7 @@ fn refresh_badge(app: &AppHandle) {
 ///
 /// The caller must show the window afterwards; this only releases the handshake.
 fn cancel_pending_close(app: &AppHandle, state: &AppState) -> bool {
-    let cleared = state
-        .flush_seq
-        .swap(0, std::sync::atomic::Ordering::SeqCst)
-        != 0;
+    let cleared = state.flush_seq.swap(0, std::sync::atomic::Ordering::SeqCst) != 0;
     if cleared {
         let _ = app.emit(events::CLOSE_CANCELLED, ());
     }
@@ -207,11 +202,7 @@ fn show_main_window_locked(
     // window now would either resurrect one that is about to be destroyed or
     // race the destroy itself, so ask the destroy task to present it again once
     // it is done and return without touching anything.
-    if state
-        .tear_down
-        .load(std::sync::atomic::Ordering::SeqCst)
-        != 0
-    {
+    if state.tear_down.load(std::sync::atomic::Ordering::SeqCst) != 0 {
         state
             .reopen_pending
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -259,11 +250,7 @@ pub fn toggle_main_window(app: &AppHandle) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    if state
-        .tear_down
-        .load(std::sync::atomic::Ordering::SeqCst)
-        != 0
-    {
+    if state.tear_down.load(std::sync::atomic::Ordering::SeqCst) != 0 {
         state
             .reopen_pending
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -313,8 +300,7 @@ async fn wait_for_destroy(app: &AppHandle, seen: u64, patience_secs: u64) -> boo
     // One polling loop instead of a channel: the counter cannot carry a stale
     // permit from a previous handshake the way a notification would, and 25 ms
     // is far below the interval at which the platform destroys a webview.
-    let deadline =
-        tokio::time::Instant::now() + std::time::Duration::from_secs(patience_secs);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(patience_secs);
     loop {
         if counter.load(std::sync::atomic::Ordering::SeqCst) != seen
             || app.get_webview_window("main").is_none()

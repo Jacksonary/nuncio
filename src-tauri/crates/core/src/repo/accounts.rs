@@ -345,6 +345,11 @@ pub fn delete(conn: &Connection, id: &str) -> Result<()> {
         params![id],
     )?;
     conn.execute("DELETE FROM undo_log WHERE account_id = ?1", params![id])?;
+    conn.execute("DELETE FROM undo_entry WHERE account_id = ?1", params![id])?;
+    conn.execute(
+        "DELETE FROM undo_request WHERE account_id = ?1",
+        params![id],
+    )?;
     conn.execute("DELETE FROM sync_state WHERE account_id = ?1", params![id])?;
     let changed = conn.execute("DELETE FROM account WHERE id = ?1", params![id])?;
     if changed == 0 {

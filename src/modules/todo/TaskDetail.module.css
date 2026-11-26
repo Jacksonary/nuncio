@@ -312,6 +312,14 @@
   border-bottom: 1px solid var(--accent-border);
 }
 
+/* The global `:focus-visible` ring outranks the `outline: none` above it in the
+   cascade (global.css is emitted last), which drew a second box around the
+   field. Drop it: the row background / bottom line is the focus cue. */
+.stepInput:focus-visible,
+.stepAddInput:focus-visible {
+  outline: none;
+}
+
 .stepInputDone {
   text-decoration: line-through;
   color: var(--text-tertiary);
@@ -366,7 +374,12 @@
   gap: var(--sp-2);
   min-height: 30px;
   padding: 0 4px;
+  border-radius: var(--radius-s);
   color: var(--accent);
+}
+
+.stepAddRow:focus-within {
+  background: var(--surface-hover);
 }
 
 .stepAddInput {

@@ -74,8 +74,7 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
 #[cfg(target_os = "macos")]
 fn tray_icon() -> tauri::image::Image<'static> {
     const TEMPLATE: &[u8] = include_bytes!("../icons/tray/template-16@2x.png");
-    tauri::image::Image::from_bytes(TEMPLATE)
-        .expect("embedded tray template is a valid PNG")
+    tauri::image::Image::from_bytes(TEMPLATE).expect("embedded tray template is a valid PNG")
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -147,7 +146,9 @@ pub fn setup(app: &AppHandle) -> nuncio_core::Result<()> {
             }
         });
 
-    builder = builder.icon(tray_icon()).icon_as_template(cfg!(target_os = "macos"));
+    builder = builder
+        .icon(tray_icon())
+        .icon_as_template(cfg!(target_os = "macos"));
     builder.build(app).map_err(|error| {
         nuncio_core::AppError::internal(format!("cannot create the tray: {error}"))
     })?;

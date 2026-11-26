@@ -595,6 +595,7 @@ function Composer({ initialDraft, mode, onClose, onSent }: ComposerProps) {
         id: saved.id,
         updatedAt: saved.updatedAt,
         remoteDraftMessageId: saved.remoteDraftMessageId,
+        remoteDraft: saved.remoteDraft,
       };
       draftRef.current = merged;
       setDraftState(merged);
@@ -945,6 +946,10 @@ function Composer({ initialDraft, mode, onClose, onSent }: ComposerProps) {
     const html = signature ? signatureBlockHtml(signature) : "";
     if (html) {
       editor.chain().focus("end").insertContent(html).run();
+      // The signature is inserted at the end of the empty document, which
+      // leaves the caret in the paragraph *below* it. Put it back above the
+      // signature so typing starts at the top of the body, like other clients.
+      editor.chain().focus("start").run();
     }
   }, [
     editor,
@@ -1200,6 +1205,7 @@ function Composer({ initialDraft, mode, onClose, onSent }: ComposerProps) {
         id: staged.id,
         updatedAt: staged.updatedAt,
         remoteDraftMessageId: staged.remoteDraftMessageId,
+        remoteDraft: staged.remoteDraft,
       };
       dirtyRef.current = false;
       await compose.send(outgoing);

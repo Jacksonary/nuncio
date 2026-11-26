@@ -4,13 +4,13 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, Row};
 
 use crate::error::AppError;
-use crate::models::{Address, OutboxItem, OutboxState};
+use crate::models::{Address, OutboxDraftCleanup, OutboxItem, OutboxState};
 use crate::repo::{get_opt_dt, get_opt_string, get_string, json_or_default, json_text, now_string};
 use crate::Result;
 
 const COLUMNS: &str = "\
-    id, account_id, draft_id, recipients_json, subject, rfc822_path, state, attempts,\
-    next_retry_at, last_error, created_at, sent_at, sending_started_at";
+    id, account_id, draft_id, recipients_json, subject, rfc822_path, draft_cleanup, state,\
+    attempts, next_retry_at, last_error, created_at, sent_at, sending_started_at";
 
 fn row_to_item(row: &Row<'_>) -> Result<OutboxItem> {
     let recipients: Option<String> = row.get("recipients_json")?;
@@ -22,6 +22,9 @@ fn row_to_item(row: &Row<'_>) -> Result<OutboxItem> {
         recipients: json_or_default(recipients.as_deref(), "recipients_json"),
         subject: get_string(row, "subject")?,
         rfc822_path: get_string(row, "rfc822_path")?,
+        draft_cleanup: get_string(row, "draft_cleanup")?
+            .parse()
+            .unwrap_or(OutboxDraftCleanup::None),
         state: state.parse().unwrap_or(OutboxState::Pending),
         attempts: row.get::<_, i64>("attempts")?.max(0) as u32,
         next_retry_at: get_opt_dt(row, "next_retry_at")?,
@@ -34,14 +37,15 @@ fn row_to_item(row: &Row<'_>) -> Result<OutboxItem> {
 
 pub fn enqueue(conn: &Connection, item: &OutboxItem) -> Result<OutboxItem> {
     conn.execute(
-        "INSERT INTO outbox (id, account_id, draft_id, recipients_json, subject, rfc822_path, state,
-                             attempts, next_retry_at, last_error, created_at, sent_at,
-                             sending_started_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL)
+        "INSERT INTO outbox (id, account_id, draft_id, recipients_json, subject, rfc822_path,
+                             draft_cleanup, state, attempts, next_retry_at, last_error, created_at,
+                             sent_at, sending_started_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL)
          ON CONFLICT(id) DO UPDATE SET
              recipients_json = excluded.recipients_json,
              subject = excluded.subject,
              rfc822_path = excluded.rfc822_path,
+             draft_cleanup = excluded.draft_cleanup,
              state = excluded.state,
              attempts = excluded.attempts,
              next_retry_at = excluded.next_retry_at,
@@ -54,6 +58,7 @@ pub fn enqueue(conn: &Connection, item: &OutboxItem) -> Result<OutboxItem> {
             json_text(&item.recipients)?,
             item.subject,
             item.rfc822_path,
+            item.draft_cleanup.as_str(),
             item.state.as_str(),
             item.attempts as i64,
             item.next_retry_at.map(crate::repo::dt_string),

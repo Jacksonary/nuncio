@@ -143,6 +143,9 @@ export function TokenInput({
     setText("");
     setInvalid(false);
     setHighlighted(-1);
+    // The recipient is now a token: leaving the list open would show an
+    // empty "no suggestions" popover over the next field.
+    setOpen(false);
     return true;
   };
 
@@ -150,6 +153,7 @@ export function TokenInput({
     add([address]);
     setText("");
     setHighlighted(-1);
+    setOpen(false);
     inputRef.current?.focus();
   };
 
@@ -293,13 +297,16 @@ export function TokenInput({
           autoComplete="off"
           spellCheck={false}
           onChange={(event) => {
-            setText(event.target.value);
+            const next = event.target.value;
+            setText(next);
             setInvalid(false);
-            setOpen(true);
+            // An empty field has nothing to suggest; keeping the list open
+            // painted an empty "no suggestions" panel over the next row.
+            setOpen(next.trim().length > 0);
           }}
           onFocus={() => {
             if (blurTimer.current !== null) window.clearTimeout(blurTimer.current);
-            setOpen(true);
+            if (text.trim()) setOpen(true);
           }}
           onBlur={() => {
             blurTimer.current = window.setTimeout(() => {

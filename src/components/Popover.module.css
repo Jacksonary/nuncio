@@ -26,6 +26,15 @@
   pointer-events: none;
 }
 
+/* Click-away layer for point-anchored menus: sits under the menu but above
+   everything else, including the mail iframe, whose clicks never bubble out. */
+.catcher {
+  position: fixed;
+  inset: 0;
+  z-index: calc(var(--z-popover) - 1);
+  background: transparent;
+}
+
 @keyframes popoverIn {
   from {
     opacity: 0;

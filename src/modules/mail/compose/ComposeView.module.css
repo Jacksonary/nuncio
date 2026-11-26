@@ -44,21 +44,40 @@
   flex: 1;
   min-height: 160px;
   overflow: auto;
-  padding: var(--sp-3) var(--sp-5);
 }
 
 .editorContent {
   min-height: 100%;
+  display: flex;
+  flex-direction: column;
 }
 
+/* Fill the whole body area so a click below the last line still lands in the
+   editor instead of the scroll padding. */
+.editorContent > div {
+  flex: 1;
+}
+
+/* The padding lives on the editable element, not on the scroll container, so
+   the whole body rectangle accepts the caret. A mail body is a writing
+   surface, not a control: it shows the caret and no focus ring (Apple Mail,
+   Outlook and Thunderbird all behave this way). */
 .prose {
   min-height: 140px;
   outline: none;
+  flex: 1;
+  padding: var(--sp-3) var(--sp-5);
   color: var(--text);
   font-size: var(--font-body);
   line-height: 1.55;
   user-select: text;
   word-break: break-word;
+}
+
+/* Outrank the global `:focus-visible` ring (same specificity, later source). */
+.prose:focus,
+.prose:focus-visible {
+  outline: none;
 }
 
 .prose :global(p) {

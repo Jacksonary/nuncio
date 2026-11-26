@@ -449,10 +449,7 @@ mod tests {
             params.get("client_id").map(String::as_str),
             Some("ms-client")
         );
-        assert_eq!(
-            params.get("prompt").map(String::as_str),
-            Some("consent")
-        );
+        assert_eq!(params.get("prompt").map(String::as_str), Some("consent"));
         assert_eq!(
             params.get("response_mode").map(String::as_str),
             Some("query")

@@ -271,6 +271,30 @@ export function stripDefaultFontWrapper(html: string): string {
 }
 
 /**
+ * Paragraphs whose whole content is `<br>` (optionally surrounded by
+ * whitespace).
+ *
+ * `<p><br></p>` is how mail HTML spells an empty paragraph so renderers keep
+ * its height. ProseMirror turns that `<br>` into a `hardBreak` node, i.e. two
+ * lines inside one paragraph: the body of a new mail looked like it had two
+ * blank lines, and a click below the first one put the caret *after* the
+ * break. Fold every such paragraph into one empty paragraph per break, which
+ * is what the editor itself produces for real empty lines.
+ */
+const BREAK_ONLY_PARAGRAPH = /<p\b([^>]*)>((?:\s|&nbsp;|<br\s*\/?>)*)<\/p>/gi;
+
+export function foldBreakOnlyParagraphs(html: string): string {
+  if (!html) return html;
+  return html.replace(BREAK_ONLY_PARAGRAPH, (whole, attrs: string, inner: string) => {
+    const breaks = inner.match(/<br\s*\/?>/gi);
+    // `&nbsp;` is content the author put there; only pure-break paragraphs fold.
+    if (!breaks || /&nbsp;/i.test(inner)) return whole;
+    const open = `<p${attrs}>`;
+    return Array.from({ length: Math.max(1, breaks.length) }, () => `${open}</p>`).join("");
+  });
+}
+
+/**
  * Rewrite cid images in a stored draft into a visible placeholder while the
  * editor is open (the staged file cannot be loaded directly: the asset
  * protocol is disabled). The `data-content-id` attribute lets the serializer
@@ -281,7 +305,7 @@ export function prepareEditorHtml(
   attachments: DraftAttachment[],
 ): string {
   if (!html) return "";
-  const unwrapped = stripDefaultFontWrapper(html);
+  const unwrapped = foldBreakOnlyParagraphs(stripDefaultFontWrapper(html));
   const byContentId = new Map(
     attachments
       .filter((item) => item.contentId)

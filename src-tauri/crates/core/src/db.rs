@@ -41,6 +41,76 @@ pub const CORE_MIGRATIONS: &[(u32, &str)] = &[
         6,
         include_str!("../migrations/0006_task_list_well_known.sql"),
     ),
+    (
+        7,
+        include_str!("../migrations/0007_message_target_pending.sql"),
+    ),
+    (
+        8,
+        include_str!("../migrations/0008_clear_local_pending.sql"),
+    ),
+    (
+        9,
+        include_str!("../migrations/0009_message_pending_delete.sql"),
+    ),
+    (
+        10,
+        include_str!("../migrations/0010_message_awaiting_reconcile.sql"),
+    ),
+    (
+        11,
+        include_str!("../migrations/0011_message_reconcile_reason.sql"),
+    ),
+    (
+        12,
+        include_str!("../migrations/0012_draft_sync_suppressed.sql"),
+    ),
+    (
+        13,
+        include_str!("../migrations/0013_draft_remote_identity.sql"),
+    ),
+    (
+        14,
+        include_str!("../migrations/0014_pending_op_sequence.sql"),
+    ),
+    (
+        15,
+        include_str!("../migrations/0015_normalize_quarantined_state.sql"),
+    ),
+    (
+        16,
+        include_str!("../migrations/0016_undo_state_machine.sql"),
+    ),
+    (17, include_str!("../migrations/0017_undo_send_intent.sql")),
+    (
+        18,
+        include_str!("../migrations/0018_undo_entry_replans.sql"),
+    ),
+    (
+        19,
+        include_str!("../migrations/0019_message_flag_writer.sql"),
+    ),
+    (
+        20,
+        include_str!("../migrations/0020_message_body_identity.sql"),
+    ),
+    (21, include_str!("../migrations/0021_flag_writer_seq.sql")),
+    (
+        22,
+        include_str!("../migrations/0022_message_flag_revision.sql"),
+    ),
+    (
+        23,
+        include_str!("../migrations/0023_message_move_target.sql"),
+    ),
+    (
+        24,
+        include_str!("../migrations/0024_message_move_target_owner.sql"),
+    ),
+    (
+        25,
+        include_str!("../migrations/0025_message_reconcile_seq.sql"),
+    ),
 ];
 
 const PRAGMAS: &str = "\
@@ -139,6 +209,9 @@ impl Db {
         if !applied.is_empty() {
             info!(versions = ?applied, "applied core migrations");
         }
+        // Belt and braces for downgrade safety: a row written by an
+        // intermediate build must never reach an older executor as Pending.
+        self.write_sync(|conn| crate::repo::pending_ops::normalize_quarantined_state(conn))?;
         Ok(())
     }
 

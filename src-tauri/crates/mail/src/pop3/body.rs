@@ -163,13 +163,25 @@ pub async fn fetch_body(
         ));
     }
 
-    let path = ctx.paths.mime_path(&account.id, &stored.summary.id);
-    ctx.paths.ensure_parent(&path)?;
-    tokio::fs::write(&path, &raw)
-        .await
-        .map_err(|error| AppError::io(format!("cannot write message cache: {error}")))?;
+    // POP3 rows are keyed by a UIDL-derived id. The cache version is bound to
+    // the same provider key the row records as its source, so a reader can
+    // recompute it from the bytes and prove which copy it read.
+    let body_identity = repo::messages::body_identity_key(&stored);
+    let path = crate::sync::body::cache_body_file(
+        ctx,
+        &account.id,
+        &stored.summary.id,
+        body_identity.as_deref(),
+        &raw,
+    )
+    .await?;
 
-    store_parsed_body(ctx, stored, path.clone(), &raw).await?;
+    if let Err(error) =
+        store_parsed_body(ctx, stored, path.clone(), &raw, body_identity.clone()).await
+    {
+        let _ = tokio::fs::remove_file(&path).await;
+        return Err(error);
+    }
     debug!(
         message = %path.display(),
         bytes = raw.len(),
@@ -182,12 +194,50 @@ pub async fn fetch_body(
 pub const BODY_GONE: &str =
     "message was removed from the POP3 server; its body is no longer available";
 
+/// Refuse to publish bytes unless the row still exists, belongs to the same
+/// account, and (when known) still names the copy the bytes were read from.
+///
+/// The download can take seconds; a delete, move or a sync rebind may land
+/// meanwhile. Returning the current row instead of the pre-download snapshot
+/// is what lets the caller preserve non-body state (notably
+/// `is_deleted_local`) that changed while the request was in flight.
+fn current_publish_target(
+    db: &rusqlite::Connection,
+    message_id: &str,
+    account_id: &str,
+    expected_identity: Option<&str>,
+) -> Result<StoredMessage> {
+    let Some(current) = repo::messages::get(db, message_id)? else {
+        return Err(AppError::conflict(
+            "message disappeared while its body was being downloaded",
+        ));
+    };
+    if current.summary.account_id != account_id {
+        return Err(AppError::conflict(
+            "message changed account while its body was being downloaded",
+        ));
+    }
+    if let Some(expected) = expected_identity {
+        if repo::messages::body_identity_key(&current).as_deref() != Some(expected) {
+            return Err(AppError::conflict(
+                "message was rebound while its body was being downloaded; retry after the next sync",
+            ));
+        }
+    }
+    Ok(current)
+}
+
 /// Parse a downloaded message and update preview, FTS text and attachments.
+///
+/// `body_identity` is the provider copy key captured before the download. It
+/// is verified against the current row before anything is written, so bytes
+/// fetched from one copy are never published under another one.
 async fn store_parsed_body(
     ctx: &CoreContext,
     mut stored: StoredMessage,
     path: PathBuf,
     raw: &[u8],
+    body_identity: Option<String>,
 ) -> Result<()> {
     let path_string = path.to_string_lossy().to_string();
     let parsed = match nuncio_mime::parse(raw) {
@@ -195,9 +245,18 @@ async fn store_parsed_body(
         Err(error) => {
             warn!(%error, message = %stored.summary.id, "failed to parse downloaded POP3 MIME body");
             let message_id = stored.summary.id.clone();
+            let account_id = stored.summary.account_id.clone();
+            let expected = body_identity.clone();
             ctx.db
                 .write(move |db| {
-                    repo::messages::set_body(db, &message_id, Some(&path_string), None)
+                    current_publish_target(db, &message_id, &account_id, expected.as_deref())?;
+                    repo::messages::set_body(
+                        db,
+                        &message_id,
+                        Some(&path_string),
+                        None,
+                        expected.as_deref(),
+                    )
                 })
                 .await?;
             return Ok(());
@@ -260,38 +319,175 @@ async fn store_parsed_body(
         .collect();
 
     let message_id = stored.summary.id.clone();
+    let account_id = stored.summary.account_id.clone();
     let text_for_fts = body_text;
     let preview = stored.summary.preview.clone();
-    let folder_id = stored.summary.folder_id.clone();
+    let expected_identity = body_identity;
     let mut parsed_stored = stored;
     ctx.db
         .write(move |db| {
             // `stored` was read before the download, which can take seconds. The
-            // user may have flagged, read or moved the message meanwhile, so the
-            // state that is not derived from the body is taken from the row as it
-            // is now rather than written back from the old snapshot.
-            if let Some(current) = repo::messages::get(db, &message_id)? {
-                parsed_stored.summary.seen = current.summary.seen;
-                parsed_stored.summary.flagged = current.summary.flagged;
-                parsed_stored.summary.answered = current.summary.answered;
-                parsed_stored.summary.forwarded = current.summary.forwarded;
-                parsed_stored.summary.folder_id = current.summary.folder_id.clone();
-                parsed_stored.summary.is_draft = current.summary.is_draft;
-            }
-            let account_id = parsed_stored.summary.account_id.clone();
-            crate::sync::messages::resolve_thread_id(db, &account_id, &mut parsed_stored)?;
+            // user may have flagged, read, moved or deleted the message
+            // meanwhile, so the state that is not derived from the body is
+            // taken from the row as it is now rather than written back from the
+            // old snapshot. Publishing must not recreate a deleted row or
+            // resurrect one the user hid, and bytes fetched from another copy
+            // must not be attached to this row.
+            let current =
+                current_publish_target(db, &message_id, &account_id, expected_identity.as_deref())?;
+            parsed_stored.summary.seen = current.summary.seen;
+            parsed_stored.summary.flagged = current.summary.flagged;
+            parsed_stored.summary.answered = current.summary.answered;
+            parsed_stored.summary.forwarded = current.summary.forwarded;
+            parsed_stored.summary.folder_id = current.summary.folder_id.clone();
+            parsed_stored.summary.is_draft = current.summary.is_draft;
+            parsed_stored.is_deleted_local = current.is_deleted_local;
+            parsed_stored.labels = current.labels.clone();
+            let thread_account = parsed_stored.summary.account_id.clone();
+            let folder_id = parsed_stored.summary.folder_id.clone();
+            crate::sync::messages::resolve_thread_id(db, &thread_account, &mut parsed_stored)?;
             repo::messages::upsert(db, &parsed_stored)?;
             crate::sync::messages::reconcile_threads(
                 db,
-                &account_id,
+                &thread_account,
                 &parsed_stored.summary.thread_id,
                 parsed_stored.message_id_header.as_deref(),
             )?;
-            repo::messages::set_body(db, &message_id, Some(&path_string), Some(&text_for_fts))?;
+            repo::messages::set_body(
+                db,
+                &message_id,
+                Some(&path_string),
+                Some(&text_for_fts),
+                expected_identity.as_deref(),
+            )?;
             repo::messages::update_preview(db, &message_id, &preview)?;
             repo::attachments::replace_for_message(db, &message_id, &attachments)?;
             repo::folders::recompute_counts(db, &folder_id)
         })
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    use nuncio_core::models::{Folder, FolderRole, MessageAction, MessageSummary};
+
+    /// A POP3 account with a single message row. The local test account is
+    /// retargeted to POP3 and its Trash role is removed, so deleting a message
+    /// hides it locally (`is_deleted_local`) instead of moving it.
+    async fn pop3_message() -> (CoreContext, StoredMessage) {
+        let root = std::env::temp_dir().join(format!(
+            "pop3-body-publish-{}",
+            nuncio_core::models::new_id()
+        ));
+        let ctx = CoreContext::for_test(nuncio_core::Paths::new(root))
+            .await
+            .expect("ctx");
+        let snapshot = ctx
+            .db
+            .write(|db| {
+                db.execute(
+                    "UPDATE account SET provider = 'pop3' WHERE id = 'local'",
+                    [],
+                )?;
+                db.execute(
+                    "UPDATE folder SET role = 'other'
+                      WHERE account_id = 'local' AND role = 'trash'",
+                    [],
+                )?;
+                repo::folders::insert(
+                    db,
+                    &Folder::new("pop3-inbox", "local", "Inbox", FolderRole::Inbox),
+                )?;
+                let summary = MessageSummary::new(
+                    "pop3-message",
+                    "local",
+                    "pop3-inbox",
+                    "pop3-thread",
+                    Utc::now(),
+                );
+                let mut stored = StoredMessage::new(summary);
+                stored.uid = Some(1);
+                repo::messages::upsert(db, &stored)?;
+                Ok(stored)
+            })
+            .await
+            .expect("seed POP3 message");
+        (ctx, snapshot)
+    }
+
+    const RAW: &[u8] = b"From: a@example.com\r\nTo: b@example.com\r\nSubject: POP3\r\n\
+Message-ID: <pop3-publish@test>\r\n\r\nDownloaded body\r\n";
+
+    /// The user deletes the message (a local hide, because the account has no
+    /// Trash) while its body is being downloaded. The late publisher must carry
+    /// the live row's delete state instead of writing its pre-download
+    /// snapshot back.
+    #[tokio::test]
+    async fn late_body_publish_keeps_a_delete_that_landed_meanwhile() {
+        let (ctx, snapshot) = pop3_message().await;
+        let service = crate::MailService::new(ctx.clone());
+        service
+            .message_act(
+                std::slice::from_ref(&snapshot.summary.id),
+                &MessageAction::Delete { permanent: false },
+            )
+            .await
+            .expect("delete");
+        assert!(
+            ctx.db
+                .read(|db| repo::messages::get_required(db, "pop3-message"))
+                .await
+                .expect("row")
+                .is_deleted_local
+        );
+
+        let identity = repo::messages::body_identity_key(&snapshot);
+        let path = ctx.paths.mime_path("local", "pop3-message");
+        store_parsed_body(&ctx, snapshot, path, RAW, identity)
+            .await
+            .expect("publish body");
+
+        let current = ctx
+            .db
+            .read(|db| repo::messages::get_required(db, "pop3-message"))
+            .await
+            .expect("row");
+        assert!(
+            current.is_deleted_local,
+            "the late publisher resurrected a message the user deleted"
+        );
+        assert!(
+            current.body_path.is_some(),
+            "the body should still be cached for the hidden row"
+        );
+    }
+
+    /// A sync rebinds the row while the body is in flight. The bytes belong to
+    /// the old copy, so the publisher must refuse instead of attaching them to
+    /// the new identity.
+    #[tokio::test]
+    async fn late_body_publish_rejects_a_row_rebound_meanwhile() {
+        let (ctx, snapshot) = pop3_message().await;
+        let identity = repo::messages::body_identity_key(&snapshot);
+        ctx.db
+            .write(|db| repo::messages::set_uid_identity(db, "pop3-message", Some(2), None))
+            .await
+            .expect("rebind");
+
+        let path = ctx.paths.mime_path("local", "pop3-message");
+        let result = store_parsed_body(&ctx, snapshot, path, RAW, identity).await;
+        assert!(
+            result.is_err(),
+            "a body fetched from another copy must not be published"
+        );
+        let current = ctx
+            .db
+            .read(|db| repo::messages::get_required(db, "pop3-message"))
+            .await
+            .expect("row");
+        assert!(current.body_path.is_none());
+        assert_eq!(current.uid, Some(2));
+    }
 }

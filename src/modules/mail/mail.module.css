@@ -83,11 +83,7 @@
   box-shadow: inset 3px 0 0 var(--accent);
 }
 
-.folderRowDrop {
-  background: var(--accent-subtle-hover);
-  outline: 1px dashed var(--accent-border);
-  outline-offset: -1px;
-}
+
 
 .folderRowMuted {
   color: var(--text-tertiary);
@@ -296,25 +292,6 @@
 .searchRow > *:first-child {
   flex: 1;
   min-width: 0;
-}
-
-.batchBar {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-1);
-  min-height: var(--control-height);
-  padding: 2px var(--sp-1);
-  border-radius: var(--radius-m);
-  background: var(--accent-subtle);
-}
-
-.batchCount {
-  /* Pinned to the right edge of the action row. */
-  margin-left: auto;
-  padding: 0 var(--sp-2);
-  font-size: var(--font-caption);
-  font-weight: var(--weight-semibold);
-  white-space: nowrap;
 }
 
 .advancedPanel {
@@ -638,6 +615,31 @@
 
 .rowIconFlag {
   color: var(--accent);
+}
+
+/* Draft sync is not a transient spinner: the state is durable and the user
+   can resolve it from the message menu ("keep local draft"). */
+.draftSyncPending,
+.draftSyncLocalOnly {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex: none;
+  padding: 0 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  line-height: 16px;
+  white-space: nowrap;
+}
+
+.draftSyncPending {
+  color: var(--warning-text, var(--text-secondary));
+  background: var(--warning-bg, rgba(234, 179, 8, 0.16));
+}
+
+.draftSyncLocalOnly {
+  color: var(--text-tertiary);
+  background: var(--surface-secondary, rgba(127, 127, 127, 0.12));
 }
 
 .rowSpacer {

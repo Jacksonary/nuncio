@@ -144,8 +144,9 @@ pub fn decode_preview_part(
         .map(str::to_ascii_lowercase)
         .as_deref()
     {
-        Some("base64") => mail_parser::decoders::base64::base64_decode(bytes)
-            .unwrap_or_else(|| bytes.to_vec()),
+        Some("base64") => {
+            mail_parser::decoders::base64::base64_decode(bytes).unwrap_or_else(|| bytes.to_vec())
+        }
         Some("quoted-printable") => {
             mail_parser::decoders::quoted_printable::quoted_printable_decode(bytes)
                 .unwrap_or_else(|| bytes.to_vec())
@@ -239,11 +240,7 @@ mod tests {
 
     #[test]
     fn strips_html_markup_from_previews() {
-        let text = decode_preview_part(
-            b"<p>Hello <b>there</b></p>",
-            None,
-            None,
-        );
+        let text = decode_preview_part(b"<p>Hello <b>there</b></p>", None, None);
         assert!(text.contains("Hello"), "got {text:?}");
         assert!(!text.contains("<p>"), "got {text:?}");
     }

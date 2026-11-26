@@ -14,7 +14,7 @@ use crate::contacts::provider::{
     ContactCursor, ContactDelta, ContactProvider, RemoteAddressBook, RemoteContact,
     RemoteContactRef, RemoteWriteResult,
 };
-use crate::dav::{DavClient, DavKind};
+use crate::dav::{href_key, DavClient, DavKind};
 use crate::error::{invalid, AppError, Result};
 use crate::http::HttpClient;
 use crate::provider::CalendarCursor;
@@ -24,6 +24,26 @@ const VCARD_TYPE: &str = "text/vcard; charset=utf-8";
 #[derive(Clone)]
 pub struct CardDavProvider {
     http: HttpClient,
+}
+
+/// Remote identity of one CardDAV object.
+///
+/// A vCard with a UID is identified by it. Without a UID the resource href is
+/// the only identity, so the id is derived from the href's **normalized** form
+/// ([`href_key`]): `A.vcf` and `%41.vcf` are the same resource and must produce
+/// the same id. Deriving from the raw spelling makes an equivalent re-delivery
+/// look like a different vCard, which bypasses a delete tombstone recorded for
+/// the previous spelling and re-imports the deleted contact.
+pub(crate) fn contact_remote_id(uid: &str, href: &str) -> String {
+    if uid.trim().is_empty() {
+        href_key(href)
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    } else {
+        uid.to_string()
+    }
 }
 
 impl std::fmt::Debug for CardDavProvider {
@@ -90,16 +110,7 @@ impl ContactProvider for CardDavProvider {
                 debug!(href = %resource.href, "CardDAV resource has no vCard");
                 continue;
             };
-            let remote_id = if first.uid.trim().is_empty() {
-                resource
-                    .href
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or_default()
-                    .to_string()
-            } else {
-                first.uid.clone()
-            };
+            let remote_id = contact_remote_id(&first.uid, &resource.href);
             let mut contact = first.contact;
             contact.photo = sanitize_photo(contact.photo);
             if contact.display_name.trim().is_empty() {
@@ -110,6 +121,7 @@ impl ContactProvider for CardDavProvider {
             contacts.push(RemoteContact {
                 contact,
                 remote_id: Some(remote_id),
+                uid_is_derived: first.uid.trim().is_empty(),
                 href: Some(resource.href),
                 etag: resource.etag,
                 raw_vcard: Some(resource.data),
@@ -120,12 +132,15 @@ impl ContactProvider for CardDavProvider {
             contacts,
             deleted_remote_ids: Vec::new(),
             deleted_hrefs: delta.deleted_hrefs,
+            listed_hrefs: delta.listed_hrefs,
             groups: Vec::new(),
             groups_full: false,
             favorites_authoritative: false,
             sync_token: delta.sync_token,
             ctag: delta.ctag,
             full_sync: delta.full_sync,
+            incomplete: delta.incomplete,
+            window_start: None,
         })
     }
 
@@ -151,6 +166,8 @@ impl ContactProvider for CardDavProvider {
             remote_id: Some(uid),
             etag,
             href: Some(url),
+            // The written vCard carries the id as its UID.
+            uid_is_derived: false,
         })
     }
 
@@ -161,18 +178,43 @@ impl ContactProvider for CardDavProvider {
         current: &RemoteContactRef,
         contact: &Contact,
         group_names: &[String],
+        assigned_uid: Option<&str>,
     ) -> Result<RemoteWriteResult> {
         let client = self.client(account);
-        let uid = current
-            .remote_id
-            .clone()
-            .ok_or_else(|| AppError::conflict("CardDAV contact has no UID"))?;
+        // A card without a UID is identified locally by the placeholder derived
+        // from its href (`A.vcf`). RFC 6352 §5.1 still requires every address
+        // object written to a CardDAV resource to carry a UID, and §5.1/§6.3.2
+        // require that UID to be unique inside the address book. Writing the
+        // placeholder back would therefore collide with a genuine UID spelled
+        // the same way and be rejected with `403 no-uid-conflict`.
+        //
+        // A rewrite of a derived card is the point at which it gains a real
+        // identity: the service allocates a UID, persists it on the operation
+        // payload, and passes it here (so retries reuse it). Once the PUT
+        // succeeds the card is addressed by that UID from then on; the derived
+        // kind is not preserved.
+        let derived = current.uid_is_derived;
+        let uid = if derived {
+            assigned_uid
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(nuncio_core::models::new_id)
+        } else {
+            current
+                .remote_id
+                .clone()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| AppError::conflict("CardDAV contact has no UID"))?
+        };
+        // The resource path is never rewritten by the identity upgrade: an
+        // existing href addresses the same object. Only a derived card with no
+        // href falls back to a UID-derived path.
         let url = current
             .href
             .clone()
             .unwrap_or_else(|| DavClient::resource_url_for(collection_url(book), &uid, "vcf"));
         let mut outbound = contact.clone();
-        // The vCard UID must stay stable across updates.
         outbound.id = uid.clone();
         let body = nuncio_ical::vcard::write_vcard(&outbound, group_names);
         let etag = client
@@ -182,6 +224,8 @@ impl ContactProvider for CardDavProvider {
             remote_id: Some(uid),
             etag,
             href: Some(url),
+            // The written vCard always carries a real UID now.
+            uid_is_derived: false,
         })
     }
 

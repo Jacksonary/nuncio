@@ -1,0 +1,11 @@
+-- Message-level revision for flag-field writes.
+--
+-- `message_flag_writer` only holds the current owner of each field. Undoing an
+-- action with no predecessor deletes the row, so a reader that observed "no
+-- writer" (for example auto mark-as-read while a body loads) would observe
+-- "no writer" again after the undo restored the value, and could overwrite it.
+--
+-- Every writer mutation stamps this revision (from the same monotonic counter
+-- as `flag_writer_seq`), including the delete, so "nothing changed" and
+-- "changed and then cleared back to no writer" stay distinguishable.
+ALTER TABLE message ADD COLUMN flag_revision INTEGER NOT NULL DEFAULT 0;

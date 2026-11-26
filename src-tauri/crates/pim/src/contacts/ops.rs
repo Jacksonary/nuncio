@@ -27,6 +27,11 @@ pub struct ContactSnapshot {
     pub remote_id: Option<String>,
     pub href: Option<String>,
     pub raw_vcard: Option<String>,
+    /// `remote_id` was derived from the href rather than being a real provider
+    /// UID. A snapshot written by an older build defaults to a real UID, the
+    /// same rule the tombstone/receipt columns use.
+    #[serde(default)]
+    pub uid_is_derived: bool,
 }
 
 impl ContactSnapshot {
@@ -37,6 +42,7 @@ impl ContactSnapshot {
             remote_id: None,
             href: None,
             raw_vcard: None,
+            uid_is_derived: false,
         }
     }
 }
@@ -58,6 +64,15 @@ pub enum ContactOp {
     /// metadata, otherwise as a create.
     Save {
         contact_id: String,
+        /// A real provider UID assigned to a card whose local identity was
+        /// derived from its href (`uid_is_derived`).
+        ///
+        /// Generated and persisted **before** the first wire attempt so a
+        /// retry reuses the same value instead of writing a different UID on
+        /// every attempt. `None` until the executor needs one (and forever for
+        /// cards that already carry a real UID).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        assigned_uid: Option<String>,
         /// `None` for a create (rollback deletes the row).
         snapshot: Option<ContactSnapshot>,
     },
@@ -133,6 +148,7 @@ mod tests {
         contact.display_name = "Ada".into();
         let op = ContactOp::Save {
             contact_id: "c1".into(),
+            assigned_uid: None,
             snapshot: None,
         };
         let value = to_value(&op).unwrap();

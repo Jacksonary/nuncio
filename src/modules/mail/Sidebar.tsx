@@ -55,7 +55,6 @@ import { t, useT } from "@/lib/i18n";
 import { queryKeys } from "@/lib/queryKeys";
 import { useShellStore } from "@/lib/store";
 import { useMessageActions, messageActionToast } from "./actions";
-import { hasMessageDragData, readMessageDragData } from "./dnd";
 import {
   aggregateUnread,
   flattenFolderTree,
@@ -139,9 +138,6 @@ interface FolderRowProps {
   onToggle: (id: string) => void;
   onSelect: (folder: Folder) => void;
   onContextMenu: (folder: Folder, point: { x: number; y: number }) => void;
-  onDropMessages: (folder: Folder, ids: string[]) => void;
-  dragOverId: string | null;
-  setDragOverId: (id: string | null) => void;
 }
 
 function FolderRow({
@@ -153,15 +149,11 @@ function FolderRow({
   onToggle,
   onSelect,
   onContextMenu,
-  onDropMessages,
-  dragOverId,
-  setDragOverId,
 }: FolderRowProps) {
   const { folder } = node;
   const open = expanded.has(folder.id);
   const hasChildren = node.children.length > 0;
   const selected = selectedId === folder.id;
-  const dropActive = dragOverId === folder.id;
   // A `\Noselect` node is a grouping container (`[Gmail]`, Proton's `Folders`).
   // Selecting it would ask the server for a mailbox it refuses to open, so the
   // row only toggles its children.
@@ -177,7 +169,6 @@ function FolderRow({
         className={[
           styles.folderRow,
           selected ? styles.folderRowSelected : "",
-          dropActive ? styles.folderRowDrop : "",
           !folder.syncEnabled ? styles.folderRowMuted : "",
         ]
           .filter(Boolean)
@@ -208,22 +199,6 @@ function FolderRow({
         onContextMenu={(event) => {
           event.preventDefault();
           onContextMenu(folder, { x: event.clientX, y: event.clientY });
-        }}
-        onDragOver={(event) => {
-          if (!folder.isSelectable || !hasMessageDragData(event.dataTransfer)) return;
-          event.preventDefault();
-          event.dataTransfer.dropEffect = "move";
-          setDragOverId(folder.id);
-        }}
-        onDragLeave={() => {
-          if (dragOverId === folder.id) setDragOverId(null);
-        }}
-        onDrop={(event) => {
-          if (!folder.isSelectable || !hasMessageDragData(event.dataTransfer)) return;
-          event.preventDefault();
-          setDragOverId(null);
-          const ids = readMessageDragData(event.dataTransfer);
-          if (ids.length > 0) onDropMessages(folder, ids);
         }}
       >
         <button
@@ -279,9 +254,6 @@ function FolderRow({
               onToggle={onToggle}
               onSelect={onSelect}
               onContextMenu={onContextMenu}
-              onDropMessages={onDropMessages}
-              dragOverId={dragOverId}
-              setDragOverId={setDragOverId}
             />
           ))
         : null}
@@ -311,7 +283,6 @@ export function MailSidebar() {
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
   const [moreAccounts, setMoreAccounts] = useState<Set<string>>(new Set());
   const [unifiedOpen, setUnifiedOpen] = useState(true);
-  const [dragOverId, setDragOverId] = useState<string | null>(null);
   const [menu, setMenu] = useState<{
     folder: Folder;
     point: { x: number; y: number };
@@ -446,7 +417,6 @@ export function MailSidebar() {
       return next;
     });
   }, []);
-
   const toggleAccount = useCallback((id: string) => {
     setExpandedAccounts((previous) => {
       const next = new Set(previous);
@@ -477,6 +447,7 @@ export function MailSidebar() {
     },
     [apply, queryClient],
   );
+
 
   const openCreateDialog = useCallback((accountId: string, parentId: string | null) => {
     setDialogValue("");
@@ -563,8 +534,14 @@ export function MailSidebar() {
       });
       if (!ok) return;
       try {
-        await foldersApi.empty(folder.id);
-        toast.success(tt("mail.sidebar.folderEmptied"));
+        const expunged = await foldersApi.empty(folder.id);
+        if (expunged) {
+          toast.success(tt("mail.sidebar.folderEmptied"));
+        } else {
+          // Without UIDPLUS/IMAP4rev2 the backend refuses instead of flagging
+          // every message `\Deleted`: nothing was removed, so say so.
+          toast.info(tt("mail.sidebar.emptyFolderUnsupported"));
+        }
         invalidateMail();
       } catch (error) {
         toast.error(tt("mail.toast.actionFailed"), errorText(error));
@@ -788,15 +765,18 @@ export function MailSidebar() {
               shows that number. An aggregate across inbox + flagged + drafts
               would mix unread with total metrics and count flagged drafts
               twice, so the parent intentionally carries no badge. */}
+          {/* Only highlighted while collapsed: expanded, the 收件箱 child is
+              the row that carries the selection, and marking both left two
+              rows looking selected at once. */}
           <div
             className={[
               styles.unifiedRow,
-              currentUnifiedRole === "inbox" ? styles.folderRowSelected : "",
+              currentUnifiedRole === "inbox" && !unifiedOpen ? styles.folderRowSelected : "",
             ]
               .filter(Boolean)
               .join(" ")}
             role="treeitem"
-            aria-selected={currentUnifiedRole === "inbox"}
+            aria-selected={currentUnifiedRole === "inbox" && !unifiedOpen}
           >
             <button
               type="button"
@@ -995,9 +975,6 @@ export function MailSidebar() {
                     onToggle={toggleFolder}
                     onSelect={(folder) => selectFolder(folder, null)}
                     onContextMenu={(folder, point) => setMenu({ folder, point })}
-                    onDropMessages={(folder, ids) => void handleDropMessages(folder, ids)}
-                    dragOverId={dragOverId}
-                    setDragOverId={setDragOverId}
                   />
                 ))}
                 {secondary.length > 0 ? (
@@ -1045,9 +1022,6 @@ export function MailSidebar() {
                         onToggle={toggleFolder}
                         onSelect={(folder) => selectFolder(folder, null)}
                         onContextMenu={(folder, point) => setMenu({ folder, point })}
-                        onDropMessages={(folder, ids) => void handleDropMessages(folder, ids)}
-                        dragOverId={dragOverId}
-                        setDragOverId={setDragOverId}
                       />
                     ))
                   : null}

@@ -72,6 +72,8 @@ export const mail: {
     "mail.sidebar.deleteFolderMessage": "确定要删除“{name}”及其中的邮件吗？此操作无法撤销。",
     "mail.sidebar.emptyFolderTitle": "清空文件夹",
     "mail.sidebar.emptyFolderMessage": "确定要永久删除“{name}”中的全部邮件吗？",
+    "mail.sidebar.emptyFolderUnsupported":
+      "服务器不支持安全清空文件夹（需要 UIDPLUS 或 IMAP4rev2），未删除任何邮件。",
 
     /* List */
     "mail.list.title": "邮件列表",
@@ -131,6 +133,10 @@ export const mail: {
     "mail.list.answered": "已回复",
     "mail.list.forwarded": "已转发",
     "mail.list.draft": "草稿",
+    "mail.list.draftSyncPending": "同步待确认",
+    "mail.list.draftSyncPendingHint": "草稿已保存在本地，远端副本尚未确认。可继续等待，或保留本地草稿并停止重试。",
+    "mail.list.draftSyncLocalOnly": "仅本地",
+    "mail.list.draftSyncLocalOnlyHint": "已停止同步此草稿；不会自动删除任何远端邮件。",
     "mail.list.importanceHigh": "高重要性",
     "mail.list.threadExpand": "展开 {count} 封会话",
     "mail.list.threadCollapse": "收起会话",
@@ -172,6 +178,7 @@ export const mail: {
     "mail.action.markJunk": "标为垃圾邮件",
     "mail.action.more": "更多",
     "mail.action.openDraft": "打开草稿",
+    "mail.action.keepLocalDraft": "保留本地草稿",
     "mail.action.print": "打印",
     "mail.action.saveAs": "另存为 .eml",
     "mail.action.saveAsFilter": "邮件文件",
@@ -321,6 +328,8 @@ export const mail: {
     "mail.createTask.date": "日期",
     "mail.toast.savedEml": "邮件已另存为 .eml",
     "mail.toast.saveFailed": "保存失败",
+    "mail.toast.keepLocalDraft": "已停止同步，草稿保留在本地",
+    "mail.toast.keepLocalDraftFailed": "无法保留本地草稿",
 
     /* Windows */
     "mail.window.composeError": "无法打开撰写窗口",
@@ -394,6 +403,8 @@ export const mail: {
     "mail.sidebar.deleteFolderMessage": "Delete “{name}” and the messages inside it? This cannot be undone.",
     "mail.sidebar.emptyFolderTitle": "Empty folder",
     "mail.sidebar.emptyFolderMessage": "Permanently delete every message in “{name}”?",
+    "mail.sidebar.emptyFolderUnsupported":
+      "This server does not support safely emptying a folder (UIDPLUS or IMAP4rev2 is required); no messages were deleted.",
 
     /* List */
     "mail.list.title": "Message list",
@@ -453,6 +464,10 @@ export const mail: {
     "mail.list.answered": "Replied",
     "mail.list.forwarded": "Forwarded",
     "mail.list.draft": "Draft",
+    "mail.list.draftSyncPending": "Sync pending",
+    "mail.list.draftSyncPendingHint": "The draft is saved locally but its remote copy is not confirmed. You can keep waiting, or keep the local draft and stop retrying.",
+    "mail.list.draftSyncLocalOnly": "Local only",
+    "mail.list.draftSyncLocalOnlyHint": "Sync is stopped for this draft. Nothing remote is deleted automatically.",
     "mail.list.importanceHigh": "High importance",
     "mail.list.threadExpand": "Expand conversation ({count})",
     "mail.list.threadCollapse": "Collapse conversation",
@@ -494,6 +509,7 @@ export const mail: {
     "mail.action.markJunk": "Mark as junk",
     "mail.action.more": "More",
     "mail.action.openDraft": "Open draft",
+    "mail.action.keepLocalDraft": "Keep local draft",
     "mail.action.print": "Print",
     "mail.action.saveAs": "Save as .eml",
     "mail.action.saveAsFilter": "E-mail files",
@@ -643,6 +659,8 @@ export const mail: {
     "mail.createTask.date": "Date",
     "mail.toast.savedEml": "Message saved as .eml",
     "mail.toast.saveFailed": "Could not save",
+    "mail.toast.keepLocalDraft": "Sync stopped; the draft is kept locally",
+    "mail.toast.keepLocalDraftFailed": "Could not keep the local draft",
 
     /* Windows */
     "mail.window.composeError": "Could not open the composer",

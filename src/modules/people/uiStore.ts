@@ -27,6 +27,8 @@ interface PeopleUiState {
   importOpen: boolean;
   /** Incremented by the search hotkey; Main focuses the search box. */
   focusSearchRequest: number;
+  /** Incremented by the select-all hotkey; the list selects every visible row. */
+  selectAllRequest: number;
   /**
    * Raised by the Delete hotkey. The ids are captured at that moment; the list
    * consumes the request when it reads it, so cancelling the confirmation
@@ -46,6 +48,7 @@ interface PeopleUiState {
   closeEditor: () => void;
   setImportOpen: (open: boolean) => void;
   requestSearchFocus: () => void;
+  requestSelectAll: () => void;
   requestDelete: (fallbackId?: Id | null) => void;
   /** Read and clear the pending delete command (one-shot semantics). */
   consumeDeleteRequest: () => ContactDeleteRequest | null;
@@ -60,6 +63,7 @@ export const usePeopleUiStore = create<PeopleUiState>()((set, get) => ({
   editor: null,
   importOpen: false,
   focusSearchRequest: 0,
+  selectAllRequest: 0,
   deleteRequest: null,
 
   setFavoritesOnly: (value) => set({ favoritesOnly: value }),
@@ -81,6 +85,8 @@ export const usePeopleUiStore = create<PeopleUiState>()((set, get) => ({
   setImportOpen: (open) => set({ importOpen: open }),
   requestSearchFocus: () =>
     set((state) => ({ focusSearchRequest: state.focusSearchRequest + 1 })),
+  requestSelectAll: () =>
+    set((state) => ({ selectAllRequest: state.selectAllRequest + 1 })),
   requestDelete: (fallbackId) =>
     set((state) => {
       const ids =

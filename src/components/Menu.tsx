@@ -316,6 +316,7 @@ export function Menu({
       role="menu"
       ariaLabel={ariaLabel ?? t("common.menu")}
       className={cn(styles.menu, className)}
+      dismissOnAnyClick
     >
       <MenuLevel items={items} onClose={onClose} autoFocus />
     </Popover>

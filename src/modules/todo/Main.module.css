@@ -93,6 +93,8 @@
   max-width: 40%;
 }
 
+/* Borderless like the task rows below it: the quick-add line is part of the
+   list, not a boxed control sitting on top of it. */
 .addRow {
   flex: none;
   display: flex;
@@ -101,21 +103,13 @@
   min-height: 40px;
   margin: 0 var(--sp-4) var(--sp-2);
   padding: 0 var(--sp-3);
-  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-m);
-  background: var(--surface-alt);
-  transition:
-    border-color var(--duration-fast) var(--ease),
-    background-color var(--duration-fast) var(--ease);
+  transition: background-color var(--duration-fast) var(--ease);
 }
 
-.addRow:hover {
-  background: var(--surface);
-}
-
+.addRow:hover,
 .addRow:focus-within {
-  border-color: var(--accent-border);
-  background: var(--surface-solid);
+  background: var(--surface-hover);
 }
 
 .addIcon {
@@ -137,6 +131,13 @@
 
 .addInput::placeholder {
   color: var(--text-tertiary);
+}
+
+/* The global `:focus-visible` ring is emitted after the module CSS, so this
+   needs its own rule: the row background is the focus indicator, a second blue
+   rectangle around the text was the double box. */
+.addInput:focus-visible {
+  outline: none;
 }
 
 .addInput:disabled {

@@ -1,0 +1,18 @@
+.bulkBar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  min-height: var(--control-height);
+  padding: 2px var(--sp-1);
+  border-radius: var(--radius-m);
+  background: var(--accent-subtle);
+}
+
+.count {
+  /* Pinned to the right edge, just before the optional clear button. */
+  margin-left: auto;
+  padding: 0 var(--sp-2);
+  font-size: var(--font-caption);
+  font-weight: var(--weight-semibold);
+  white-space: nowrap;
+}

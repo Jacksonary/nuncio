@@ -32,6 +32,24 @@ impl Paths {
 
     /// `mime/<account>/<2-char>/<hash>.eml`
     pub fn mime_path(&self, account_id: &str, hash: &str) -> PathBuf {
+        self.mime_dir(account_id, hash)
+            .join(format!("{}.eml", sanitize_component(hash)))
+    }
+
+    /// `mime/<account>/<2-char>/<hash>-<version>.eml`
+    ///
+    /// The version names the exact bytes and the provider copy they came from,
+    /// so a fetch for another version never overwrites a file a reader may
+    /// still be using. Only the row whose `body_path` names this file may treat
+    /// its bytes as its own.
+    pub fn mime_versioned_path(&self, account_id: &str, hash: &str, version: &str) -> PathBuf {
+        let hash = sanitize_component(hash);
+        let version = sanitize_component(version);
+        self.mime_dir(account_id, &hash)
+            .join(format!("{hash}-{version}.eml"))
+    }
+
+    fn mime_dir(&self, account_id: &str, hash: &str) -> PathBuf {
         let account = sanitize_component(account_id);
         let hash = sanitize_component(hash);
         let prefix: String = hash.chars().take(2).collect::<String>().to_lowercase();
@@ -40,11 +58,7 @@ impl Paths {
         } else {
             prefix
         };
-        self.root
-            .join("mime")
-            .join(account)
-            .join(prefix)
-            .join(format!("{hash}.eml"))
+        self.root.join("mime").join(account).join(prefix)
     }
 
     pub fn mime_root(&self) -> PathBuf {
@@ -190,6 +204,16 @@ mod tests {
         assert_eq!(
             paths.mime_path("acc-1", "AB12cd"),
             PathBuf::from("/data/nuncio/mime/acc-1/ab/AB12cd.eml")
+        );
+        // A versioned cache file is a distinct path per content/source, so a
+        // fetch for another copy can never overwrite the one a reader holds.
+        assert_eq!(
+            paths.mime_versioned_path("acc-1", "AB12cd", "deadbeefdeadbeef"),
+            PathBuf::from("/data/nuncio/mime/acc-1/ab/AB12cd-deadbeefdeadbeef.eml")
+        );
+        assert_ne!(
+            paths.mime_versioned_path("acc-1", "AB12cd", "aaaaaaaaaaaaaaaa"),
+            paths.mime_versioned_path("acc-1", "AB12cd", "bbbbbbbbbbbbbbbb")
         );
         assert_eq!(
             paths.attachment_path("msg-1", "../../evil.exe"),

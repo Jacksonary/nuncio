@@ -212,10 +212,26 @@ pub struct DavProp {
 #[derive(Debug, Clone, Default)]
 pub struct DavResponse {
     pub href: String,
+    /// Response-level (outside `propstat`) status, when the server sent one.
     pub status: Option<u16>,
     pub prop: DavProp,
+    /// At least one status (response-level or `propstat`) reports `404`.
     pub not_found: bool,
+    /// At least one status is 2xx, or the response carried no status at all
+    /// (in which case `200 OK` is implied).
     pub ok: bool,
+}
+
+impl DavResponse {
+    /// Whether this response proves the resource itself does not exist.
+    ///
+    /// Only a response-level `404` is definitive. A `404` inside a `propstat`
+    /// means those properties are unavailable, not that the resource is gone:
+    /// a server can answer `address-data` with `404` on an object that still
+    /// exists. Treating that as a deletion would destroy local data.
+    pub fn is_missing(&self) -> bool {
+        self.status == Some(404)
+    }
 }
 
 /// Parsed `multistatus`.
@@ -241,7 +257,15 @@ fn prop_from_node(prop: &Node) -> DavProp {
     let mut out = DavProp::default();
     for child in &prop.children {
         match child.name.as_str() {
-            "getetag" => out.etag = Some(child.text.trim().trim_matches('"').to_string()),
+            "getetag" => {
+                // An empty element (for example the property echoed inside a
+                // failed `propstat`) is not an identity; treating it as
+                // `Some("")` would make an unreadable resource look changed.
+                let etag = child.text.trim().trim_matches('"');
+                if !etag.is_empty() {
+                    out.etag = Some(etag.to_string());
+                }
+            }
             "getcontenttype" => out.content_type = Some(child.text.trim().to_string()),
             "calendar-data" | "address-data" => out.data = Some(child.text.clone()),
             "displayname" => out.display_name = Some(child.text.trim().to_string()),
@@ -324,7 +348,8 @@ pub fn parse_multistatus(xml: &str) -> Result<Multistatus> {
             .and_then(|node| status_code(&node.text));
         let mut prop = DavProp::default();
         let mut not_found = direct_status == Some(404);
-        let mut ok = direct_status.is_none_or(|code| (200..300).contains(&code));
+        let mut ok = direct_status.is_some_and(|code| (200..300).contains(&code));
+        let mut saw_status = direct_status.is_some();
         let mut principal = None;
         let mut calendar_home = None;
         let mut addressbook_home = None;
@@ -333,23 +358,34 @@ pub fn parse_multistatus(xml: &str) -> Result<Multistatus> {
             let status = propstat
                 .child("status")
                 .and_then(|node| status_code(&node.text));
-            if status == Some(404) {
-                not_found = true;
-            }
-            if status.is_some_and(|code| (200..300).contains(&code)) {
-                ok = true;
-            }
-            if let Some(prop_node) = propstat.child("prop") {
-                let parsed = prop_from_node(prop_node);
-                merge_prop(&mut prop, parsed);
-                if let Some(node) = prop_node.child("current-user-principal") {
-                    principal = href_of(node);
+            if let Some(code) = status {
+                saw_status = true;
+                if (200..300).contains(&code) {
+                    ok = true;
+                } else if code == 404 {
+                    not_found = true;
                 }
-                if let Some(node) = prop_node.child("calendar-home-set") {
-                    calendar_home = href_of(node);
-                }
-                if let Some(node) = prop_node.child("addressbook-home-set") {
-                    addressbook_home = href_of(node);
+            }
+            // Properties inside a failed `propstat` (for example `404` on
+            // `address-data`) are not a value: they are the server saying the
+            // property could not be returned. Merging them anyway made an
+            // empty element look like a successfully delivered (empty) body,
+            // or overwrote a good value from an earlier `200` propstat. No
+            // status means the server implied `200 OK`.
+            let successful = status.is_none_or(|code| (200..300).contains(&code));
+            if successful {
+                if let Some(prop_node) = propstat.child("prop") {
+                    let parsed = prop_from_node(prop_node);
+                    merge_prop(&mut prop, parsed);
+                    if let Some(node) = prop_node.child("current-user-principal") {
+                        principal = href_of(node);
+                    }
+                    if let Some(node) = prop_node.child("calendar-home-set") {
+                        calendar_home = href_of(node);
+                    }
+                    if let Some(node) = prop_node.child("addressbook-home-set") {
+                        addressbook_home = href_of(node);
+                    }
                 }
             }
         }
@@ -371,7 +407,8 @@ pub fn parse_multistatus(xml: &str) -> Result<Multistatus> {
             status: direct_status,
             prop,
             not_found,
-            ok,
+            // No status anywhere means the server implied `200 OK`.
+            ok: ok || !saw_status,
         });
     }
     Ok(out)

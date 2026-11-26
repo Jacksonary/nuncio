@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use rusqlite::{params, Connection, Row};
+use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use crate::error::AppError;
 use crate::models::{Folder, FolderRole, FolderTree, UnifiedCounts};
@@ -408,6 +408,19 @@ pub fn set_sync_flags(
     Ok(())
 }
 
+/// UIDVALIDITY generation the folder was last synced with. Used to decide
+/// whether a restored UID still addresses the same message.
+pub fn uidvalidity(conn: &Connection, id: &str) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT uidvalidity FROM folder WHERE id = ?1",
+            params![id],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()?
+        .flatten())
+}
+
 pub fn set_last_sync_at(
     conn: &Connection,
     id: &str,
@@ -586,13 +599,8 @@ mod tests {
                 &Folder::new("f-trash", "local", "Trash", FolderRole::Trash),
             )?;
 
-            let mut summary = MessageSummary::new(
-                "m1",
-                "local",
-                &drafts.id,
-                "thread:m1",
-                crate::models::now(),
-            );
+            let mut summary =
+                MessageSummary::new("m1", "local", &drafts.id, "thread:m1", crate::models::now());
             summary.seen = true;
             summary.is_draft = true;
             crate::repo::messages::upsert(conn, &StoredMessage::new(summary))?;
@@ -600,16 +608,20 @@ mod tests {
 
             // Migrating between two Drafts-role folders keeps the flag.
             crate::repo::messages::move_to_folder(conn, &["m1".to_string()], &other_drafts.id)?;
-            assert!(crate::repo::messages::get_required(conn, "m1")?
-                .summary
-                .is_draft);
+            assert!(
+                crate::repo::messages::get_required(conn, "m1")?
+                    .summary
+                    .is_draft
+            );
             assert_eq!(unified_counts(conn)?.drafts, 1);
 
             // Leaving Drafts for Trash clears it, and the unified badge follows.
             crate::repo::messages::move_to_folder(conn, &["m1".to_string()], &trash.id)?;
-            assert!(!crate::repo::messages::get_required(conn, "m1")?
-                .summary
-                .is_draft);
+            assert!(
+                !crate::repo::messages::get_required(conn, "m1")?
+                    .summary
+                    .is_draft
+            );
             assert_eq!(unified_counts(conn)?.drafts, 0);
             Ok(())
         })

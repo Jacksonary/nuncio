@@ -415,6 +415,54 @@ fn header_row(
     stored
 }
 
+/// Whether a header/body write may (re)use an existing row.
+///
+/// POP3 rows are identified by the deterministic id derived from their UIDL, so
+/// the message number (`uid`) may legitimately change between sessions and is
+/// not treated as an identity here. Everything that belongs to a *newer local
+/// action* is: a different folder (the user moved the row), a soft/permanent
+/// delete, or an in-flight move/reconcile projection. The upsert writes
+/// `folder_id`, `uid`, `target_pending` and the owner columns, so writing over
+/// any of those would revert that action. Returns `true` when the row is either
+/// absent or still the untouched copy this sync stored.
+fn may_publish_row(
+    existing: Option<&StoredMessage>,
+    incoming: &StoredMessage,
+    owner: Option<repo::messages::ProjectionOwner>,
+    pending: bool,
+) -> bool {
+    let Some(existing) = existing else {
+        return true;
+    };
+    existing.summary.account_id == incoming.summary.account_id
+        && existing.summary.folder_id == incoming.summary.folder_id
+        && !existing.is_deleted_local
+        && owner.is_none()
+        && !pending
+}
+
+/// Re-check an existing POP3 row inside the caller's write transaction.
+///
+/// A sync may have been running while the user moved, deleted or re-queued the
+/// row; the in-flight header/body write must then be refused instead of
+/// reverting that newer local state.
+fn check_publish_row(db: &rusqlite::Connection, incoming: &StoredMessage) -> Result<bool> {
+    let existing = repo::messages::get(db, &incoming.summary.id)?;
+    if existing.is_none() {
+        return Ok(true);
+    }
+    let owner = repo::messages::projection_owner(db, &incoming.summary.id)?;
+    let pending = repo::messages::is_pending_projection(db, &incoming.summary.id)?;
+    if may_publish_row(existing.as_ref(), incoming, owner, pending) {
+        return Ok(true);
+    }
+    warn!(
+        message = %incoming.summary.id,
+        "POP3 sync: row changed while it was being stored; refusing to overwrite it"
+    );
+    Ok(false)
+}
+
 /// Store a headers-only row (the normal listing path).
 async fn store_headers(
     ctx: &CoreContext,
@@ -431,7 +479,9 @@ async fn store_headers(
     let folder_id = folder.id.clone();
     ctx.db
         .write(move |db| {
-            repo::messages::upsert(db, &stored)?;
+            if check_publish_row(db, &stored)? {
+                repo::messages::upsert(db, &stored)?;
+            }
             repo::folders::recompute_counts(db, &folder_id)
         })
         .await?;
@@ -461,14 +511,14 @@ async fn store_full_message(
     stored.summary.size = raw.len() as u64;
 
     let id = stored.summary.id.clone();
-    let path = ctx.paths.mime_path(&account.id, &id);
-    ctx.paths.ensure_parent(&path)?;
-    let write_path = path.clone();
-    let bytes = raw.to_vec();
-    tokio::task::spawn_blocking(move || std::fs::write(&write_path, &bytes))
-        .await
-        .map_err(|error| AppError::internal(format!("POP3 body write task failed: {error}")))?
-        .map_err(|error| AppError::io(format!("cannot cache POP3 message: {error}")))?;
+    // The cache version is bound to the provider key recorded below, so the
+    // same bytes read later can be recomputed and attributed to this copy.
+    let body_identity = repo::messages::body_identity_key(&stored);
+    // Versioned, immutable cache file: a later body refresh writes a different
+    // path instead of overwriting this one.
+    let path =
+        crate::sync::body::cache_body_file(ctx, &account.id, &id, body_identity.as_deref(), raw)
+            .await?;
     let path_string = path.to_string_lossy().to_string();
     stored.body_path = Some(path_string.clone());
     stored.body_cached_at = Some(Utc::now());
@@ -499,10 +549,18 @@ async fn store_full_message(
     let folder_id = folder.id.clone();
     ctx.db
         .write(move |db| {
-            repo::messages::upsert(db, &stored)?;
-            repo::messages::set_body(db, &id, Some(&path_string), Some(&body_text))?;
-            repo::messages::update_preview(db, &id, &preview)?;
-            repo::attachments::replace_for_message(db, &id, &attachments)?;
+            if check_publish_row(db, &stored)? {
+                repo::messages::upsert(db, &stored)?;
+                repo::messages::set_body(
+                    db,
+                    &id,
+                    Some(&path_string),
+                    Some(&body_text),
+                    body_identity.as_deref(),
+                )?;
+                repo::messages::update_preview(db, &id, &preview)?;
+                repo::attachments::replace_for_message(db, &id, &attachments)?;
+            }
             repo::folders::recompute_counts(db, &folder_id)
         })
         .await?;
@@ -586,6 +644,38 @@ mod tests {
         rows.sort_by(|a, b| b.date.cmp(&a.date).then_with(|| b.id.cmp(&a.id)));
         assert_eq!(rows[0].subject, "second");
         assert_eq!(rows[1].subject, "first");
+    }
+
+    /// A re-sent header block must not revert a newer local action: a moved,
+    /// deleted or claimed row keeps its folder/identity/markers.
+    #[test]
+    fn a_newer_local_action_blocks_a_header_write() {
+        let parsed = headers("Subject: x\r\nMessage-ID: <x@y>\r\n\r\n");
+        let incoming = header_row("acc", "folder", "uidl-1", 7, 10, &parsed);
+        let untouched = incoming.clone();
+
+        assert!(may_publish_row(None, &incoming, None, false));
+        assert!(may_publish_row(Some(&untouched), &incoming, None, false));
+
+        let mut moved = untouched.clone();
+        moved.summary.folder_id = "other".into();
+        assert!(!may_publish_row(Some(&moved), &incoming, None, false));
+
+        let mut deleted = untouched.clone();
+        deleted.is_deleted_local = true;
+        assert!(!may_publish_row(Some(&deleted), &incoming, None, false));
+
+        let owner = repo::messages::ProjectionOwner {
+            op_id: "op-new".into(),
+            sequence: Some(2),
+        };
+        assert!(!may_publish_row(
+            Some(&untouched),
+            &incoming,
+            Some(owner),
+            false
+        ));
+        assert!(!may_publish_row(Some(&untouched), &incoming, None, true));
     }
 
     #[test]

@@ -349,7 +349,12 @@ pub async fn send_account_message_within(
                     ))
                 }
             };
-            match tokio::time::timeout_at(deadline, send_raw(config, &refreshed, Some(&from), &recipients, bytes)).await {
+            match tokio::time::timeout_at(
+                deadline,
+                send_raw(config, &refreshed, Some(&from), &recipients, bytes),
+            )
+            .await
+            {
                 Ok(result) => result,
                 Err(_) => Err(AppError::network(
                     "SMTP send exceeded its deadline after re-authenticating",

@@ -220,6 +220,26 @@ pub fn imap_error(error: async_imap::error::Error) -> AppError {
     }
 }
 
+/// Prefix shared by every error emitted when an IMAP command or socket
+/// watchdog expires. Such an error always means the connection was poisoned
+/// (the response stream is half-consumed), so the worker must rebuild it.
+pub const COMMAND_TIMEOUT_MARKER: &str = "IMAP command timeout";
+
+/// `true` when an error was raised by a command or socket timeout.
+///
+/// This is deliberately narrower than "the message contains the word
+/// timeout": connect-phase timeouts (`IMAP connect ... timed out`) also report
+/// a network error but leave no session to invalidate, so treating them as a
+/// lost command would make the worker retry a dial immediately instead of
+/// honouring its backoff.
+pub fn is_command_timeout(error: &AppError) -> bool {
+    if error.code() != "network" {
+        return false;
+    }
+    let message = error.message();
+    message.starts_with(COMMAND_TIMEOUT_MARKER) || message.starts_with("IMAP timeout:")
+}
+
 /// `true` when an error describes a transport-level connection loss rather
 /// than a protocol rejection. Only such errors are retried transparently (and
 /// only for idempotent commands): a stale socket that a server closed while it
@@ -288,6 +308,24 @@ mod tests {
     }
 
     #[test]
+    fn command_timeouts_are_retryable_but_connect_timeouts_are_not() {
+        let command = AppError::network(format!(
+            "{COMMAND_TIMEOUT_MARKER}: SELECT timed out after 30.0s; connection marked unusable"
+        ));
+        assert!(is_command_timeout(&command));
+        // A socket watchdog error is surfaced with this prefix.
+        assert!(is_command_timeout(&AppError::network(
+            "IMAP timeout: IMAP read timeout: no data for 180s; connection abandoned"
+        )));
+        // Connect-phase budgets do not invalidate a session and must keep
+        // their backoff instead of triggering an immediate retry.
+        assert!(!is_command_timeout(&AppError::network(
+            "IMAP connect to example.com timed out after 40s"
+        )));
+        assert!(!is_command_timeout(&AppError::protocol("IMAP command failed")));
+    }
+
+    #[test]
     fn connection_errors_are_classified() {
         assert!(is_connection_error(&AppError::network(
             "IMAP I/O error: Broken pipe (os error 32)"
@@ -319,13 +357,19 @@ mod tests {
         assert_eq!(decode_modified_utf7("&V4NXPpCuTvY-"), "垃圾邮件");
         assert_eq!(decode_modified_utf7("&XfJSIJZkkK5O9g-"), "已删除邮件");
         assert_eq!(decode_modified_utf7("&ZeVnLIqe-"), "日本語");
-        assert_eq!(decode_modified_utf7("~peter/mail/&U,BTFw-/&ZeVnLIqe-"), "~peter/mail/台北/日本語");
+        assert_eq!(
+            decode_modified_utf7("~peter/mail/&U,BTFw-/&ZeVnLIqe-"),
+            "~peter/mail/台北/日本語"
+        );
     }
 
     #[test]
     fn modified_utf7_passes_ascii_and_edge_cases_through() {
         assert_eq!(decode_modified_utf7("INBOX"), "INBOX");
-        assert_eq!(decode_modified_utf7("[Gmail]/Sent Mail"), "[Gmail]/Sent Mail");
+        assert_eq!(
+            decode_modified_utf7("[Gmail]/Sent Mail"),
+            "[Gmail]/Sent Mail"
+        );
         // "&-" is a literal ampersand.
         assert_eq!(decode_modified_utf7("A&-B"), "A&B");
         // Malformed or unterminated sequences are preserved verbatim.
@@ -340,7 +384,10 @@ mod tests {
         assert_eq!(decode_mailbox_name("&XfJT0ZAB-"), "已发送");
         // RFC 2047 wrapped names: some servers never emit UTF-7 for these.
         assert_eq!(decode_mailbox_name("=?UTF-8?B?5bey5Y+R6YCB?="), "已发送");
-        assert_eq!(decode_mailbox_name("=?utf-8?Q?=E8=8D=89=E7=A8=BF?="), "草稿");
+        assert_eq!(
+            decode_mailbox_name("=?utf-8?Q?=E8=8D=89=E7=A8=BF?="),
+            "草稿"
+        );
         // ASCII passes through untouched either way.
         assert_eq!(decode_mailbox_name("INBOX"), "INBOX");
         // A literal "=?" that is not an encoded word is preserved.

@@ -7,7 +7,7 @@ use nuncio_core::models::{Account, AccountState, FolderRole, ProviderKind};
 use nuncio_core::{events, repo, AppError, CoreContext, Result};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tokio::time::sleep;
+use tokio::time::{sleep, sleep_until, Instant as TokioInstant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -15,7 +15,7 @@ use crate::engine::EngineConfig;
 use crate::imap::conn::ImapConnection;
 use crate::ops::executor::{expire, store};
 use crate::sync::body;
-use crate::util::{imap_error, is_connection_error};
+use crate::util::{is_command_timeout, is_connection_error};
 use crate::{ops, pop3, smtp, sync};
 
 /// Commands serialized through an account's worker connection.
@@ -77,7 +77,9 @@ pub(crate) enum AccountCommand {
     },
     Expunge {
         folder_id: String,
-        reply: oneshot::Sender<Result<()>>,
+        /// `true` when the messages were removed from the server, `false` when
+        /// the server has no UIDPLUS and they keep their `\Deleted` flag.
+        reply: oneshot::Sender<Result<bool>>,
     },
     ExecuteOps {
         reply: Option<oneshot::Sender<Result<()>>>,
@@ -297,13 +299,43 @@ impl Worker {
     }
 
     async fn connection(&mut self, account: &Account) -> Result<&mut ImapConnection> {
+        // A timed-out command poisons the session: its response stream cannot
+        // be resynchronised, so it must never be handed to another command.
+        // `finish` drops it on the error path; this is the defensive guard for
+        // paths that swallowed a timeout inside a larger command.
+        if self
+            .conn
+            .as_ref()
+            .is_some_and(|connection| connection.is_poisoned())
+        {
+            debug!(
+                account = %self.account_id,
+                "discarding an IMAP connection poisoned by a timeout"
+            );
+            self.conn = None;
+            self.next_attempt = Instant::now();
+        }
         if self.conn.is_none() {
             let now = Instant::now();
             if now < self.next_attempt {
                 self.short_circuited = true;
                 return Err(AppError::network("IMAP is reconnecting"));
             }
-            let connection = crate::imap::conn::connect_account(&self.ctx, account).await?;
+            let timeouts = crate::imap::conn::ConnectTimeouts {
+                command: self.config.command_timeout,
+                fetch: self.config.fetch_timeout,
+                io_read: self.config.io_read_timeout,
+                io_write: self.config.io_write_timeout,
+                ..crate::imap::conn::ConnectTimeouts::default()
+            };
+            let connection =
+                crate::imap::conn::connect_account_with_timeouts(&self.ctx, account, timeouts)
+                    .await?;
+            if connection.is_poisoned() {
+                return Err(AppError::network(
+                    "IMAP handshake ended with an unusable connection",
+                ));
+            }
             let capabilities = connection.caps.merge_into(account);
             persist_capabilities(&self.ctx, account, capabilities).await?;
             self.conn = Some(connection);
@@ -331,11 +363,15 @@ impl Worker {
                 None => None,
             };
             if let Some(error) = failure {
-                if is_connection_error(&error) {
+                let poisoned = self
+                    .conn
+                    .as_ref()
+                    .is_some_and(|connection| connection.is_poisoned());
+                if is_connection_error(&error) || is_command_timeout(&error) || poisoned {
                     debug!(
                         account = %self.account_id,
                         %error,
-                        "stale IMAP session detected; reconnecting before use"
+                        "stale or timed-out IMAP session detected; reconnecting before use"
                     );
                     self.conn = None;
                     self.next_attempt = Instant::now();
@@ -481,11 +517,14 @@ impl Worker {
             Err(error) => Err(error),
         };
         let retry = match &result {
-            Err(error) if !self.short_circuited && is_connection_error(error) => {
+            Err(error)
+                if !self.short_circuited
+                    && (is_connection_error(error) || is_command_timeout(error)) =>
+            {
                 debug!(
                     account = %self.account_id,
                     %error,
-                    "IMAP command lost its connection; reconnecting and retrying once"
+                    "IMAP command lost its connection or timed out; reconnecting and retrying once"
                 );
                 true
             }
@@ -802,10 +841,7 @@ async fn handle_command(worker: &mut Worker, command: AccountCommand) {
                             }
                             None => folder.name.clone(),
                         };
-                        conn.session
-                            .rename(&folder.remote_path, &new_remote)
-                            .await
-                            .map_err(imap_error)?;
+                        conn.rename(&folder.remote_path, &new_remote).await?;
                         let folder_id = folder.id.clone();
                         let parent_for_db = new_parent_id.clone();
                         let updated_remote = new_remote.clone();
@@ -869,6 +905,14 @@ async fn handle_command(worker: &mut Worker, command: AccountCommand) {
                 .run_conn(move |conn, _account, ctx| {
                     Box::pin(async move {
                         let id = folder_id.clone();
+                        // "Do it, or do not do it": without a directed
+                        // expunge the only possible command is a whole-folder
+                        // EXPUNGE, which would also erase mail other clients
+                        // flagged. Refuse before SELECT/STORE and leave both
+                        // the server and the local rows untouched.
+                        if !conn.caps.directed_expunge() {
+                            return Ok(false);
+                        }
                         let folder: nuncio_core::models::Folder = ctx
                             .db
                             .read(move |db| repo::folders::get_required(db, &id))
@@ -882,7 +926,8 @@ async fn handle_command(worker: &mut Worker, command: AccountCommand) {
                                 repo::messages::delete_all_in_folder(db, &folder_id)?;
                                 Ok(())
                             })
-                            .await
+                            .await?;
+                        Ok(true)
                     })
                 })
                 .await;
@@ -993,8 +1038,16 @@ async fn idle_loop(
             continue;
         }
 
-        let connection = match crate::imap::conn::connect_account(&ctx, &account).await {
-            Ok(connection) => connection,
+        let timeouts = crate::imap::conn::ConnectTimeouts {
+            command: config.command_timeout,
+            fetch: config.fetch_timeout,
+            io_read: config.io_read_timeout,
+            io_write: config.io_write_timeout,
+            ..crate::imap::conn::ConnectTimeouts::default()
+        };
+        let connection =
+            match crate::imap::conn::connect_account_with_timeouts(&ctx, &account, timeouts).await {
+                Ok(connection) => connection,
             Err(error) => {
                 debug!(%error, account = %account_id, "IDLE connection failed");
                 let delay = backoff.next_delay();
@@ -1049,20 +1102,49 @@ async fn idle_loop(
     debug!(account = %account_id, "idle loop stopped");
 }
 
+/// How long one IDLE wait may last before it is re-issued (RFC 2177 requires
+/// re-issuing before 29 minutes).
+const IDLE_WAIT: Duration = Duration::from_secs(25 * 60);
+
 async fn run_idle_session(
     tx: &mpsc::Sender<AccountCommand>,
     mut connection: ImapConnection,
 ) -> Result<()> {
     connection.select("INBOX").await?;
     connection.touch();
+    let control = connection.timeout_control();
+    let command_timeout = connection.command_timeout();
     let mut session = connection.session;
     loop {
+        // IDLE is a waiting command, not a request/response command: the
+        // server may stay silent for the whole wait, so the per-read socket
+        // watchdog must not apply. `init`/`done` themselves are still bounded
+        // by the ordinary command budget below.
+        control.suspend_read_timeout();
         let mut handle = session.idle();
-        handle.init().await.map_err(crate::util::imap_error)?;
-        let (future, stop) = handle.wait_with_timeout(Duration::from_secs(25 * 60));
+        match tokio::time::timeout(command_timeout, handle.init()).await {
+            Ok(result) => result.map_err(crate::util::imap_error)?,
+            Err(_) => {
+                control.poison();
+                return Err(AppError::network(
+                    "IMAP command timeout: IDLE did not start in time",
+                ));
+            }
+        }
+        let (future, stop) = handle.wait_with_timeout(IDLE_WAIT);
         let outcome = future.await.map_err(crate::util::imap_error)?;
         drop(stop);
-        session = handle.done().await.map_err(crate::util::imap_error)?;
+        // The wait is over; from here on reads are ordinary command reads.
+        control.resume_read_timeout();
+        session = match tokio::time::timeout(command_timeout, handle.done()).await {
+            Ok(result) => result.map_err(crate::util::imap_error)?,
+            Err(_) => {
+                control.poison();
+                return Err(AppError::network(
+                    "IMAP command timeout: IDLE did not terminate in time",
+                ));
+            }
+        };
         match outcome {
             async_imap::extensions::idle::IdleResponse::NewData(_) => {
                 let (reply, _rx) = oneshot::channel();
@@ -1072,7 +1154,15 @@ async fn run_idle_session(
                 // Re-issue IDLE (RFC 2177 requires < 29 minutes). Probe the
                 // socket first: a server may have dropped it during the long
                 // wait without telling us.
-                session.noop().await.map_err(crate::util::imap_error)?;
+                match tokio::time::timeout(command_timeout, session.noop()).await {
+                    Ok(result) => result.map_err(crate::util::imap_error)?,
+                    Err(_) => {
+                        control.poison();
+                        return Err(AppError::network(
+                            "IMAP command timeout: IDLE keepalive NOOP timed out",
+                        ));
+                    }
+                }
             }
             async_imap::extensions::idle::IdleResponse::ManualInterrupt => {
                 return Err(AppError::network("IDLE interrupted"));
@@ -1220,23 +1310,36 @@ async fn graph_loop(
     config: EngineConfig,
 ) {
     let mut backoff = Backoff::new(Duration::from_secs(5), Duration::from_secs(300));
-    let mut delay = crate::engine::poll_interval(config.no_idle_poll_interval);
+    // Absolute deadline, not a per-iteration delay. The op-queue ticker sends a
+    // command every 10 seconds; resetting a 120-second sleep on every command
+    // starved the poll timer forever, so automatic Graph sync never ran and new
+    // mail only appeared after a manual sync.
+    let mut next_poll =
+        TokioInstant::now() + crate::engine::poll_interval(config.no_idle_poll_interval);
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
             command = rx.recv() => {
                 let Some(command) = command else { break };
+                let explicit_sync = matches!(
+                    command,
+                    AccountCommand::SyncAll(_) | AccountCommand::SyncFolder(_, _)
+                );
                 handle_graph_command(&ctx, &account_id, command).await;
-                // A command is an explicit wake-up: retry immediately if it
-                // failed, then return to the normal cadence.
                 backoff.reset();
-                delay = crate::engine::poll_interval(config.no_idle_poll_interval);
+                if explicit_sync {
+                    // The user asked for a sync; the timer restarts from now.
+                    next_poll = TokioInstant::now()
+                        + crate::engine::poll_interval(config.no_idle_poll_interval);
+                }
             }
-            _ = sleep(delay) => {
+            _ = sleep_until(next_poll) => {
+                debug!(account = %account_id, "Graph poll tick");
                 match graph_sync_account(&ctx, &account_id).await {
                     Ok(()) => {
                         backoff.reset();
-                        delay = crate::engine::poll_interval(config.no_idle_poll_interval);
+                        next_poll = TokioInstant::now()
+                            + crate::engine::poll_interval(config.no_idle_poll_interval);
                     }
                     Err(error) => {
                         let mut next = backoff.next_delay();
@@ -1253,11 +1356,14 @@ async fn graph_loop(
                         if let Some(seconds) = crate::graph::take_retry_after_secs() {
                             next = next.max(Duration::from_secs(seconds + 5));
                         }
-                        delay = next;
-                        debug!(
+                        next_poll = TokioInstant::now() + next;
+                        // Warn, not debug: a release build logs at info, and a
+                        // silently failing Graph loop looks exactly like "new
+                        // mail never arrives".
+                        warn!(
                             account = %account_id,
                             %error,
-                            retry_seconds = delay.as_secs(),
+                            retry_seconds = next.as_secs(),
                             "Graph sync failed; backing off"
                         );
                     }
@@ -1275,8 +1381,10 @@ async fn graph_loop(
 /// because it requires an `ImapConnection`.  The per-folder work and the
 /// notification step are the same shared functions.
 async fn graph_sync_account(ctx: &CoreContext, account_id: &str) -> Result<()> {
+    debug!(account = %account_id, "Graph sync start");
     let account = load_account(ctx, account_id).await?;
     if !crate::graph::uses_graph(&account) {
+        debug!(account = %account_id, "Graph sync skipped: account is not a Graph account");
         return Ok(());
     }
     ctx.sync_status
@@ -1367,17 +1475,12 @@ async fn graph_sync_account(ctx: &CoreContext, account_id: &str) -> Result<()> {
                 let id = account.id.clone();
                 if let Err(error) = ctx
                     .db
-                    .write(move |db| {
-                        repo::accounts::update_state(db, &id, AccountState::Ok, None)
-                    })
+                    .write(move |db| repo::accounts::update_state(db, &id, AccountState::Ok, None))
                     .await
                 {
                     debug!(%error, account = %account.id, "cannot clear the account state");
                 } else {
-                    events::emit_accounts_changed(
-                        ctx.events.as_ref(),
-                        vec![account.id.clone()],
-                    );
+                    events::emit_accounts_changed(ctx.events.as_ref(), vec![account.id.clone()]);
                 }
             }
             info!(

@@ -1,0 +1,11 @@
+-- A row whose optimistic operation failed and whose folder-local identity is
+-- not trusted yet. It differs from `pending_delete` (operation still queued)
+-- and from `target_pending` (an optimistic move waiting for its target UID):
+--
+-- * folder re-syncs must keep the row across a UIDVALIDITY change, exactly like
+--   a pending-password delete, so a refused command does not lose the message,
+--   its attachments or its FTS document before the server was consulted;
+-- * the next sync resolves it with a targeted, window-independent lookup (UID
+--   presence for a retained UID, Message-ID header search otherwise) and only
+--   then clears the marker.
+ALTER TABLE message ADD COLUMN awaiting_reconcile INTEGER NOT NULL DEFAULT 0;

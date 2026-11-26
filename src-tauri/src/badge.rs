@@ -111,7 +111,11 @@ fn draw_text(pixels: &mut [u8], text: &str) {
     if glyphs.is_empty() {
         return;
     }
-    let scale = if glyphs.len() > 1 { SCALE_PAIR } else { SCALE_SINGLE };
+    let scale = if glyphs.len() > 1 {
+        SCALE_PAIR
+    } else {
+        SCALE_SINGLE
+    };
     let total_w = glyphs.len() as u32 * GLYPH_W * scale + (glyphs.len() as u32 - 1) * GAP * scale;
     let total_h = GLYPH_H * scale;
     let start_x = (SIZE.saturating_sub(total_w)) / 2;

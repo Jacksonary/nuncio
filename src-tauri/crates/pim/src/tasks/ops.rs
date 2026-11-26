@@ -23,6 +23,11 @@ pub struct TaskSnapshot {
     pub etag: Option<String>,
     pub remote_id: Option<String>,
     pub href: Option<String>,
+    /// `remote_id` was derived from the href rather than being a real provider
+    /// UID. A snapshot written by an older build defaults to a real UID, the
+    /// same rule the task row and tombstone columns use.
+    #[serde(default)]
+    pub uid_is_derived: bool,
 }
 
 /// A task list with every task it contained (for delete rollback).
@@ -41,6 +46,15 @@ pub struct TaskListSnapshot {
 pub enum TaskOp {
     Save {
         task_id: String,
+        /// A real provider UID assigned to a task whose local identity was
+        /// derived from its href (`uid_is_derived`).
+        ///
+        /// Generated and persisted **before** the first wire attempt so a retry
+        /// reuses the same value instead of writing a different UID on every
+        /// attempt. `None` until the executor needs one (and forever for tasks
+        /// that already carry a real UID).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        assigned_uid: Option<String>,
         /// `None` for a create (rollback deletes the row).
         snapshot: Option<TaskSnapshot>,
     },

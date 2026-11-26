@@ -37,6 +37,10 @@
   color: var(--warning);
 }
 
+.syncing {
+  color: var(--text-tertiary);
+}
+
 .label {
   overflow: hidden;
   text-overflow: ellipsis;

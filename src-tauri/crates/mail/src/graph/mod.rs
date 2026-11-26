@@ -17,6 +17,7 @@ pub mod folders;
 pub mod messages;
 pub mod ops;
 
+use std::future::Future;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -180,10 +181,50 @@ impl GraphMailClient {
     where
         F: FnOnce(&Client) -> RequestBuilder,
     {
+        let response = self
+            .send_authed_checked(ctx, account_id, build, || {
+                std::future::ready(Ok::<bool, AppError>(true))
+            })
+            .await?;
+        response
+            .ok_or_else(|| AppError::internal("Graph send guard rejected an unconditional request"))
+    }
+
+    /// Authenticated request with a last-moment eligibility check.
+    ///
+    /// `guard` runs after the token has been read (or refreshed) and
+    /// immediately before the request is executed, once for the initial send
+    /// and again for the 401 retry. Executors use it to re-verify that their
+    /// per-message writer/ownership evidence still holds: a token refresh can
+    /// block long enough for a sync to delete the projection or a newer action
+    /// to take the field over, and the retry must then be skipped instead of
+    /// writing a stale value.
+    ///
+    /// Returns `Ok(None)` when the guard refuses a send. The request was not
+    /// executed at that point (the only earlier attempt was the one that got
+    /// 401, which the server rejected), so callers may record `NotExecuted`.
+    pub async fn send_authed_checked<F, C, Fut>(
+        &self,
+        ctx: &CoreContext,
+        account_id: &str,
+        build: F,
+        guard: C,
+    ) -> Result<Option<Response>>
+    where
+        F: FnOnce(&Client) -> RequestBuilder,
+        C: Fn() -> Fut,
+        Fut: Future<Output = Result<bool>>,
+    {
         let mut token = ctx
             .creds
             .api_token(account_id, TokenResource::MicrosoftGraph)
             .await?;
+        // The guard is deliberately after token acquisition: that await can
+        // refresh the credential, which is exactly the window in which the
+        // caller's evidence may have changed.
+        if !guard().await? {
+            return Ok(None);
+        }
         // Build the request once: the closure is `FnOnce` and cannot be
         // replayed.  Bodies produced by `json`/`body` are byte buffers, so the
         // built request stays cloneable for the single retry.
@@ -218,6 +259,12 @@ impl GraphMailClient {
                         .creds
                         .api_token(account_id, TokenResource::MicrosoftGraph)
                         .await?;
+                    // Re-check after the refresh and before the retry actually
+                    // leaves the process. A writer/hand-over that landed while
+                    // the token was refreshing must win over this stale PATCH.
+                    if !guard().await? {
+                        return Ok(None);
+                    }
                     let header =
                         HeaderValue::from_str(&format!("Bearer {token}")).map_err(|error| {
                             AppError::auth(format!("invalid Graph access token: {error}"))
@@ -242,7 +289,7 @@ impl GraphMailClient {
             }
         }
 
-        Ok(response)
+        Ok(Some(response))
     }
 
     /// Map a non-success Graph response to the closest `AppError` variant.

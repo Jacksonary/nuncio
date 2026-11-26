@@ -107,7 +107,8 @@ export const folders = {
   setSyncEnabled: (id: T.Id, value: boolean) => call<void>("folder_set_sync_enabled", { id, value }),
   markAllRead: (id: T.Id) => call<void>("folder_mark_all_read", { id }),
   /** Permanently delete everything in a trash/junk folder. */
-  empty: (id: T.Id) => call<void>("folder_empty", { id }),
+  /** Resolves `false` when the server could only mark messages as deleted. */
+  empty: (id: T.Id) => call<boolean>("folder_empty", { id }),
   sync: (id: T.Id) => call<void>("folder_sync", { id }),
   /** Pull the next batch of older mail from the server (IMAP / Graph only). */
   loadOlder: (id: T.Id) => call<T.LoadOlderResult>("folder_load_older", { id }),
@@ -164,6 +165,12 @@ export const compose = {
   /** Saves locally (and queues a server Drafts APPEND). Returns the draft with id set. */
   save: (draft: T.Draft) => call<T.Draft>("compose_save", { draft }),
   discard: (draftId: T.Id) => call<void>("compose_discard", { draftId }),
+  /**
+   * Stop retrying remote sync for a draft whose copy could not be confirmed.
+   * The draft stays local; no remote mail is deleted.
+   */
+  keepLocalDraft: (messageId: T.Id) =>
+    call<void>("compose_keep_local_draft", { messageId }),
   /** Validates, builds MIME, queues to outbox. */
   send: (draft: T.Draft) => call<void>("compose_send", { draft }),
   /** Copies files into the draft staging dir. */

@@ -88,7 +88,15 @@ pub enum PimOp {
         instance_start: Option<String>,
         notify_attendees: bool,
         snapshot: Vec<EventSnapshot>,
+        /// The new tail series created by a `ThisAndFollowing` edit.
+        #[serde(default)]
         following_id: Option<String>,
+        /// The override created (or reused) by a `This` edit. It is a new local
+        /// row when the occurrence had no override yet, so it must be part of
+        /// the pending-protection set even though it is absent from the
+        /// pre-edit snapshot.
+        #[serde(default)]
+        exception_id: Option<String>,
     },
     EventDelete {
         event_id: String,
@@ -232,6 +240,7 @@ mod tests {
             notify_attendees: true,
             snapshot: snapshots(&[stored]),
             following_id: None,
+            exception_id: None,
         };
         let value = to_value(&op).expect("encode");
         let decoded: PimOp = serde_json::from_value(value).expect("decode");

@@ -45,6 +45,7 @@ import {
 } from "@fluentui/react-icons";
 import {
   Avatar,
+  BulkBar,
   Button,
   Checkbox,
   DatePicker,
@@ -67,6 +68,7 @@ import {
 } from "@/components";
 import {
   app,
+  compose as composeApi,
   folders as foldersApi,
   isIpcError,
   messages as messagesApi,
@@ -98,7 +100,6 @@ import {
 import { onMailCommand } from "./commands";
 import { openTaskFromMessage } from "./taskDialog";
 import { useMailCompose } from "./composeIntegration";
-import { setMessageDragData } from "./dnd";
 import {
   EMPTY_SELECTION,
   actionTargets,
@@ -795,6 +796,19 @@ export function MessageList() {
     [tt],
   );
 
+  const keepLocalDraft = useCallback(
+    async (summary: MessageSummary) => {
+      try {
+        await composeApi.keepLocalDraft(summary.id);
+        toast.success(tt("mail.toast.keepLocalDraft"));
+        void queryClient.invalidateQueries({ queryKey: ["messages"] });
+      } catch (error) {
+        toast.error(tt("mail.toast.keepLocalDraftFailed"), errorText(error));
+      }
+    },
+    [queryClient, tt],
+  );
+
   const reply = useCallback(
     (summary: MessageSummary, mode: ReplyMode) => {
       if (summary.isDraft) {
@@ -829,13 +843,15 @@ export function MessageList() {
     (summary: MessageSummary, event: ReactMouseEvent) => {
       event.preventDefault();
       event.stopPropagation();
+      // Highlight the row the menu acts on, but do not open it: a right click
+      // must not swap the reading pane. Menu commands still target this
+      // message through the selection.
       if (!selected.ids.includes(summary.id)) {
         dispatchSelection({ type: "replace", ids: [summary.id] });
-        setActive(summary.id);
       }
       setContextMenu({ summary, point: { x: event.clientX, y: event.clientY } });
     },
-    [selected.ids, setActive],
+    [selected.ids],
   );
 
   useEffect(() => {
@@ -1045,6 +1061,14 @@ export function MessageList() {
         icon: <DocumentEdit16Regular />,
         onSelect: () => void compose.openDraft(summary.id),
       });
+      if (summary.draftSyncState === "pendingConfirmation") {
+        items.push({
+          id: "keep-local-draft",
+          label: tt("mail.action.keepLocalDraft"),
+          icon: <Mail16Regular />,
+          onSelect: () => void keepLocalDraft(summary),
+        });
+      }
     } else {
       items.push(
         {
@@ -1157,6 +1181,7 @@ export function MessageList() {
     deleteMessages,
     deleteOutbox,
     folderChoices,
+    keepLocalDraft,
     markJunk,
     moveMessages,
     reply,
@@ -1261,7 +1286,6 @@ export function MessageList() {
   // The bulk row is always on screen (except in the outbox view): hiding it
   // until something was selected made "select all" undiscoverable, and the
   // actions are cheap no-ops when the selection is empty.
-  const hasSelection = selected.ids.length > 0;
 
   // Every row currently in the list is selected, which turns the toggle into
   // "deselect all". Selection can also hold ids that are no longer listed (a
@@ -1405,73 +1429,6 @@ export function MessageList() {
           </div>
         </div>
 
-        {outboxView ? null : (
-          <div className={styles.batchBar} role="toolbar" aria-label={tt("mail.list.batchBar")}>
-            {/* Same control and the same pressed look as the header's selection
-                toggle: one icon, state shown by the button being pressed. */}
-            <Tooltip
-              content={
-                allListedSelected ? tt("mail.list.selectNone") : tt("mail.list.selectAll")
-              }
-            >
-              <ToggleButton
-                pressed={allListedSelected}
-                onPressedChange={() =>
-                  dispatchSelection(
-                    allListedSelected
-                      ? { type: "clear" }
-                      : { type: "replace", ids: orderedIds },
-                  )
-                }
-                icon={<SelectAllOn16Regular />}
-                size="small"
-                aria-label={tt("mail.list.selectAll")}
-                disabled={orderedIds.length === 0}
-              />
-            </Tooltip>
-            <IconButton
-              icon={<Archive16Regular />}
-              label={tt("mail.action.archive")}
-              size="small"
-              onClick={() => void runBulk(() => archiveMessages(selected.ids))}
-            />
-            <IconButton
-              icon={<Delete16Regular />}
-              label={tt("mail.action.delete")}
-              size="small"
-              onClick={() => void runBulk(() => deleteMessages(selected.ids))}
-            />
-            <IconButton
-              icon={<MailRead16Regular />}
-              label={tt("mail.action.markRead")}
-              size="small"
-              onClick={() => void runBulk(() => setSeen(selected.ids, true))}
-            />
-            <IconButton
-              icon={<MailUnread16Regular />}
-              label={tt("mail.action.markUnread")}
-              size="small"
-              onClick={() => void runBulk(() => setSeen(selected.ids, false))}
-            />
-            <IconButton
-              icon={<Flag16Regular />}
-              label={tt("mail.action.flag")}
-              size="small"
-              onClick={() => void runBulk(() => setFlagged(selected.ids, true))}
-            />
-            <MenuButton
-              label={tt("mail.action.move")}
-              icon={<ArrowMove20Regular />}
-              items={moveMenuEntries}
-              appearance="subtle"
-              size="small"
-              disabled={moveMenuEntries.length === 0}
-            />
-            {hasSelection ? (
-              <span className={styles.batchCount}>{selected.ids.length}</span>
-            ) : null}
-          </div>
-        )}
         <div className={styles.searchRow}>
           <SearchBox
             ref={searchRef}
@@ -1566,6 +1523,78 @@ export function MessageList() {
             </div>
           </div>
         ) : null}
+
+        {/* Command row sits directly above the list: the actions belong to the
+            rows below, not to the folder title or the search field. */}
+        {outboxView ? null : (
+          <BulkBar
+            ariaLabel={tt("mail.list.batchBar")}
+            selectedCount={selected.ids.length}
+            leading={
+              /* Same control and the same pressed look as the header's selection
+                 toggle: one icon, state shown by the button being pressed. */
+              <Tooltip
+                content={
+                  allListedSelected ? tt("mail.list.selectNone") : tt("mail.list.selectAll")
+                }
+              >
+                <ToggleButton
+                  pressed={allListedSelected}
+                  onPressedChange={() =>
+                    dispatchSelection(
+                      allListedSelected
+                        ? { type: "clear" }
+                        : { type: "replace", ids: orderedIds },
+                    )
+                  }
+                  icon={<SelectAllOn16Regular />}
+                  size="small"
+                  aria-label={tt("mail.list.selectAll")}
+                  disabled={orderedIds.length === 0}
+                />
+              </Tooltip>
+            }
+          >
+            <IconButton
+              icon={<Archive16Regular />}
+              label={tt("mail.action.archive")}
+              size="small"
+              onClick={() => void runBulk(() => archiveMessages(selected.ids))}
+            />
+            <IconButton
+              icon={<Delete16Regular />}
+              label={tt("mail.action.delete")}
+              size="small"
+              onClick={() => void runBulk(() => deleteMessages(selected.ids))}
+            />
+            <IconButton
+              icon={<MailRead16Regular />}
+              label={tt("mail.action.markRead")}
+              size="small"
+              onClick={() => void runBulk(() => setSeen(selected.ids, true))}
+            />
+            <IconButton
+              icon={<MailUnread16Regular />}
+              label={tt("mail.action.markUnread")}
+              size="small"
+              onClick={() => void runBulk(() => setSeen(selected.ids, false))}
+            />
+            <IconButton
+              icon={<Flag16Regular />}
+              label={tt("mail.action.flag")}
+              size="small"
+              onClick={() => void runBulk(() => setFlagged(selected.ids, true))}
+            />
+            <MenuButton
+              label={tt("mail.action.move")}
+              icon={<ArrowMove20Regular />}
+              items={moveMenuEntries}
+              appearance="subtle"
+              size="small"
+              disabled={moveMenuEntries.length === 0}
+            />
+          </BulkBar>
+        )}
       </header>
 
       {coverageNotice ? (
@@ -1675,13 +1704,6 @@ export function MessageList() {
                     role="option"
                     aria-selected={isSelected}
                     tabIndex={isSelected ? 0 : -1}
-                    draggable={!outboxItem}
-                    onDragStart={(event) => {
-                      setMessageDragData(
-                        event.dataTransfer,
-                        isSelected && selected.ids.length > 0 ? selected.ids : [summary.id],
-                      );
-                    }}
                     onClick={(event) => handleSelect(summary, event)}
                     onKeyDown={(event) => {
                       if (
@@ -1756,6 +1778,22 @@ export function MessageList() {
                         {summary.isDraft ? (
                           <span className={styles.rowIcon} title={tt("mail.list.draft")}>
                             <DocumentEdit16Regular />
+                          </span>
+                        ) : null}
+                        {summary.draftSyncState === "pendingConfirmation" ? (
+                          <span
+                            className={styles.draftSyncPending}
+                            title={tt("mail.list.draftSyncPendingHint")}
+                          >
+                            <Warning16Regular />
+                            <span>{tt("mail.list.draftSyncPending")}</span>
+                          </span>
+                        ) : summary.draftSyncState === "localOnly" ? (
+                          <span
+                            className={styles.draftSyncLocalOnly}
+                            title={tt("mail.list.draftSyncLocalOnlyHint")}
+                          >
+                            {tt("mail.list.draftSyncLocalOnly")}
                           </span>
                         ) : null}
                         {summary.flagged ? (

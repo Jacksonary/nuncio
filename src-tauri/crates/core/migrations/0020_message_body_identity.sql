@@ -1,0 +1,13 @@
+-- Provider copy a cached message body was read from.
+--
+-- A sync can rebind the local row to another server copy while `body_path`
+-- still points at the previous copy's MIME (the upsert keeps a non-NULL path).
+-- Opening that row as a draft would then pair one message's bytes with another
+-- message's provider identity, and a later delete could be authorized for the
+-- wrong copy.
+--
+-- `body_identity` is the copy key captured *before* the body was fetched and
+-- written together with `body_path`. A reader may use the cached body only
+-- while the row still names that same copy; a missing or different value means
+-- the body's source cannot be proven and must be treated as a candidate.
+ALTER TABLE message ADD COLUMN body_identity TEXT;

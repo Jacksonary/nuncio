@@ -48,7 +48,7 @@ pub mod operation_kinds {
     pub use crate::ops::{
         AppendDraftOp, AppendToSentOp, ArchiveOp, DeleteOp, DeleteRemoteDraftOp, FolderCreateOp,
         FolderDeleteOp, FolderMarkReadOp, FolderRenameOp, FolderSubscribeOp, MarkJunkOp, MoveOp,
-        SendOp, SetFlagsOp,
+        RemoteDraftRef, SendOp, SetFlagsOp,
     };
 }
 

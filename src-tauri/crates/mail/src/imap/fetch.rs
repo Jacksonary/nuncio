@@ -333,16 +333,12 @@ fn collect_text_part_headers(
                 _ => "7bit",
             }
             .to_string();
-            let charset = common
-                .ty
-                .params
-                .as_ref()
-                .and_then(|params| {
-                    params
-                        .iter()
-                        .find(|(key, _)| key.eq_ignore_ascii_case("charset"))
-                        .map(|(_, value)| value.to_string())
-                });
+            let charset = common.ty.params.as_ref().and_then(|params| {
+                params
+                    .iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case("charset"))
+                    .map(|(_, value)| value.to_string())
+            });
             out.push((prefix.clone(), html, encoding, charset));
         }
         BodyStructure::Multipart { bodies, .. } => {

@@ -7,23 +7,22 @@ use std::sync::Arc;
 use nuncio_core::events::MailChangeKind;
 use nuncio_core::models::{
     Address, Attachment, Folder, FolderRole, Importance, MailFilter, MailRule, MailScope,
-    MessageAction, MessageListQuery, MessagePage, MessageSummary, PageCursor, ProviderKind,
-    SearchCoverage,
-    SearchQuery, StoredMessage,
+    MessageAction, MessageListQuery, MessagePage, MessageSummary, NewPendingOp, PageCursor,
+    ProviderKind, SearchCoverage, SearchQuery, StoredMessage,
 };
 use nuncio_core::{events, repo, AppError, Result};
-use rusqlite::{types::Value, Row};
+use rusqlite::{types::Value, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::ops::{
-    self, ArchiveOp, DeleteOp, FlagRollback, MarkJunkOp, MoveOp, SetFlagsOp, KIND_ARCHIVE,
-    KIND_DELETE, KIND_MARK_JUNK, KIND_MOVE, KIND_SET_FLAGS,
+    ArchiveOp, DeleteOp, FlagRollback, MarkJunkOp, MoveOp, SetFlagsOp, KIND_ARCHIVE, KIND_DELETE,
+    KIND_MARK_JUNK, KIND_MOVE, KIND_SET_FLAGS,
 };
 
 use super::MailService;
 
-fn is_local_only(provider: ProviderKind) -> bool {
+pub(crate) fn is_local_only(provider: ProviderKind) -> bool {
     matches!(provider, ProviderKind::Local | ProviderKind::Pop3)
 }
 
@@ -45,8 +44,11 @@ fn delete_is_permanent(requested: bool, source_role: FolderRole, is_draft: bool)
 }
 
 /// Serializable copy of [`StoredMessage`] (core keeps that type serde-free).
+///
+/// Embedded in [`crate::ops::DeleteOp`] so a permanent delete can be rolled
+/// back after the local row was removed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct StoredSnapshot {
+pub struct StoredSnapshot {
     pub summary: MessageSummary,
     pub bcc: Vec<Address>,
     pub reply_to: Vec<Address>,
@@ -105,6 +107,7 @@ impl StoredSnapshot {
             raw_headers: self.raw_headers,
             body_path: self.body_path,
             body_cached_at: self.body_cached_at,
+            body_identity: None,
             internal_date: self.internal_date,
             is_deleted_local: self.is_deleted_local,
         }
@@ -130,6 +133,11 @@ pub(crate) struct UndoEntryState {
     pub is_deleted_local: bool,
     pub snapshot: StoredSnapshot,
     pub attachments: Vec<Attachment>,
+    /// Owner token of this action's local flag writes. Remote actions also
+    /// record their queued operation id; local/POP3 actions have no operation,
+    /// so this token is the only proof that an undo still owns the field.
+    #[serde(default)]
+    pub flag_writer_id: Option<String>,
 }
 
 /// Undo payload persisted in `undo_log.payload_json`.
@@ -160,6 +168,100 @@ struct Target {
     target_folder: Option<String>,
     permanent: bool,
 }
+
+/// One queued server operation prepared before the state-changing transaction.
+///
+/// The local optimistic change and the queue row are written in the same
+/// transaction, so a failure to queue cannot leave a row marked
+/// `target_pending` with no operation that will ever release it.
+struct PreparedOp {
+    account_id: String,
+    kind: &'static str,
+    payload: serde_json::Value,
+    description: String,
+}
+
+/// Folder-local identity a payload was built from. Re-read inside the write
+/// transaction to make sure a concurrent sync/action did not move the row or
+/// replace its UID generation before the operation is queued.
+#[derive(Debug, Clone)]
+struct RemoteExpectation {
+    id: String,
+    account_id: String,
+    folder_id: String,
+    uid: Option<i64>,
+    uidvalidity: Option<i64>,
+    /// Provider identity the target was read with (Graph only). The queue
+    /// transaction re-checks both the row and the `graph_remote` mapping, so a
+    /// sync that rebound the stable row/UID pair to another message cannot
+    /// slip a delete for the wrong copy into the queue.
+    remote_id: Option<String>,
+    /// Whether this account addresses messages by provider id (Graph). Such an
+    /// operation must never be queued without a pinned id: the executor could
+    /// only re-resolve it from the mutable mapping, which is exactly the copy a
+    /// sync may have swapped underneath the user.
+    graph: bool,
+}
+
+/// `(uids, rollback, message_ids, remote_ids)`; the last three align with
+/// `uids`. `remote_ids` pins the Graph copy each UID addressed when the action
+/// was queued, so a later undo never re-resolves a mutable UID mapping.
+type FlagGroups =
+    HashMap<(String, String, Option<i64>), (Vec<i64>, Vec<FlagRollback>, Vec<String>, Vec<String>)>;
+type MoveGroups = HashMap<(String, String, String, Option<i64>), (Vec<i64>, Vec<String>)>;
+type ArchiveGroups =
+    HashMap<(String, String, Option<i64>), (Vec<i64>, Vec<String>, Option<String>)>;
+/// Re-check, inside the queue transaction, that the row still carries the
+/// identity the payload was built from.
+///
+/// Besides the folder/UID generation this also pins a Graph provider id: a
+/// sync may reuse the same local row (and therefore the same synthetic UID)
+/// for a different provider message, so the UID alone cannot prove the delete
+/// would address the copy the user selected.
+fn remote_expectation_matches(db: &Connection, expected: &RemoteExpectation) -> Result<bool> {
+    let Some(stored) = repo::messages::get(db, &expected.id)? else {
+        return Ok(false);
+    };
+    if stored.summary.account_id != expected.account_id
+        || stored.summary.folder_id != expected.folder_id
+        || stored.uid != expected.uid
+        || stored.uidvalidity != expected.uidvalidity
+    {
+        return Ok(false);
+    }
+    let Some(remote) = expected
+        .remote_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        // A Graph command may only address the provider id the user acted on.
+        // With no pinned id the executor would have to re-resolve the UID
+        // through the mutable mapping, which a sync may already have rebound.
+        // Refuse to queue instead of risking a delete/flag on another message.
+        return Ok(!expected.graph);
+    };
+    if stored.gm_msgid.as_deref() != Some(remote) {
+        return Ok(false);
+    }
+    // The executor resolves provider ids through this mapping. If a sync has
+    // already rewritten it to another id, the row is no longer the copy the
+    // user acted on.
+    if let Some(uid) = expected.uid {
+        let key = format!("graph_remote:{}:{uid}", expected.folder_id);
+        if let Some(mapped) = repo::sync_state::get(db, &expected.account_id, "mail", &key)? {
+            if mapped != remote {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+type DeleteGroups = HashMap<
+    (String, String, bool, Option<String>, Option<i64>),
+    (Vec<i64>, Vec<String>, Vec<StoredSnapshot>, Vec<String>),
+>;
+type JunkGroups = HashMap<(String, String, Option<i64>), (Vec<i64>, Vec<String>, Option<String>)>;
 
 impl MailService {
     /// List messages for a folder / unified / search scope.
@@ -258,13 +360,12 @@ impl MailService {
         };
         let (ids, coverage) = self.server_search(search, &cancel).await?;
         if !cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            *self.inner.search_cache.lock().expect("search cache lock") =
-                Some(SearchCacheEntry {
-                    key,
-                    stored: std::time::Instant::now(),
-                    ids: ids.clone(),
-                    coverage: coverage.clone(),
-                });
+            *self.inner.search_cache.lock().expect("search cache lock") = Some(SearchCacheEntry {
+                key,
+                stored: std::time::Instant::now(),
+                ids: ids.clone(),
+                coverage: coverage.clone(),
+            });
         }
         Ok((ids, coverage))
     }
@@ -716,74 +817,166 @@ impl MailService {
     }
 
     /// Mark a message as seen when it is opened.
-    pub(crate) async fn mark_seen_on_open(&self, stored: &mut StoredMessage) -> Result<()> {
+    ///
+    /// The local value, the queued command and the durable writer are one
+    /// transaction. Splitting them let a user action that committed in between
+    /// be overtaken by this (older) intent: the writer then named the automatic
+    /// operation even though the user had already chosen another value.
+    ///
+    /// Both the provider copy and the message's flag revision observed when
+    /// the open started are re-checked inside the transaction. If either
+    /// changed, a sync rebound the row or a newer action ran first, and this
+    /// open must not overwrite it.
+    ///
+    /// The revision is message-level, not the per-field writer `seq`: an undo
+    /// with no predecessor deletes the writer row, so comparing `Option<seq>`
+    /// would see `None == None` and overwrite the value the undo just restored.
+    pub(crate) async fn mark_seen_on_open(
+        &self,
+        stored: &mut StoredMessage,
+        opened_copy: Option<String>,
+        observed_flag_revision: Option<i64>,
+    ) -> Result<()> {
         if stored.summary.seen {
             return Ok(());
         }
-        let previous = stored.uid.map(|uid| FlagRollback {
-            uid,
-            seen: stored.summary.seen,
-            flagged: stored.summary.flagged,
-            answered: stored.summary.answered,
-            forwarded: stored.summary.forwarded,
-        });
-        stored.summary.seen = true;
-        let id = stored.summary.id.clone();
+        let account = self.account(&stored.summary.account_id).await?;
+        let message_id = stored.summary.id.clone();
         let folder_id = stored.summary.folder_id.clone();
-        self.inner
+        let account_id = account.id.clone();
+        let local_only = is_local_only(account.provider);
+        let local_owner = local_only.then(nuncio_core::models::new_id);
+        let message_for_tx = message_id.clone();
+        let outcome = self
+            .inner
             .ctx
             .db
             .write(move |db| {
-                repo::messages::set_flags(db, &[id], Some(true), None, None, None)?;
-                Ok(())
+                let Some(current) = repo::messages::get(db, &message_for_tx)? else {
+                    return Ok(None);
+                };
+                if repo::messages::body_identity_key(&current) != opened_copy {
+                    // The row now names another provider copy: a sync rebound
+                    // it while the body was loading. The user opened the copy
+                    // observed at the start, so marking this one read on its
+                    // behalf would write a flag for a message they never read.
+                    return Ok(Some(false));
+                }
+                if current.summary.seen {
+                    // Already read (a sync or a newer action got there first).
+                    return Ok(Some(true));
+                }
+                let current_revision = repo::messages::flag_revision(db, &message_for_tx)?;
+                if current_revision != observed_flag_revision {
+                    // A newer user action committed while this message was
+                    // being opened. Its intent wins; leave the row alone.
+                    return Ok(Some(false));
+                }
+                let previous = current.uid.map(|uid| FlagRollback {
+                    uid,
+                    seen: current.summary.seen,
+                    flagged: current.summary.flagged,
+                    answered: current.summary.answered,
+                    forwarded: current.summary.forwarded,
+                });
+                repo::messages::set_flags(
+                    db,
+                    std::slice::from_ref(&message_for_tx),
+                    Some(true),
+                    None,
+                    None,
+                    None,
+                )?;
+                let uid = current.uid;
+                if local_only || uid.is_none() {
+                    // No server command, but the local write still owns the
+                    // field so a later undo cannot clobber a newer action.
+                    let owner = local_owner.unwrap_or_else(nuncio_core::models::new_id);
+                    repo::messages::record_flag_writers(
+                        db,
+                        &message_for_tx,
+                        &owner,
+                        "setSeen",
+                        Some(true),
+                        None,
+                        None,
+                        None,
+                    )?;
+                    return Ok(Some(true));
+                }
+                let payload = SetFlagsOp {
+                    folder_id: current.summary.folder_id.clone(),
+                    uids: vec![uid.unwrap_or_default()],
+                    seen: Some(true),
+                    flagged: None,
+                    answered: None,
+                    forwarded: None,
+                    source_uidvalidity: current.uidvalidity,
+                    previous: previous.into_iter().collect(),
+                    message_ids: vec![message_for_tx.clone()],
+                    outcomes: Vec::new(),
+                    // Pin the Graph copy this open addressed; undo must not
+                    // re-resolve the synthetic UID to whatever the row names
+                    // after a rebind.
+                    remote_ids: current
+                        .gm_msgid
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(|value| vec![value.to_string()])
+                        .unwrap_or_default(),
+                };
+                let op = repo::pending_ops::enqueue(
+                    db,
+                    NewPendingOp::new(
+                        account_id,
+                        KIND_SET_FLAGS,
+                        serde_json::to_value(payload).map_err(|error| {
+                            AppError::internal(format!("cannot encode setFlags: {error}"))
+                        })?,
+                        "Mark message as read",
+                    ),
+                )?;
+                repo::messages::record_flag_writers(
+                    db,
+                    &message_for_tx,
+                    &op.id,
+                    "setSeen",
+                    Some(true),
+                    None,
+                    None,
+                    None,
+                )?;
+                Ok(Some(true))
             })
             .await?;
-        let account = self.account(&stored.summary.account_id).await?;
-        self.enqueue_seen(&account, stored, true, previous, "Mark message as read")
-            .await?;
-        self.emit_changed(
-            &account.id,
-            vec![folder_id],
-            vec![stored.summary.id.clone()],
-            MailChangeKind::Updated,
-        );
-        self.update_badge().await;
-        Ok(())
-    }
-
-    async fn enqueue_seen(
-        &self,
-        account: &nuncio_core::models::Account,
-        stored: &StoredMessage,
-        seen: bool,
-        previous: Option<FlagRollback>,
-        description: &str,
-    ) -> Result<Option<String>> {
-        if is_local_only(account.provider) {
-            return Ok(None);
+        match outcome {
+            Some(true) => {
+                stored.summary.seen = true;
+                self.emit_changed(
+                    &account.id,
+                    vec![folder_id],
+                    vec![stored.summary.id.clone()],
+                    MailChangeKind::Updated,
+                );
+                self.update_badge().await;
+            }
+            Some(false) => {
+                // Reflect the value the newer action left behind.
+                let id = stored.summary.id.clone();
+                if let Some(fresh) = self
+                    .inner
+                    .ctx
+                    .db
+                    .read(move |db| repo::messages::get(db, &id))
+                    .await?
+                {
+                    stored.summary.seen = fresh.summary.seen;
+                }
+            }
+            None => {}
         }
-        let Some(uid) = stored.uid else {
-            return Ok(None);
-        };
-        let payload = SetFlagsOp {
-            folder_id: stored.summary.folder_id.clone(),
-            uids: vec![uid],
-            seen: Some(seen),
-            flagged: None,
-            answered: None,
-            forwarded: None,
-            previous: previous.into_iter().collect(),
-        };
-        let op = ops::enqueue_operation(
-            &self.inner.ctx,
-            &account.id,
-            KIND_SET_FLAGS,
-            serde_json::to_value(payload)
-                .map_err(|error| AppError::internal(format!("cannot encode setFlags: {error}")))?,
-            description,
-        )
-        .await?;
-        Ok(Some(op.id))
+        Ok(())
     }
 
     /// Apply an action to one or more messages: local state changes are
@@ -874,14 +1067,17 @@ impl MailService {
                     }
                 }
                 MessageAction::Archive => {
-                    target_folder = self
+                    let archive = self
                         .role_folder(&account, FolderRole::Archive, &mut role_cache)
                         .await?;
-                    if target_folder.is_none() {
-                        target_folder = self
-                            .role_folder(&account, FolderRole::All, &mut role_cache)
-                            .await?;
-                    }
+                    let all = self
+                        .role_folder(&account, FolderRole::All, &mut role_cache)
+                        .await?;
+                    target_folder = crate::ops::archive_target(
+                        account.capabilities.gmail_extensions,
+                        archive.as_deref(),
+                        all.as_deref(),
+                    );
                     if target_folder.as_deref() == Some(message.summary.folder_id.as_str()) {
                         target_folder = None;
                     }
@@ -948,7 +1144,7 @@ impl MailService {
             return Ok(String::new());
         }
 
-        // ── local changes (single transaction) ────────────────────────
+        // ── prepare local groups and server payloads ─────────────────
         let action_kind = match action {
             MessageAction::SetSeen { .. } => "setSeen",
             MessageAction::SetFlagged { .. } => "setFlagged",
@@ -963,19 +1159,65 @@ impl MailService {
             _ => None,
         };
 
+        let seen_value = match action {
+            MessageAction::SetSeen { value } => Some(*value),
+            _ => None,
+        };
+        let flagged_value = match action {
+            MessageAction::SetFlagged { value } => Some(*value),
+            _ => None,
+        };
+        // A flag action on a local/POP3 row, or on a row without a server UID,
+        // queues no operation. Its local write still needs a durable owner so a
+        // later undo cannot clobber a newer action's value.
+        let local_flag_ids: Vec<String> = if matches!(action_kind, "setSeen" | "setFlagged") {
+            targets
+                .iter()
+                .filter(|target| {
+                    is_local_only(target.account.provider) || target.message.uid.is_none()
+                })
+                .map(|target| target.message.summary.id.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let flag_writer_id =
+            matches!(action_kind, "setSeen" | "setFlagged").then(nuncio_core::models::new_id);
+
+        // Only accounts that queue a remote operation get the optimistic
+        // move treatment (UID cleared, `target_pending` set). Local/POP3
+        // messages, and remote rows without a server UID (Graph, never
+        // uploaded drafts), are moved plainly: there is no target UID to wait
+        // for, and marking them would block every later action forever.
+        // Permanent deletes split by whether a server command will be queued:
+        // a remote row is only hidden (full state kept) until the command is
+        // acknowledged, while a row with no server identity is erased at once.
         let mut permanent_ids: Vec<String> = Vec::new();
+        let mut pending_permanent_ids: Vec<String> = Vec::new();
         let mut hidden_ids: Vec<String> = Vec::new();
-        let mut moves: HashMap<String, Vec<String>> = HashMap::new();
+        let mut local_moves: HashMap<String, Vec<String>> = HashMap::new();
+        let mut remote_moves: HashMap<String, Vec<String>> = HashMap::new();
         let mut flag_ids: Vec<String> = Vec::new();
         for target in &targets {
+            let queues_remote_move =
+                !is_local_only(target.account.provider) && target.message.uid.is_some();
             match action_kind {
                 "setSeen" | "setFlagged" => flag_ids.push(target.message.summary.id.clone()),
                 "delete" if target.permanent => {
-                    permanent_ids.push(target.message.summary.id.clone())
+                    if queues_remote_move {
+                        pending_permanent_ids.push(target.message.summary.id.clone());
+                    } else {
+                        permanent_ids.push(target.message.summary.id.clone());
+                    }
                 }
                 "delete" => {
                     if let Some(folder_id) = &target.target_folder {
-                        moves
+                        let group = if queues_remote_move {
+                            &mut remote_moves
+                        } else {
+                            &mut local_moves
+                        };
+                        group
                             .entry(folder_id.clone())
                             .or_default()
                             .push(target.message.summary.id.clone());
@@ -987,7 +1229,12 @@ impl MailService {
                 }
                 _ => {
                     if let Some(folder_id) = &target.target_folder {
-                        moves
+                        let group = if queues_remote_move {
+                            &mut remote_moves
+                        } else {
+                            &mut local_moves
+                        };
+                        group
                             .entry(folder_id.clone())
                             .or_default()
                             .push(target.message.summary.id.clone());
@@ -995,60 +1242,195 @@ impl MailService {
                 }
             }
         }
-        let seen_value = match action {
-            MessageAction::SetSeen { value } => Some(*value),
-            _ => None,
+
+        let prepared: Vec<PreparedOp> = match action {
+            MessageAction::SetSeen { value } => self.prepare_flag_ops(
+                &targets,
+                Some(*value),
+                None,
+                if *value {
+                    "Mark as read"
+                } else {
+                    "Mark as unread"
+                },
+            )?,
+            MessageAction::SetFlagged { value } => self.prepare_flag_ops(
+                &targets,
+                None,
+                Some(*value),
+                if *value {
+                    "Flag message"
+                } else {
+                    "Unflag message"
+                },
+            )?,
+            MessageAction::Move { .. } => self.prepare_move_ops(&targets, "Move message")?,
+            MessageAction::Archive => self.prepare_archive_ops(&targets)?,
+            MessageAction::Delete { permanent } => self.prepare_delete_ops(
+                &targets,
+                if *permanent {
+                    "Delete message permanently"
+                } else {
+                    "Delete message"
+                },
+            )?,
+            MessageAction::MarkJunk { value } => self.prepare_junk_ops(
+                &targets,
+                *value,
+                if *value {
+                    "Mark as junk"
+                } else {
+                    "Mark as not junk"
+                },
+            )?,
         };
-        let flagged_value = match action {
-            MessageAction::SetFlagged { value } => Some(*value),
-            _ => None,
-        };
-        let flags = flag_ids.clone();
+
+        // The queue check, the local change, the optimistic move and the
+        // queue rows all run in one write transaction. A row that enters
+        // `target_pending` always has the operation that will release it, and
+        // two concurrent actions cannot both pass the pending check with the
+        // same stale source identity.
+        let pending_ids: Vec<String> = targets
+            .iter()
+            .filter(|target| !is_local_only(target.account.provider))
+            .map(|target| target.message.summary.id.clone())
+            .collect();
+        // Only rows that will actually queue a server command need a pinned
+        // provider identity. A row without a UID (for example an unsynced
+        // Graph draft) is changed locally and must stay actionable.
+        let expectations: Vec<RemoteExpectation> = targets
+            .iter()
+            .filter(|target| {
+                !is_local_only(target.account.provider) && target.message.uid.is_some()
+            })
+            .map(|target| RemoteExpectation {
+                id: target.message.summary.id.clone(),
+                account_id: target.account.id.clone(),
+                folder_id: target.message.summary.folder_id.clone(),
+                uid: target.message.uid,
+                uidvalidity: target.message.uidvalidity,
+                graph: crate::graph::uses_graph(&target.account),
+                remote_id: crate::graph::uses_graph(&target.account)
+                    .then(|| target.message.gm_msgid.clone())
+                    .flatten()
+                    .filter(|value| !value.trim().is_empty()),
+            })
+            .collect();
+        let flags = flag_ids;
         let deletes = permanent_ids.clone();
+        let pending_deletes = pending_permanent_ids.clone();
         let hidden = hidden_ids.clone();
-        let move_groups = moves.clone();
-        self.inner
+        let local_move_groups = local_moves;
+        let remote_move_groups = remote_moves;
+        let local_flag_ids_for_tx = local_flag_ids.clone();
+        let flag_writer_id_for_tx = flag_writer_id.clone();
+        let op_ids = self
+            .inner
             .ctx
             .db
             .write(move |db| {
+                // A row marked `target_pending` is an optimistic move whose
+                // server copy has not been mapped yet. Refuse inside the
+                // transaction: otherwise the local change would report success
+                // while the remote queue silently skipped it (and the next
+                // sync would resurrect the message in its old folder).
+                let pending = repo::messages::target_pending_ids(db, &pending_ids)?;
+                if let Some(id) = pending.first() {
+                    return Err(AppError::Conflict(format!(
+                        "message {id} is still being moved to its new folder; retry after the sync finishes"
+                    )));
+                }
+                // The payloads were built from rows read before this
+                // transaction. Re-check that none of them moved or changed
+                // generation in the meantime, so the queued UID really
+                // addresses the message the user acted on.
+                for expected in &expectations {
+                    if !remote_expectation_matches(db, expected)? {
+                        return Err(AppError::Conflict(format!(
+                            "message {} changed while the action was being prepared; retry",
+                            expected.id
+                        )));
+                    }
+                }
                 if !flags.is_empty() {
                     repo::messages::set_flags(db, &flags, seen_value, flagged_value, None, None)?;
                 }
                 if !deletes.is_empty() {
                     repo::messages::delete_local(db, &deletes, true)?;
                 }
+                if !pending_deletes.is_empty() {
+                    // Keep the row, its attachments and its FTS document until
+                    // the server acknowledges the delete; a refused command
+                    // unhides it again instead of rebuilding it.
+                    repo::messages::hide_for_permanent_delete(db, &pending_deletes)?;
+                }
                 if !hidden.is_empty() {
                     repo::messages::delete_local(db, &hidden, false)?;
                 }
-                for (folder_id, ids) in move_groups {
+                for (folder_id, ids) in local_move_groups {
                     repo::messages::move_to_folder(db, &ids, &folder_id)?;
                 }
-                Ok(())
+                for (folder_id, ids) in remote_move_groups {
+                    repo::messages::move_to_folder_pending(db, &ids, &folder_id)?;
+                }
+                // Record the per-field writer in the same transaction as the
+                // local value and the queue row. Execution and rollback only
+                // restore a field this exact owner still holds.
+                if let Some(owner) = flag_writer_id_for_tx.as_deref() {
+                    for id in &local_flag_ids_for_tx {
+                        repo::messages::record_flag_writers(
+                            db,
+                            id,
+                            owner,
+                            action_kind,
+                            seen_value,
+                            flagged_value,
+                            None,
+                            None,
+                        )?;
+                    }
+                }
+                let mut op_ids = Vec::with_capacity(prepared.len());
+                for op in prepared {
+                    let kind = op.kind;
+                    let payload = op.payload.clone();
+                    let stored = repo::pending_ops::enqueue(
+                        db,
+                        NewPendingOp::new(op.account_id, op.kind, payload.clone(), op.description),
+                    )?;
+                    // The optimistic move above already put the row in its
+                    // destination. Record this operation as the owner of the
+                    // identity it is waiting for, so a retry of an earlier
+                    // batch cannot fill the slot with a stale destination.
+                    crate::ops::claim_move_target_owner(
+                        db,
+                        &stored.account_id,
+                        kind,
+                        &payload,
+                        &stored.id,
+                        stored.sequence,
+                    )?;
+                    if kind == KIND_SET_FLAGS {
+                        if let Ok(payload) = serde_json::from_value::<SetFlagsOp>(payload) {
+                            for message_id in &payload.message_ids {
+                                repo::messages::record_flag_writers(
+                                    db,
+                                    message_id,
+                                    &stored.id,
+                                    action_kind,
+                                    payload.seen,
+                                    payload.flagged,
+                                    payload.answered,
+                                    payload.forwarded,
+                                )?;
+                            }
+                        }
+                    }
+                    op_ids.push(stored.id);
+                }
+                Ok(op_ids)
             })
             .await?;
-
-        // ── server operations ────────────────────────────────────────
-        let mut op_ids: Vec<String> = Vec::new();
-        match action {
-            MessageAction::SetSeen { value } => {
-                op_ids.extend(self.queue_flag_ops(&targets, Some(*value), None).await?);
-            }
-            MessageAction::SetFlagged { value } => {
-                op_ids.extend(self.queue_flag_ops(&targets, None, Some(*value)).await?);
-            }
-            MessageAction::Move { .. } => {
-                op_ids.extend(self.queue_move_ops(&targets, "Move message").await?);
-            }
-            MessageAction::Archive => {
-                op_ids.extend(self.queue_archive_ops(&targets).await?);
-            }
-            MessageAction::Delete { .. } => {
-                op_ids.extend(self.queue_delete_ops(&targets).await?);
-            }
-            MessageAction::MarkJunk { value } => {
-                op_ids.extend(self.queue_junk_ops(&targets, *value).await?);
-            }
-        }
 
         // ── undo entry ───────────────────────────────────────────────
         let attachment_ids: Vec<String> = targets
@@ -1082,6 +1464,7 @@ impl MailService {
                 forwarded: target.message.summary.forwarded,
                 is_deleted_local: target.message.is_deleted_local,
                 snapshot: StoredSnapshot::from(&target.message),
+                flag_writer_id: flag_writer_id.clone(),
                 attachments: attachment_map
                     .remove(&target.message.summary.id)
                     .unwrap_or_default(),
@@ -1204,13 +1587,18 @@ impl MailService {
         Ok(value)
     }
 
-    async fn queue_flag_ops(
+    fn prepare_flag_ops(
         &self,
         targets: &[Target],
         seen: Option<bool>,
         flagged: Option<bool>,
-    ) -> Result<Vec<String>> {
-        let mut grouped: HashMap<(String, String), (Vec<i64>, Vec<FlagRollback>)> = HashMap::new();
+        description: &str,
+    ) -> Result<Vec<PreparedOp>> {
+        // Group by (account, folder, UIDVALIDITY): a payload must never carry
+        // UIDs from two generations, or a valid row would vouch for a stale
+        // one. Rows with no generation form their own group and are refused by
+        // the executor (which reconciles the folder).
+        let mut grouped: FlagGroups = HashMap::new();
         for target in targets {
             if is_local_only(target.account.provider) {
                 continue;
@@ -1222,6 +1610,7 @@ impl MailService {
                 .entry((
                     target.account.id.clone(),
                     target.message.summary.folder_id.clone(),
+                    target.message.uidvalidity,
                 ))
                 .or_default();
             entry.0.push(uid);
@@ -1232,9 +1621,23 @@ impl MailService {
                 answered: target.message.summary.answered,
                 forwarded: target.message.summary.forwarded,
             });
+            entry.2.push(target.message.summary.id.clone());
+            entry.3.push(
+                target
+                    .message
+                    .gm_msgid
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .to_string(),
+            );
         }
-        let mut ids = Vec::new();
-        for ((account_id, folder_id), (uids, previous)) in grouped {
+        let mut prepared = Vec::new();
+        for (
+            (account_id, folder_id, source_uidvalidity),
+            (uids, previous, message_ids, remote_ids),
+        ) in grouped
+        {
             let payload = SetFlagsOp {
                 folder_id,
                 uids,
@@ -1242,33 +1645,26 @@ impl MailService {
                 flagged,
                 answered: None,
                 forwarded: None,
+                source_uidvalidity,
                 previous,
+                message_ids,
+                outcomes: Vec::new(),
+                remote_ids,
             };
-            let op = ops::enqueue_operation(
-                &self.inner.ctx,
-                &account_id,
-                KIND_SET_FLAGS,
-                serde_json::to_value(payload).map_err(|error| {
+            prepared.push(PreparedOp {
+                account_id,
+                kind: KIND_SET_FLAGS,
+                payload: serde_json::to_value(payload).map_err(|error| {
                     AppError::internal(format!("cannot encode setFlags: {error}"))
                 })?,
-                if seen == Some(true) {
-                    "Mark as read"
-                } else if seen == Some(false) {
-                    "Mark as unread"
-                } else if flagged == Some(true) {
-                    "Flag message"
-                } else {
-                    "Unflag message"
-                },
-            )
-            .await?;
-            ids.push(op.id);
+                description: description.to_string(),
+            });
         }
-        Ok(ids)
+        Ok(prepared)
     }
 
-    async fn queue_move_ops(&self, targets: &[Target], description: &str) -> Result<Vec<String>> {
-        let mut grouped: HashMap<(String, String, String), Vec<i64>> = HashMap::new();
+    fn prepare_move_ops(&self, targets: &[Target], description: &str) -> Result<Vec<PreparedOp>> {
+        let mut grouped: MoveGroups = HashMap::new();
         for target in targets {
             if is_local_only(target.account.provider) {
                 continue;
@@ -1278,38 +1674,43 @@ impl MailService {
             else {
                 continue;
             };
-            grouped
+            let entry = grouped
                 .entry((
                     target.account.id.clone(),
                     target.message.summary.folder_id.clone(),
                     target_folder,
+                    target.message.uidvalidity,
                 ))
-                .or_default()
-                .push(uid);
+                .or_default();
+            entry.0.push(uid);
+            entry.1.push(target.message.summary.id.clone());
         }
-        let mut ids = Vec::new();
-        for ((account_id, folder_id, target_folder_id), uids) in grouped {
+        let mut prepared = Vec::new();
+        for ((account_id, folder_id, target_folder_id, source_uidvalidity), (uids, message_ids)) in
+            grouped
+        {
             let payload = MoveOp {
                 folder_id,
                 target_folder_id,
                 uids,
+                message_ids,
+                source_uidvalidity,
+                outcomes: Vec::new(),
+                remote_ids: Vec::new(),
             };
-            let op = ops::enqueue_operation(
-                &self.inner.ctx,
-                &account_id,
-                KIND_MOVE,
-                serde_json::to_value(payload)
+            prepared.push(PreparedOp {
+                account_id,
+                kind: KIND_MOVE,
+                payload: serde_json::to_value(payload)
                     .map_err(|error| AppError::internal(format!("cannot encode move: {error}")))?,
-                description,
-            )
-            .await?;
-            ids.push(op.id);
+                description: description.to_string(),
+            });
         }
-        Ok(ids)
+        Ok(prepared)
     }
 
-    async fn queue_archive_ops(&self, targets: &[Target]) -> Result<Vec<String>> {
-        let mut grouped: HashMap<(String, String), (Vec<i64>, Option<String>)> = HashMap::new();
+    fn prepare_archive_ops(&self, targets: &[Target]) -> Result<Vec<PreparedOp>> {
+        let mut grouped: ArchiveGroups = HashMap::new();
         for target in targets {
             if is_local_only(target.account.provider) {
                 continue;
@@ -1321,37 +1722,43 @@ impl MailService {
                 .entry((
                     target.account.id.clone(),
                     target.message.summary.folder_id.clone(),
+                    target.message.uidvalidity,
                 ))
                 .or_default();
             entry.0.push(uid);
-            if entry.1.is_none() {
-                entry.1 = target.target_folder.clone();
+            entry.1.push(target.message.summary.id.clone());
+            if entry.2.is_none() {
+                entry.2 = target.target_folder.clone();
             }
         }
-        let mut ids = Vec::new();
-        for ((account_id, folder_id), (uids, target_folder_id)) in grouped {
+        let mut prepared = Vec::new();
+        for ((account_id, folder_id, source_uidvalidity), (uids, message_ids, target_folder_id)) in
+            grouped
+        {
             let payload = ArchiveOp {
                 folder_id,
                 uids,
                 target_folder_id,
+                soft_hidden: false,
+                message_ids,
+                source_uidvalidity,
+                outcomes: Vec::new(),
+                remote_ids: Vec::new(),
             };
-            let op = ops::enqueue_operation(
-                &self.inner.ctx,
-                &account_id,
-                KIND_ARCHIVE,
-                serde_json::to_value(payload).map_err(|error| {
+            prepared.push(PreparedOp {
+                account_id,
+                kind: KIND_ARCHIVE,
+                payload: serde_json::to_value(payload).map_err(|error| {
                     AppError::internal(format!("cannot encode archive: {error}"))
                 })?,
-                "Archive message",
-            )
-            .await?;
-            ids.push(op.id);
+                description: "Archive message".to_string(),
+            });
         }
-        Ok(ids)
+        Ok(prepared)
     }
 
-    async fn queue_delete_ops(&self, targets: &[Target]) -> Result<Vec<String>> {
-        let mut grouped: HashMap<(String, String, bool, Option<String>), Vec<i64>> = HashMap::new();
+    fn prepare_delete_ops(&self, targets: &[Target], description: &str) -> Result<Vec<PreparedOp>> {
+        let mut grouped: DeleteGroups = HashMap::new();
         for target in targets {
             if is_local_only(target.account.provider) {
                 continue;
@@ -1359,46 +1766,72 @@ impl MailService {
             let Some(uid) = target.message.uid else {
                 continue;
             };
-            grouped
+            let entry = grouped
                 .entry((
                     target.account.id.clone(),
                     target.message.summary.folder_id.clone(),
                     target.permanent,
                     target.target_folder.clone(),
+                    target.message.uidvalidity,
                 ))
-                .or_default()
-                .push(uid);
+                .or_default();
+            entry.0.push(uid);
+            entry.1.push(target.message.summary.id.clone());
+            if target.permanent {
+                // The optimistic permanent delete now hides the row instead of
+                // removing it, but keep its contents as a fallback: if the row
+                // disappears for any other reason, a refused command can still
+                // rebuild it even when it is older than the sync window.
+                entry.2.push(StoredSnapshot::from(&target.message));
+            }
+            // Pin the exact provider id this target was read with. Graph ids
+            // change without changing the local row (and its synthetic UID),
+            // so execution must address this copy, never a re-resolved one.
+            entry.3.push(if crate::graph::uses_graph(&target.account) {
+                target.message.gm_msgid.clone().unwrap_or_default()
+            } else {
+                String::new()
+            });
         }
-        let mut ids = Vec::new();
-        for ((account_id, folder_id, permanent, target_folder_id), uids) in grouped {
+        let mut prepared = Vec::new();
+        for (
+            (account_id, folder_id, permanent, target_folder_id, source_uidvalidity),
+            (uids, message_ids, snapshot, remote_ids),
+        ) in grouped
+        {
             let payload = DeleteOp {
                 folder_id,
                 uids,
                 permanent,
                 soft_hidden: !permanent && target_folder_id.is_none(),
                 target_folder_id,
+                message_ids,
+                source_uidvalidity,
+                pending_delete: permanent,
+                deleted_flag_set: false,
+                snapshot,
+                outcomes: Vec::new(),
+                remote_ids,
             };
-            let op = ops::enqueue_operation(
-                &self.inner.ctx,
-                &account_id,
-                KIND_DELETE,
-                serde_json::to_value(payload).map_err(|error| {
+            prepared.push(PreparedOp {
+                account_id,
+                kind: KIND_DELETE,
+                payload: serde_json::to_value(payload).map_err(|error| {
                     AppError::internal(format!("cannot encode delete: {error}"))
                 })?,
-                if permanent {
-                    "Delete message permanently"
-                } else {
-                    "Delete message"
-                },
-            )
-            .await?;
-            ids.push(op.id);
+                description: description.to_string(),
+            });
         }
-        Ok(ids)
+        Ok(prepared)
     }
 
-    async fn queue_junk_ops(&self, targets: &[Target], value: bool) -> Result<Vec<String>> {
-        let mut grouped: HashMap<(String, String), (Vec<i64>, Option<String>)> = HashMap::new();
+    fn prepare_junk_ops(
+        &self,
+        targets: &[Target],
+        value: bool,
+        description: &str,
+    ) -> Result<Vec<PreparedOp>> {
+        let mut grouped: JunkGroups = HashMap::new();
         for target in targets {
             if is_local_only(target.account.provider) {
                 continue;
@@ -1410,38 +1843,39 @@ impl MailService {
                 .entry((
                     target.account.id.clone(),
                     target.message.summary.folder_id.clone(),
+                    target.message.uidvalidity,
                 ))
                 .or_default();
             entry.0.push(uid);
-            if entry.1.is_none() {
-                entry.1 = target.target_folder.clone();
+            entry.1.push(target.message.summary.id.clone());
+            if entry.2.is_none() {
+                entry.2 = target.target_folder.clone();
             }
         }
-        let mut ids = Vec::new();
-        for ((account_id, folder_id), (uids, target_folder_id)) in grouped {
+        let mut prepared = Vec::new();
+        for ((account_id, folder_id, source_uidvalidity), (uids, message_ids, target_folder_id)) in
+            grouped
+        {
             let payload = MarkJunkOp {
                 folder_id,
                 uids,
                 value,
                 target_folder_id,
+                message_ids,
+                source_uidvalidity,
+                outcomes: Vec::new(),
+                remote_ids: Vec::new(),
             };
-            let op = ops::enqueue_operation(
-                &self.inner.ctx,
-                &account_id,
-                KIND_MARK_JUNK,
-                serde_json::to_value(payload).map_err(|error| {
+            prepared.push(PreparedOp {
+                account_id,
+                kind: KIND_MARK_JUNK,
+                payload: serde_json::to_value(payload).map_err(|error| {
                     AppError::internal(format!("cannot encode markJunk: {error}"))
                 })?,
-                if value {
-                    "Mark as junk"
-                } else {
-                    "Mark as not junk"
-                },
-            )
-            .await?;
-            ids.push(op.id);
+                description: description.to_string(),
+            });
         }
-        Ok(ids)
+        Ok(prepared)
     }
 
     /// Apply an action to every message of the given conversations.
@@ -1484,6 +1918,85 @@ impl MailService {
     /// Revert one specific action by the undo id returned from `message_act`.
     pub async fn message_undo(&self, undo_id: &str) -> Result<bool> {
         self.undo_by_id(undo_id).await
+    }
+
+    /// Re-run the targeted reconciliation for messages the UI marks as
+    /// `reconcileReason`.
+    ///
+    /// This is the safe retry path for a message that could not be resolved
+    /// automatically (an unreliable HEADER search, a missing Message-ID, an
+    /// ambiguous copy). It never deletes anything by itself: it re-synchronizes
+    /// the owning folder(s), and the sync's reconciliation pass applies the
+    /// same evidence rules as before. Returns how many rows were retried.
+    pub async fn message_reconcile(&self, ids: &[String]) -> Result<usize> {
+        let mut folders: HashMap<String, String> = HashMap::new();
+        let mut retried = 0;
+        for id in ids {
+            let info = self
+                .inner
+                .ctx
+                .db
+                .read({
+                    let id = id.clone();
+                    move |db| {
+                        Ok(db
+                            .query_row(
+                                "SELECT folder_id, account_id, reconcile_reason,
+                                        NULLIF(NULLIF(TRIM(reconcile_op_id), ''), '0'),
+                                        target_pending, awaiting_reconcile
+                                   FROM message WHERE id = ?1",
+                                rusqlite::params![id],
+                                |row| {
+                                    Ok((
+                                        row.get::<_, String>(0)?,
+                                        row.get::<_, String>(1)?,
+                                        row.get::<_, Option<String>>(2)?,
+                                        row.get::<_, Option<String>>(3)?,
+                                        row.get::<_, i64>(4)?,
+                                        row.get::<_, i64>(5)?,
+                                    ))
+                                },
+                            )
+                            .optional()?)
+                    }
+                })
+                .await?;
+            let Some((folder_id, account_id, reason, op_id, target_pending, awaiting)) = info
+            else {
+                continue;
+            };
+            if reason.is_none() && target_pending == 0 && awaiting == 0 {
+                continue;
+            }
+            retried += 1;
+            folders.insert(folder_id.clone(), account_id.clone());
+            let Some(op_id) = op_id else {
+                continue;
+            };
+            let target = self
+                .inner
+                .ctx
+                .db
+                .read(move |db| {
+                    Ok(repo::pending_ops::get(db, &op_id)?.and_then(|op| {
+                        op.payload
+                            .get("targetFolderId")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string)
+                    }))
+                })
+                .await?;
+            if let Some(target) = target {
+                folders.entry(target).or_insert(account_id);
+            }
+        }
+        for (folder, account) in folders {
+            self.inner
+                .engine
+                .sync_now(Some(&account), Some(&folder))
+                .await?;
+        }
+        Ok(retried)
     }
 
     /// Run one local rule immediately against a folder; returns the number of
@@ -1613,6 +2126,8 @@ fn row_to_summary(row: &Row<'_>) -> Result<MessageSummary> {
         size: row.get::<_, i64>("size")?.max(0) as u64,
         thread_count: 1,
         thread_unread: 0,
+        reconcile_reason: nuncio_core::repo::get_opt_string(row, "reconcile_reason")?,
+        draft_sync_state: None,
     })
 }
 
@@ -1638,6 +2153,7 @@ fn fetch_summaries(conn: &rusqlite::Connection, ids: &[String]) -> Result<Vec<Me
             summaries.push(row_to_summary(row)?);
         }
     }
+    repo::messages::attach_draft_sync_state(conn, &mut summaries)?;
     Ok(summaries)
 }
 
@@ -1889,6 +2405,7 @@ fn list_label_messages(
 mod tests {
     use super::delete_is_permanent;
     use nuncio_core::models::FolderRole;
+    use nuncio_core::repo;
 
     #[test]
     fn a_discarded_draft_is_deleted_rather_than_trashed() {
@@ -1913,5 +2430,229 @@ mod tests {
     #[test]
     fn an_explicit_request_wins() {
         assert!(delete_is_permanent(true, FolderRole::Inbox, false));
+    }
+
+    /// The ABA case behind the message-level fallback revision.
+    ///
+    /// An open observes "no writer". While the body loads, the user marks the
+    /// message read and undoes it; because the action has no predecessor the
+    /// undo *deletes* the writer row. Comparing `Option<writer.seq>` would see
+    /// `None == None` and mark the restored unread message read again. The
+    /// message revision must have moved, so the automatic write is skipped.
+    #[tokio::test]
+    async fn auto_mark_read_does_not_overwrite_a_value_restored_after_writer_clear() {
+        use nuncio_core::models::{
+            Account, AccountState, AuthKind, FolderRole, MessageSummary, ProviderKind, Security,
+            ServerConfig, StoredMessage,
+        };
+        use nuncio_core::{CoreContext, Paths};
+
+        let dir = std::env::temp_dir().join(format!(
+            "nuncio-mail-seen-{}",
+            nuncio_core::models::new_id()
+        ));
+        let ctx = CoreContext::for_test(Paths::new(dir))
+            .await
+            .expect("context");
+        let now = nuncio_core::models::now();
+        let account = Account {
+            id: "acc".into(),
+            provider: ProviderKind::Imap,
+            email: "me@example.com".into(),
+            display_name: "Me".into(),
+            color: "#000000".into(),
+            auth_kind: AuthKind::Password,
+            oauth_provider: None,
+            imap: Some(ServerConfig::new(
+                "imap.example.com",
+                993,
+                Security::Tls,
+                "me@example.com",
+            )),
+            smtp: None,
+            pop3: None,
+            caldav_url: None,
+            carddav_url: None,
+            sent_copy: None,
+            sync_window_days: 90,
+            mail_enabled: true,
+            calendar_enabled: false,
+            contacts_enabled: false,
+            tasks_enabled: false,
+            notifications_enabled: true,
+            include_in_unified: true,
+            sort_order: 0,
+            state: AccountState::Ok,
+            state_message: None,
+            capabilities: Default::default(),
+            created_at: now,
+        };
+        ctx.db
+            .write({
+                let account = account.clone();
+                move |db| {
+                    repo::accounts::insert(db, &account)?;
+                    let folder =
+                        nuncio_core::models::Folder::new("fld", "acc", "Inbox", FolderRole::Inbox);
+                    repo::folders::insert(db, &folder)
+                }
+            })
+            .await
+            .expect("account and folder");
+        let summary = MessageSummary::new("m1", "acc", "fld", "t1", now);
+        let mut stored = StoredMessage::new(summary);
+        stored.uid = Some(7);
+        stored.uidvalidity = Some(1);
+        ctx.db
+            .write(move |db| repo::messages::upsert(db, &stored))
+            .await
+            .expect("message");
+
+        // Snapshot the open's baseline: the provider copy and the revision.
+        let mut opened = ctx
+            .db
+            .read(|db| repo::messages::get_required(db, "m1"))
+            .await
+            .expect("stored");
+        let opened_copy = repo::messages::body_identity_key(&opened);
+        let observed_revision = ctx
+            .db
+            .read(|db| repo::messages::flag_revision(db, "m1"))
+            .await
+            .expect("revision");
+        assert_eq!(observed_revision, Some(0));
+
+        // Mark read, then undo with no predecessor: the writer row disappears.
+        ctx.db
+            .write(|db| {
+                repo::messages::set_flags(db, &["m1".to_string()], Some(true), None, None, None)?;
+                repo::messages::record_flag_writer(
+                    db,
+                    "m1",
+                    "seen",
+                    "op-1",
+                    Some(true),
+                    "setSeen",
+                )?;
+                repo::messages::set_flags(db, &["m1".to_string()], Some(false), None, None, None)?;
+                repo::messages::reassign_flag_writer(db, "m1", "seen", "op-1", None, None, None)
+            })
+            .await
+            .expect("mark read and undo");
+        assert!(
+            ctx.db
+                .read(|db| repo::messages::flag_writer(db, "m1", "seen"))
+                .await
+                .expect("writer")
+                .is_none(),
+            "the undo removed the last writer"
+        );
+
+        let service = crate::MailService::new(ctx.clone());
+        service
+            .mark_seen_on_open(&mut opened, opened_copy, observed_revision)
+            .await
+            .expect("auto mark read");
+
+        let seen = ctx
+            .db
+            .read(|db| repo::messages::get_required(db, "m1"))
+            .await
+            .expect("stored")
+            .summary
+            .seen;
+        assert!(
+            !seen,
+            "the automatic mark must not overwrite the value the undo restored"
+        );
+        let ops = ctx
+            .db
+            .read(|db| repo::pending_ops::list(db, Some("acc")))
+            .await
+            .expect("ops");
+        assert!(
+            ops.is_empty(),
+            "no setFlags may be queued after the concurrent change"
+        );
+    }
+
+    /// A sync can rebind the stable row (and its synthetic UID) to another
+    /// Graph message before the queue transaction runs. The transaction must
+    /// reject the stale payload instead of queueing a delete for the new copy.
+    #[test]
+    fn a_rebound_graph_copy_fails_the_queue_expectation() {
+        use super::{remote_expectation_matches, RemoteExpectation};
+        use nuncio_core::models::{MessageSummary, StoredMessage};
+
+        let db = nuncio_core::Db::open_in_memory().expect("db");
+        db.migrate_core().expect("migrate");
+        db.write_sync(|conn| {
+            let now = nuncio_core::models::now().to_rfc3339();
+            conn.execute(
+                "INSERT INTO account (id, provider, email, auth_kind, created_at, updated_at)
+                 VALUES ('acc', 'outlook', 'me@example.com', 'oauth', ?1, ?1)",
+                rusqlite::params![now],
+            )?;
+            conn.execute(
+                "INSERT INTO folder (id, account_id, remote_path, name, role, created_at, updated_at)
+                 VALUES ('fld', 'acc', 'Inbox', 'Inbox', 'inbox', ?1, ?1)",
+                rusqlite::params![now],
+            )?;
+            let summary = MessageSummary::new(
+                "row",
+                "acc",
+                "fld",
+                "thread",
+                nuncio_core::models::now(),
+            );
+            let mut stored = StoredMessage::new(summary);
+            stored.uid = Some(7);
+            stored.uidvalidity = Some(1);
+            stored.gm_msgid = Some("copy-a".into());
+            repo::messages::upsert(conn, &stored)?;
+            repo::sync_state::set(conn, "acc", "mail", "graph_remote:fld:7", "copy-a")?;
+
+            let expected = RemoteExpectation {
+                id: "row".into(),
+                account_id: "acc".into(),
+                folder_id: "fld".into(),
+                uid: Some(7),
+                uidvalidity: Some(1),
+                graph: true,
+                remote_id: Some("copy-a".into()),
+            };
+            assert!(remote_expectation_matches(conn, &expected)?);
+
+            // The same local row/UID now names a different provider message.
+            stored.gm_msgid = Some("copy-b".into());
+            repo::messages::upsert(conn, &stored)?;
+            repo::sync_state::set(conn, "acc", "mail", "graph_remote:fld:7", "copy-b")?;
+            assert!(
+                !remote_expectation_matches(conn, &expected)?,
+                "a rebound provider id must fail the queue check"
+            );
+
+            // No pinned provider id at all: the executor could only re-resolve
+            // it from the mutable mapping, so the queue must refuse.
+            let unpinned = RemoteExpectation {
+                remote_id: None,
+                ..expected
+            };
+            assert!(
+                !remote_expectation_matches(conn, &unpinned)?,
+                "a Graph action without a provider id must be refused"
+            );
+            let imap_unpinned = RemoteExpectation {
+                graph: false,
+                remote_id: None,
+                ..unpinned
+            };
+            assert!(
+                remote_expectation_matches(conn, &imap_unpinned)?,
+                "an IMAP action has no provider id to pin"
+            );
+            Ok(())
+        })
+        .expect("expectation");
     }
 }

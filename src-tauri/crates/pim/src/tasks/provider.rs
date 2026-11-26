@@ -61,6 +61,10 @@ pub struct RemoteTask {
     /// `false` when the provider could not return the complete step set in
     /// this batch (the sync engine then keeps local steps).
     pub steps_complete: bool,
+    /// `remote_id` was derived from the href because the VTODO has no UID
+    /// (CalDAV). It is a placeholder, not a real provider UID, and must never
+    /// be matched against a real UID of another resource.
+    pub uid_is_derived: bool,
 }
 
 /// A batch of task changes.
@@ -69,6 +73,16 @@ pub struct TaskDelta {
     pub tasks: Vec<RemoteTask>,
     pub deleted_remote_ids: Vec<String>,
     pub deleted_hrefs: Vec<String>,
+    /// Every href the server listed in this pass, including objects whose ETag
+    /// matched the local baseline and were therefore not downloaded.
+    ///
+    /// Only a full collection listing can supply this (the DAV ETag fallback);
+    /// an incremental delta leaves it empty. A full-sync prune must treat a
+    /// listed href as present even when it is absent from [`Self::tasks`].
+    pub listed_hrefs: Vec<String>,
+    /// A listed object's identity could not be read this round. The object is
+    /// present but unrefreshed: do not prune and do not advance the cursor.
+    pub incomplete: bool,
     pub sync_token: Option<String>,
     pub ctag: Option<String>,
     pub full_sync: bool,
@@ -80,6 +94,11 @@ pub struct RemoteTaskRef {
     pub remote_id: Option<String>,
     pub href: Option<String>,
     pub etag: Option<String>,
+    /// `remote_id` is a href-derived placeholder, not a real provider UID.
+    /// A provider that rewrites the object must not write the placeholder into
+    /// the VTODO as a real `UID`: it can collide with a genuine UID of the same
+    /// spelling. The rewrite instead receives a freshly assigned real UID.
+    pub uid_is_derived: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -87,6 +106,10 @@ pub struct RemoteWriteResult {
     pub remote_id: Option<String>,
     pub etag: Option<String>,
     pub href: Option<String>,
+    /// `remote_id` is a href-derived placeholder (the written object has no
+    /// real UID). Persisted so a later delete tombstone matches only the same
+    /// kind of identity.
+    pub uid_is_derived: bool,
 }
 
 /// Which fields the provider can actually store.
@@ -164,12 +187,34 @@ pub trait TaskProvider: Send + Sync {
         task: &Task,
     ) -> Result<RemoteWriteResult>;
 
+    /// The identity a create of `task_id` will use when the client chooses
+    /// it, so a delete racing an in-flight create can suppress the object
+    /// before its receipt arrives.
+    ///
+    /// Providers that allocate ids server-side return `None`: an unacknowledged
+    /// create cannot be attributed in advance. The sync engine then isolates
+    /// the list instead of guessing.
+    fn predicted_create_identity(
+        &self,
+        _list: &RemoteTaskList,
+        _task_id: &str,
+    ) -> Option<RemoteTaskRef> {
+        None
+    }
+
+    /// Rewrite an existing task.
+    ///
+    /// `assigned_uid` is a real UID the service already persisted for a task
+    /// whose stored identity was derived from its href. Providers that address
+    /// objects by a real UID must write this value instead of the placeholder;
+    /// providers with provider-side ids ignore it.
     async fn update_task(
         &self,
         account: &Account,
         list: &RemoteTaskList,
         current: &RemoteTaskRef,
         task: &Task,
+        assigned_uid: Option<&str>,
     ) -> Result<RemoteWriteResult>;
 
     async fn delete_task(
